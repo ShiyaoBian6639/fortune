@@ -73,6 +73,119 @@ def parse_args():
     return p.parse_args()
 
 
+# ─── Stratified stock sampler ─────────────────────────────────────────────────
+
+def _stratified_sample(
+    stock_files: list,
+    data_dir: str,
+    max_stocks: int,
+    seed: int = 42,
+) -> list:
+    """
+    Stratified random sample from stock_files, grouped by SW L1 sector.
+
+    Guarantees that every sector present in the data is represented
+    proportionally in the subset.  Falls back to uniform random shuffle
+    if sector data (stock_sectors.csv) is not available.
+
+    Algorithm:
+      1. Load stock_sectors.csv → build {ts_code: sw_l1_name} map.
+      2. Group stock_files by sector.
+      3. Sample proportionally: each sector gets ~max_stocks / n_sectors slots,
+         with remainders distributed to larger sectors.
+      4. Shuffle within each sector before sampling for randomness.
+
+    Args:
+        stock_files: [(ts_code, filepath), ...]  — full universe
+        data_dir:    path to stock_data/
+        max_stocks:  target number of stocks
+        seed:        random seed for reproducibility
+    """
+    import random
+    from collections import defaultdict
+
+    rng = random.Random(seed)
+
+    if max_stocks >= len(stock_files):
+        return stock_files   # no sampling needed
+
+    # Try to load sector info for stratification
+    sector_col = None
+    sector_map: dict = {}
+    sector_path = os.path.join(data_dir, 'stock_sectors.csv')
+
+    if os.path.exists(sector_path):
+        try:
+            import pandas as pd
+            df = pd.read_csv(sector_path, usecols=['ts_code', 'sw_l1_name', 'sector'])
+            # Prefer SW L1 (31 sectors); fall back to coarse 'sector' (9 groups)
+            if 'sw_l1_name' in df.columns and df['sw_l1_name'].nunique() > 9:
+                sector_col = 'sw_l1_name'
+            else:
+                sector_col = 'sector'
+            sector_map = df.set_index('ts_code')[sector_col].to_dict()
+            # Also index by bare code
+            for code, val in list(sector_map.items()):
+                bare = str(code).split('.')[0]
+                sector_map[bare] = val
+        except Exception as e:
+            print(f"  [warn] Could not load sector data for stratification: {e}")
+
+    if not sector_map:
+        # Fallback: uniform random shuffle
+        sampled = list(stock_files)
+        rng.shuffle(sampled)
+        return sampled[:max_stocks]
+
+    # Group by sector
+    groups: dict = defaultdict(list)
+    for ts_code, filepath in stock_files:
+        bare   = str(ts_code).split('.')[0]
+        sector = sector_map.get(ts_code, sector_map.get(bare, 'Unknown'))
+        groups[sector].append((ts_code, filepath))
+
+    n_sectors = len(groups)
+    base_per_sector = max_stocks // n_sectors
+    remainder       = max_stocks % n_sectors
+
+    # Sort sectors by size descending so larger sectors absorb the remainder first
+    sorted_sectors = sorted(groups.keys(), key=lambda s: -len(groups[s]))
+
+    sampled = []
+    for i, sector in enumerate(sorted_sectors):
+        stocks = list(groups[sector])
+        rng.shuffle(stocks)
+        quota = base_per_sector + (1 if i < remainder else 0)
+        quota = min(quota, len(stocks))   # can't take more than available
+        sampled.extend(stocks[:quota])
+
+    # If total < max_stocks (some sectors had fewer stocks than quota),
+    # top up with random picks from sectors that had more available
+    if len(sampled) < max_stocks:
+        already = {ts for ts, _ in sampled}
+        pool    = [(ts, fp) for ts, fp in stock_files if ts not in already]
+        rng.shuffle(pool)
+        sampled.extend(pool[:max_stocks - len(sampled)])
+
+    rng.shuffle(sampled)   # final shuffle so sectors aren't in blocks
+
+    # Print sector distribution
+    sector_counts = defaultdict(int)
+    for ts_code, _ in sampled:
+        bare   = str(ts_code).split('.')[0]
+        sector = sector_map.get(ts_code, sector_map.get(bare, 'Unknown'))
+        sector_counts[sector] += 1
+
+    print(f"  Stratified by {sector_col or 'random'} across "
+          f"{n_sectors} sectors → {len(sampled)} stocks selected")
+    top5 = sorted(sector_counts.items(), key=lambda x: -x[1])[:5]
+    others = len(sector_counts) - 5
+    print("  " + "  |  ".join(f"{s}: {n}" for s, n in top5)
+          + (f"  |  +{others} more" if others > 0 else ""))
+
+    return sampled
+
+
 # ─── Data pipeline ────────────────────────────────────────────────────────────
 
 def build_cache(args, config):
@@ -107,8 +220,11 @@ def build_cache(args, config):
                     stock_files.append((ts_code, os.path.join(d, f)))
 
     if max_stocks and max_stocks > 0:
-        stock_files = stock_files[:max_stocks]
-        print(f"Using {max_stocks} stocks (subset)")
+        stock_files = _stratified_sample(
+            stock_files, data_dir,
+            max_stocks, seed=config.get('random_seed', 42),
+        )
+        print(f"Using {len(stock_files)} stocks (stratified sample, seed={config.get('random_seed', 42)})")
     else:
         print(f"Using all {len(stock_files)} stocks")
 
