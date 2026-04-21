@@ -50,8 +50,14 @@ def parse_args():
     # None = use config default (128); explicit value overrides
     p.add_argument('--batch_size',  type=int, default=None,
                    help='Batch size (default from config: 128)')
-    p.add_argument('--lr',          type=float, default=None,
-                   help='Learning rate (default from config: 5e-5)')
+    p.add_argument('--lr',             type=float, default=None,
+                   help='Learning rate (default: 2e-5)')
+    p.add_argument('--weight_decay',   type=float, default=None,
+                   help='AdamW weight decay (default: 0.05)')
+    p.add_argument('--max_grad_norm',  type=float, default=None,
+                   help='Gradient clip threshold (default: 0.5)')
+    p.add_argument('--dropout',        type=float, default=None,
+                   help='Dropout rate (default: 0.15)')
     p.add_argument('--hidden',      type=int, default=None,
                    help='TFT hidden dim (default from config: 128)')
     p.add_argument('--heads',       type=int, default=None,
@@ -330,12 +336,15 @@ def main():
         'cache_dir':    args.cache_dir,
         'model_save_path': os.path.join(args.data_dir, 'deeptime_model.pth'),
     }
-    if args.batch_size  is not None: overrides['batch_size']       = args.batch_size
-    if args.lr          is not None: overrides['learning_rate']     = args.lr
-    if args.hidden      is not None: overrides['tft_hidden']        = args.hidden
-    if args.heads       is not None: overrides['tft_heads']         = args.heads
-    if args.lstm_layers is not None: overrides['tft_lstm_layers']   = args.lstm_layers
-    if args.seq_len     is not None: overrides['sequence_length']   = args.seq_len
+    if args.batch_size   is not None: overrides['batch_size']       = args.batch_size
+    if args.lr           is not None: overrides['learning_rate']    = args.lr
+    if args.weight_decay is not None: overrides['weight_decay']     = args.weight_decay
+    if args.max_grad_norm is not None: overrides['max_grad_norm']   = args.max_grad_norm
+    if args.dropout      is not None: overrides['tft_dropout']      = args.dropout
+    if args.hidden       is not None: overrides['tft_hidden']       = args.hidden
+    if args.heads        is not None: overrides['tft_heads']        = args.heads
+    if args.lstm_layers  is not None: overrides['tft_lstm_layers']  = args.lstm_layers
+    if args.seq_len      is not None: overrides['sequence_length']  = args.seq_len
 
     config = get_config(**overrides)
 
@@ -376,6 +385,8 @@ def main():
     print(f"\nEffective config:")
     print(f"  batch_size={config['batch_size']}  hidden={config['tft_hidden']}  "
           f"heads={config['tft_heads']}  lstm_layers={config['tft_lstm_layers']}")
+    print(f"  lr={config['learning_rate']}  weight_decay={config.get('weight_decay',0.05)}  "
+          f"max_grad_norm={config.get('max_grad_norm',0.5)}  dropout={config.get('tft_dropout',0.15)}")
     print(f"  seq_len={config['sequence_length']}  lr={config['learning_rate']}  "
           f"epochs={config['epochs']}  AMP={config['use_amp']}")
 

@@ -224,9 +224,15 @@ def train_model(
     patience   = config.get('early_stopping_patience', 15)
     warmup_ep  = config.get('warmup_epochs', 8)
     use_amp    = config.get('use_amp', True) and device != 'cpu'
-    max_gn     = config.get('max_grad_norm', 1.0)
+    max_gn     = config.get('max_grad_norm', 0.5)   # tighter than 1.0; see note below
     seed       = config.get('random_seed', 42)
     save_path  = config.get('model_save_path', 'stock_data/deeptime_model.pth')
+    weight_decay = config.get('weight_decay', 0.05)  # raised from 0.01 to slow weight growth
+
+    # Note on max_grad_norm:
+    #   Raw pre-clip norms growing 0.5→20 during warmup indicate the loss surface
+    #   has steep curvature. Clipping at 0.5 (was 1.0) keeps effective step direction
+    #   stable and prevents weight-magnitude runaway that causes val-loss divergence.
 
     set_seed(seed)
     model = model.to(device)
@@ -234,7 +240,7 @@ def train_model(
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr,
-        betas=(0.9, 0.95), weight_decay=0.01,
+        betas=(0.9, 0.95), weight_decay=weight_decay,
     )
 
     # Cosine LR with linear warmup

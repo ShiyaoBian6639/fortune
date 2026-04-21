@@ -147,10 +147,13 @@ IPO_AGE_EMB_DIM    = 8    # IPO age bucket
 #   VSN activation = B*T × num_vars × hidden × fp16
 #   With B=256, T=30, num_vars=204, hidden=128: 256×30×204×128×2 = 0.40 GB
 #   With gradients + LSTM + attn + optimizer states: ~5 GB total — safe.
-TFT_HIDDEN      = 128   # was 160; reduces VSN by 20%, fits 12 GB VRAM
+TFT_HIDDEN      = 128
 TFT_HEADS       = 4
 TFT_LSTM_LAYERS = 2
-TFT_DROPOUT     = 0.1
+# Dropout raised 0.1→0.15: reduces overfitting on subset runs (≤1000 stocks).
+# The SectorGAT B×B attention matrix and EfficientVSN shared projection both
+# benefit from stronger regularisation when train sequences are few.
+TFT_DROPOUT     = 0.15
 
 # Tushare API token (same as dl/)
 TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
@@ -208,7 +211,21 @@ DEFAULT_CONFIG = {
     # batch=128: 927 seqs/s, peak ~5.5 GB — safe fallback
     'batch_size':               192,
     'epochs':                   50,
-    'learning_rate':            5e-5,
+
+    # LR: 2e-5 is safer default for subset runs (≤1000 stocks).
+    # At 5e-5 gradient norms grow 0.5→20 during warmup causing val-loss divergence.
+    # For the full 5190-stock run, try 3e-5 or 5e-5.
+    'learning_rate':            2e-5,
+
+    # Weight decay raised 0.01→0.05: restrains weight-magnitude growth
+    # that drives gradient norms upward under high LR.
+    'weight_decay':             0.05,
+
+    # Gradient clip lowered 1.0→0.5: pre-clip norms of 15-20 with max_norm=1.0
+    # scales each step to 5-7% of raw gradient (direction-distorting).
+    # 0.5 keeps the scaling ratio ≥2.5% so step directions are meaningful.
+    'max_grad_norm':            0.5,
+
     'early_stopping_patience':  15,
     'warmup_epochs':            8,
     'use_amp':                  True,
