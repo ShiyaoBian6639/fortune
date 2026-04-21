@@ -575,6 +575,181 @@ class RegressionDataWriter:
         return date_map
 
 
+# ─── Post-processing feature normalization ────────────────────────────────────
+
+def normalize_cache(
+    cache_dir:  str,
+    chunk_size: int = 2_000,
+    reservoir_size: int = 50_000,
+    force: bool = False,
+) -> None:
+    """
+    Post-process an existing cache with two-tier feature normalization.
+
+    Fits ALL statistics on the TRAIN split only to prevent leakage.
+    Applies in-place to train/val/test obs memmaps (modifies files on disk).
+
+    Tier 1 — fina indicators + market MACD/MTM (percentile clip + standardize):
+        These are unbounded and raw. Clip to [p5, p95] fitted on train,
+        then rescale to zero-mean unit-variance.  Handles ROE=300%, MTM spikes.
+
+    Tier 2 — all other features (safety clip at ±5σ):
+        After CS normalization most features are ~N(0,1). This clips any
+        residual outliers (gap stocks, ST warnings, penny-stock extremes)
+        without altering the distribution for well-behaved features.
+
+    Idempotent: if metadata shows 'normalized=true' the function returns early
+    unless force=True.
+    """
+    meta_path = os.path.join(cache_dir, 'metadata.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    if meta.get('normalized') and not force:
+        print("  Cache already normalized (use force=True to reapply).")
+        return
+
+    from .config import (
+        DT_OBSERVED_PAST_COLUMNS, FINA_INDICATOR_COLUMNS, EXTRA_MONEYFLOW_COLUMNS
+    )
+
+    n_train = meta['splits']['train']['n_samples']
+    T       = meta['seq_length']
+    n_past  = meta['n_past']
+
+    if n_train == 0:
+        print("  [skip] normalize_cache: empty train split")
+        return
+
+    # ── Identify feature tiers ────────────────────────────────────────────────
+    # Tier 1: fina ratios + unbounded market indicators (MACD, MTM, pe_ttm)
+    TIER1_KWS = ('_macd', '_mtm', 'sse_pe_ttm', 'sse50_pe_ttm')
+    tier1_set = set(FINA_INDICATOR_COLUMNS)   # fina always Tier 1
+    tier1_set.add('has_fina_data')            # binary flag: treat like fina
+
+    tier1_idx = []
+    for i, feat in enumerate(DT_OBSERVED_PAST_COLUMNS[:n_past]):
+        if feat in tier1_set or any(kw in feat for kw in TIER1_KWS):
+            tier1_idx.append(i)
+    tier1_idx = np.array(tier1_idx, dtype=np.intp)
+    print(f"  Tier 1 (clip+standardize): {len(tier1_idx)} features")
+
+    # ── Pass 1: compute statistics from train split (chunked, low RAM) ────────
+    print(f"  Computing feature stats from {n_train:,} train sequences...")
+    train_obs = np.memmap(
+        os.path.join(cache_dir, 'train_obs.npy'),
+        dtype='float32', mode='r', shape=(n_train, T, n_past)
+    )
+
+    feat_sum    = np.zeros(n_past, dtype='float64')
+    feat_sq_sum = np.zeros(n_past, dtype='float64')
+    total_rows  = 0
+    reservoir   = np.zeros((reservoir_size, n_past), dtype='float32')
+    res_n       = 0   # total reservoir candidates seen
+
+    for start in range(0, n_train, chunk_size):
+        end   = min(start + chunk_size, n_train)
+        # Flatten time dim: (chunk, T, F) → (chunk*T, F)
+        chunk = train_obs[start:end].reshape(-1, n_past).astype('float64')
+        # Replace NaN/Inf with 0 for stats computation
+        chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+
+        feat_sum    += chunk.sum(axis=0)
+        feat_sq_sum += (chunk ** 2).sum(axis=0)
+        total_rows  += len(chunk)
+
+        # Reservoir sampling for percentile estimation (last timestep per seq)
+        last = train_obs[start:end, -1, :].astype('float32')  # (chunk, F)
+        for i in range(len(last)):
+            res_n += 1
+            if res_n <= reservoir_size:
+                reservoir[res_n - 1] = last[i]
+            else:
+                j = np.random.randint(0, res_n)
+                if j < reservoir_size:
+                    reservoir[j] = last[i]
+
+    del train_obs
+
+    mean = feat_sum / max(total_rows, 1)
+    var  = feat_sq_sum / max(total_rows, 1) - mean ** 2
+    std  = np.sqrt(np.maximum(var, 1e-10))
+
+    res_valid = min(res_n, reservoir_size)
+    p5  = np.percentile(reservoir[:res_valid], 5,  axis=0).astype('float64')
+    p95 = np.percentile(reservoir[:res_valid], 95, axis=0).astype('float64')
+
+    # ── Build per-feature clip bounds ──────────────────────────────────────────
+    clip_lo = mean - 5.0 * std    # Tier 2 global safety bounds
+    clip_hi = mean + 5.0 * std
+
+    # Tier 1: use percentile bounds (tighter, handles heavy tails)
+    clip_lo[tier1_idx] = p5[tier1_idx]
+    clip_hi[tier1_idx] = p95[tier1_idx]
+
+    # Tier 1 standardize params: shift/scale so Tier-1 features are ~N(0,1) after clip
+    tier1_mean = mean.copy()
+    tier1_std  = std.copy()
+    tier1_mean[tier1_idx] = (p5[tier1_idx] + p95[tier1_idx]) / 2.0  # midpoint of clip range
+    tier1_std[tier1_idx]  = np.maximum(
+        (p95[tier1_idx] - p5[tier1_idx]) / (2.0 * 1.96),   # ≈ σ from IQR
+        1e-8
+    )
+
+    # ── Save scaler ────────────────────────────────────────────────────────────
+    scaler_path = os.path.join(cache_dir, 'feature_scaler.npz')
+    np.savez(scaler_path,
+             mean=mean, std=std, p5=p5, p95=p95,
+             clip_lo=clip_lo, clip_hi=clip_hi,
+             tier1_idx=tier1_idx,
+             tier1_mean=tier1_mean, tier1_std=tier1_std)
+    print(f"  Scaler saved: {scaler_path}")
+
+    # ── Pass 2: apply normalization to all splits ──────────────────────────────
+    clip_lo32 = clip_lo.astype('float32')
+    clip_hi32 = clip_hi.astype('float32')
+
+    for split in ('train', 'val', 'test'):
+        n = meta['splits'].get(split, {}).get('n_samples', 0)
+        if n == 0:
+            continue
+
+        obs = np.memmap(
+            os.path.join(cache_dir, f'{split}_obs.npy'),
+            dtype='float32', mode='r+', shape=(n, T, n_past)
+        )
+        print(f"  Normalizing {split} ({n:,} seqs)...", end=' ', flush=True)
+
+        for start in range(0, n, chunk_size):
+            end   = min(start + chunk_size, n)
+            chunk = obs[start:end].copy().astype('float64')   # (B, T, F)
+
+            # Tier 2: clip all features to ±5σ (broadcast over B and T)
+            np.clip(chunk, clip_lo[np.newaxis, np.newaxis, :],
+                    clip_hi[np.newaxis, np.newaxis, :], out=chunk)
+
+            # Tier 1: additionally standardize (in-place for tier1 features)
+            for fi in tier1_idx:
+                s = float(tier1_std[fi])
+                if s > 1e-8:
+                    chunk[:, :, fi] = (chunk[:, :, fi] - tier1_mean[fi]) / s
+
+            obs[start:end] = chunk.astype('float32')
+
+        obs.flush()
+        del obs
+        print("done")
+
+    # ── Mark cache as normalized ───────────────────────────────────────────────
+    meta['normalized']     = True
+    meta['scaler_path']    = scaler_path
+    meta['tier1_features'] = [DT_OBSERVED_PAST_COLUMNS[i] for i in tier1_idx
+                               if i < len(DT_OBSERVED_PAST_COLUMNS)]
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    print("  Cache normalization complete.")
+
+
 # ─── Cache helpers ─────────────────────────────────────────────────────────────
 
 def cache_exists(cache_dir: str) -> bool:

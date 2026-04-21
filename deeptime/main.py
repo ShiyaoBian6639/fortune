@@ -239,6 +239,13 @@ def main():
     # Run post-cache sanity checks
     run_all_checks(config['data_dir'], config['cache_dir'], config)
 
+    # ── Feature normalization (P1-P3): post-process cache in-place ───────────
+    # Fits statistics on train split only; applies Winsorization + standardization
+    # to fina/MACD/MTM features (Tier 1) and ±5σ safety clip to all features (Tier 2).
+    print("\nApplying feature normalization to cache...")
+    from .memmap_dataset import normalize_cache
+    normalize_cache(config['cache_dir'], chunk_size=2_000)
+
     # ── GPU memory limit: dedicated VRAM only (RTX 4070 Super = 12 GB) ───────
     if torch.cuda.is_available():
         # Reserve at most 90% of dedicated VRAM; raises OOM instead of spilling

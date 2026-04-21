@@ -48,6 +48,9 @@ FINA_INDICATOR_COLUMNS = [
     'roe', 'roa', 'grossprofit_margin', 'netprofit_margin',
     'current_ratio', 'quick_ratio', 'debt_to_assets',
     'assets_yoy', 'equity_yoy', 'op_yoy', 'ebt_yoy', 'eps',
+    # Binary flag: 1 = fina data available (ann_date ≤ trade_date), 0 = pre-announcement
+    # Lets model distinguish "zero fundamentals because data missing" from genuine zeros.
+    'has_fina_data',
 ]
 
 BLOCK_TRADE_COLUMNS = [

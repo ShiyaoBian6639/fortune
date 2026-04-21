@@ -114,11 +114,20 @@ def forward_fill_fundamentals(
     """
     Point-in-time join: for each trading day, use the most recent quarterly
     report whose ann_date <= trade_date. Forward-fill until next announcement.
+
+    Priority-4 fixes vs original:
+    - Zero-fill (not NaN) for rows before the first announcement so those
+      rows are NOT dropped by later dropna(). The 'has_fina_data' binary flag
+      lets the model distinguish "no announcement yet" from genuine zeros.
+    - 'has_fina_data' = 1 when fina data is available, 0 otherwise.
     """
-    # Ensure all fina columns exist (filled with NaN initially)
+    # All fina columns default to 0 (not NaN) → no rows dropped due to missing fina
     for col in FINA_INDICATOR_COLUMNS:
         if col not in stock_df.columns:
-            stock_df[col] = np.nan
+            stock_df[col] = 0.0
+
+    # has_fina_data starts at 0; set to 1 below where data exists
+    stock_df['has_fina_data'] = 0.0
 
     if fina_df is None or len(fina_df) == 0:
         return stock_df
@@ -127,19 +136,30 @@ def forward_fill_fundamentals(
         stock_df = stock_df.copy()
         stock_df['trade_date'] = pd.to_datetime(stock_df['trade_date'].astype(str))
 
-    # Merge: for each trading date, find the last ann_date <= trade_date
     fina_sorted = fina_df.sort_values('ann_date').reset_index(drop=True)
     ann_dates   = fina_sorted['ann_date'].values
     trade_dates = stock_df['trade_date'].values
 
-    # Use searchsorted to find the last applicable announcement
-    idx = np.searchsorted(ann_dates, trade_dates, side='right') - 1   # -1 if before first ann
+    # idx = last announcement index with ann_date <= trade_date; -1 if none yet
+    idx = np.searchsorted(ann_dates, trade_dates, side='right') - 1
+
+    has_data = (idx >= 0).astype('float32')
+    stock_df['has_fina_data'] = has_data
 
     for col in FINA_INDICATOR_COLUMNS:
+        if col == 'has_fina_data':
+            continue
         if col not in fina_sorted.columns:
             continue
         vals = fina_sorted[col].values
-        col_values = np.where(idx >= 0, vals[np.clip(idx, 0, len(vals) - 1)], np.nan)
+        # Zero-fill when no announcement exists (idx < 0) instead of NaN
+        col_values = np.where(
+            idx >= 0,
+            vals[np.clip(idx, 0, len(vals) - 1)],
+            0.0           # ← was np.nan, now 0 so rows are NOT dropped
+        )
+        # Replace any NaN/Inf within fina values with 0 (e.g. missing line items)
+        col_values = np.nan_to_num(col_values, nan=0.0, posinf=0.0, neginf=0.0)
         stock_df[col] = col_values.astype('float32')
 
     return stock_df
