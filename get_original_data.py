@@ -180,22 +180,29 @@ def download_date(pro, trade_date: str) -> pd.DataFrame:
 
 # ─── Buffer flush ─────────────────────────────────────────────────────────────
 
-def flush_buffer(buffer: dict):
+def flush_buffer(buffer: dict, initial_download: bool = False):
     """
     Write accumulated {ts_code: DataFrame} buffer to per-stock CSV files.
-    Files are stored newest-first (descending trade_date) so that
-    extend_stock_data.get_latest_date() can read just the first row.
+
+    initial_download=True: files don't exist yet → just write, skip read-merge.
+    This is ~3× faster for the initial full download.
+    Files stored newest-first (descending trade_date) for extend_stock_data compat.
     """
     for ts_code, new_df in buffer.items():
-        exchange = ts_code.split('.')[1].lower()   # 'sh' or 'sz'
+        parts = ts_code.split('.')
+        if len(parts) != 2:
+            continue
+        exchange = parts[1].lower()
         if exchange not in ('sh', 'sz'):
             continue
-        symbol = ts_code.split('.')[0]
+        symbol = parts[0]
         path   = DATA_DIR / exchange / f'{symbol}.csv'
 
         new_df = new_df.sort_values('trade_date', ascending=False)
 
-        if path.exists():
+        if initial_download or not path.exists():
+            new_df.to_csv(path, index=False)
+        else:
             try:
                 existing = pd.read_csv(path, dtype={'trade_date': str})
                 combined = (pd.concat([existing, new_df])
@@ -205,14 +212,12 @@ def flush_buffer(buffer: dict):
                 combined.to_csv(path, index=False)
             except Exception:
                 new_df.to_csv(path, index=False)
-        else:
-            new_df.to_csv(path, index=False)
 
 
 # ─── Main download loop ───────────────────────────────────────────────────────
 
 def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
-                 batch: int = None):
+                 batch: int = None, initial: bool = False):
     """
     Download all A-share daily OHLCV by iterating trading dates.
 
@@ -220,14 +225,21 @@ def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
         pro:        Tushare Pro API instance.
         start_date: First date to download (YYYYMMDD).
         end_date:   Last date (default: today).
-        batch:      Stop after downloading this many dates (for incremental runs).
+        batch:      Stop after this many dates (for safe incremental runs).
+        initial:    True = no existing files, skip read-merge on flush (~3x faster).
+                    Auto-detected if stock_data/sh/ is empty.
     """
     if end_date is None:
         end_date = datetime.now().strftime('%Y%m%d')
 
+    # Auto-detect initial download (no stock files exist yet)
+    sh_files = list((DATA_DIR / 'sh').glob('*.csv')) if (DATA_DIR / 'sh').exists() else []
+    if initial or not sh_files:
+        initial = True
+        print("  [Mode] Initial download — flush writes new files only (fastest)")
+
     ck = load_checkpoint()
     completed_set = set(ck['completed_dates'])
-    failed_set    = set(ck['failed_dates'])
 
     all_dates = get_trading_dates(pro, start_date, end_date)
     pending   = [d for d in all_dates if d not in completed_set]
@@ -238,26 +250,32 @@ def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
 
     print(f"\n{'='*60}")
     print(f"Date-first download: {start_date} → {end_date}")
-    print(f"  Total trading days: {total}")
-    print(f"  Already downloaded: {done}")
-    print(f"  Remaining:          {remaining}")
+    print(f"  Total trading days : {total}")
+    print(f"  Already downloaded : {done}")
+    print(f"  Remaining          : {remaining}")
     if batch:
-        print(f"  This run limit:     {batch} dates")
+        print(f"  This run limit     : {batch} dates")
+    # Time estimate at 0.5s/call avg
+    eta_min = remaining * 0.5 / 60
+    print(f"  ETA (network only) : ~{eta_min:.0f} min")
     print(f"{'='*60}\n")
 
     if not pending:
         print("  All dates already downloaded.")
         return
 
-    buffer: dict = {}    # {ts_code: list of DataFrames}
+    buffer: dict = {}
     dates_this_run = 0
+    t_start = time.time()
 
     for i, trade_date in enumerate(pending):
         if batch and dates_this_run >= batch:
             print(f"\nBatch limit ({batch} dates) reached. Run again to continue.")
             break
 
+        t0 = time.time()
         df = download_date(pro, trade_date)
+        elapsed = time.time() - t0
 
         if df is None:
             ck['failed_dates'].append(trade_date)
@@ -265,38 +283,50 @@ def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
         elif df.empty:
             ck['completed_dates'].append(trade_date)
         else:
-            # Accumulate by ts_code
             for ts_code, grp in df.groupby('ts_code'):
                 if ts_code not in buffer:
                     buffer[ts_code] = []
                 buffer[ts_code].append(grp)
 
             ck['completed_dates'].append(trade_date)
-            n_stocks = len(df['ts_code'].unique())
-            print(f"  [{done+dates_this_run+1:4d}/{total}] {trade_date}  "
-                  f"{n_stocks:4d} stocks")
+            n_stocks = df['ts_code'].nunique()
+
+            # ETA update every 50 dates
+            dates_done_total = done + dates_this_run + 1
+            if (dates_this_run + 1) % 50 == 0:
+                rate = (dates_this_run + 1) / (time.time() - t_start)
+                left = total - dates_done_total
+                eta  = left / rate / 60
+                print(f"  [{dates_done_total:4d}/{total}] {trade_date}  "
+                      f"{n_stocks:4d} stocks  ({rate:.1f} dates/s, ETA ~{eta:.0f} min)")
+            else:
+                print(f"  [{dates_done_total:4d}/{total}] {trade_date}  {n_stocks:4d} stocks")
 
         dates_this_run += 1
-        time.sleep(CALL_INTERVAL)
+        time.sleep(max(0, CALL_INTERVAL - elapsed))
 
-        # Flush buffer periodically to limit RAM usage
+        # Flush buffer periodically
         if dates_this_run % FLUSH_EVERY == 0:
-            flush_buffer({k: pd.concat(v) for k, v in buffer.items()})
+            t_flush = time.time()
+            flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
             buffer.clear()
             save_checkpoint(ck)
-            print(f"  ... flushed to disk ({done+dates_this_run} total dates done)")
+            print(f"  ... checkpoint saved  "
+                  f"({done+dates_this_run}/{total} dates, flush={time.time()-t_flush:.1f}s)")
 
     # Final flush
     if buffer:
-        flush_buffer({k: pd.concat(v) for k, v in buffer.items()})
+        flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
         buffer.clear()
 
     save_checkpoint(ck)
+    total_time = (time.time() - t_start) / 60
     print(f"\n{'='*60}")
-    print(f"Session complete: {dates_this_run} dates downloaded this run")
-    print(f"Total completed: {len(ck['completed_dates'])}/{total}")
+    print(f"Session complete in {total_time:.1f} min")
+    print(f"  Dates this run : {dates_this_run}")
+    print(f"  Total done     : {len(ck['completed_dates'])}/{total}")
     if ck['failed_dates']:
-        print(f"Failed dates:    {len(ck['failed_dates'])} (run --retry-failed)")
+        print(f"  Failed dates   : {len(ck['failed_dates'])} → run --retry-failed")
     print(f"{'='*60}")
 
 
@@ -411,6 +441,8 @@ def main():
     parser.add_argument('--download',      action='store_true', help='Download all dates')
     parser.add_argument('--batch',         type=int, default=None,
                         help='Max dates per run (default: all)')
+    parser.add_argument('--initial',       action='store_true',
+                        help='Force initial-download mode (skip read-merge, ~3x faster for first run)')
     parser.add_argument('--status',        action='store_true', help='Show progress')
     parser.add_argument('--retry-failed',  action='store_true', help='Retry failed dates')
     parser.add_argument('--reset',         action='store_true', help='Reset checkpoint')
@@ -430,12 +462,13 @@ def main():
         retry_failed(pro)
     elif args.download:
         get_stock_list(pro=pro)
-        download_all(pro, batch=args.batch)
+        download_all(pro, batch=args.batch, initial=args.initial)
     else:
         parser.print_help()
-        print("\nQuick start:")
-        print("  python get_original_data.py --download")
-        print("  python get_original_data.py --download --batch 60  # incremental")
+        print("\nQuick start (fresh server):")
+        print("  python get_original_data.py --download          # auto-detects initial mode")
+        print("  python get_original_data.py --status            # check progress")
+        print("  python get_original_data.py --retry-failed      # retry any failed dates")
 
 
 if __name__ == '__main__':
