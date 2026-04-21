@@ -73,10 +73,13 @@ class RegressionMemmapDataset(Dataset):
             path = os.path.join(d, fname)
             if os.path.exists(path):
                 return np.memmap(path, dtype=dtype, mode='r', shape=shape)
-            return np.zeros(shape, dtype=dtype)   # graceful fallback for old caches
+            return np.zeros(shape, dtype=dtype)
 
-        self.obs_seqs      = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
-        self.future_inputs = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
+        # obs and future may be zarr (compressed) or plain memmap
+        self.obs_seqs, _    = _open_zarr_or_memmap(
+            os.path.join(d, f'{s}_obs'), 'float32', (n, self.seq_length, self.n_past))
+        self.future_inputs, _ = _open_zarr_or_memmap(
+            os.path.join(d, f'{s}_future'), 'float32', (n, self.max_fw, self.n_future))
         self.targets       = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
         self.sector_ids    = _mm(f'{s}_sectors.npy',    'int64',   (n,))
         self.industry_ids  = _mm(f'{s}_industries.npy', 'int64',   (n,))
@@ -105,9 +108,10 @@ class RegressionMemmapDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
+        # np.asarray cast handles both zarr (float16) and memmap (float32) → float32
         return (
-            torch.from_numpy(self.obs_seqs[idx].copy()),
-            torch.from_numpy(self.future_inputs[idx].copy()),
+            torch.from_numpy(np.asarray(self.obs_seqs[idx],     dtype='float32')),
+            torch.from_numpy(np.asarray(self.future_inputs[idx], dtype='float32')),
             torch.from_numpy(self.targets[idx].copy()),
             int(self.sector_ids[idx]),
             int(self.industry_ids[idx]),
@@ -199,8 +203,11 @@ class RegressionChunkedLoader:
                 return np.memmap(path, dtype=dtype, mode='r', shape=shape)
             return np.zeros(shape, dtype=dtype)   # zero-fill for old caches
 
-        self._obs     = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
-        self._future  = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
+        # obs / future: prefer zarr (float16 compressed) over float32 memmap
+        self._obs,    _ = _open_zarr_or_memmap(
+            os.path.join(d, f'{s}_obs'),    'float32', (n, self.seq_length, self.n_past))
+        self._future, _ = _open_zarr_or_memmap(
+            os.path.join(d, f'{s}_future'), 'float32', (n, self.max_fw, self.n_future))
         self._targets = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
         self._sectors = _mm(f'{s}_sectors.npy',    'int64',   (n,))
         self._inds    = _mm(f'{s}_industries.npy', 'int64',   (n,))
@@ -225,9 +232,12 @@ class RegressionChunkedLoader:
             start = chunk_idx * self.chunk_samples
             end   = min(start + self.chunk_samples, self.n_samples)
             idx   = indices[start:end]
+            # zarr reads return float16; cast to float32 for model compatibility
+            obs_chunk = np.asarray(self._obs[idx], dtype='float32')
+            fut_chunk = np.asarray(self._future[idx], dtype='float32')
             return (
-                self._obs[idx].copy(),
-                self._future[idx].copy(),
+                obs_chunk,
+                fut_chunk,
                 self._targets[idx].copy(),
                 self._sectors[idx].copy(),
                 self._inds[idx].copy(),
@@ -636,9 +646,8 @@ def normalize_cache(
 
     # ── Pass 1: compute statistics from train split (chunked, low RAM) ────────
     print(f"  Computing feature stats from {n_train:,} train sequences...")
-    train_obs = np.memmap(
-        os.path.join(cache_dir, 'train_obs.npy'),
-        dtype='float32', mode='r', shape=(n_train, T, n_past)
+    train_obs, _ = _open_zarr_or_memmap(
+        os.path.join(cache_dir, 'train_obs'), 'float32', (n_train, T, n_past)
     )
 
     feat_sum    = np.zeros(n_past, dtype='float64')
@@ -714,29 +723,41 @@ def normalize_cache(
         if n == 0:
             continue
 
-        obs = np.memmap(
-            os.path.join(cache_dir, f'{split}_obs.npy'),
-            dtype='float32', mode='r+', shape=(n, T, n_past)
-        )
-        print(f"  Normalizing {split} ({n:,} seqs)...", end=' ', flush=True)
+        zarr_path = os.path.join(cache_dir, f'{split}_obs.zarr')
+        npy_path  = os.path.join(cache_dir, f'{split}_obs.npy')
+        if os.path.isdir(zarr_path):
+            import zarr as _zarr
+            obs      = _zarr.open(zarr_path, mode='r+')
+            obs_kind = 'zarr'
+        elif os.path.exists(npy_path):
+            obs      = np.memmap(npy_path, dtype='float32', mode='r+', shape=(n, T, n_past))
+            obs_kind = 'memmap'
+        else:
+            print(f"  [skip] {split}_obs not found")
+            continue
+        print(f"  Normalizing {split} ({n:,} seqs, {obs_kind})...", end=' ', flush=True)
 
         for start in range(0, n, chunk_size):
             end   = min(start + chunk_size, n)
-            chunk = obs[start:end].copy().astype('float64')   # (B, T, F)
+            chunk = np.asarray(obs[start:end], dtype='float64')   # (B, T, F)
 
-            # Tier 2: clip all features to ±5σ (broadcast over B and T)
+            # Tier 2: clip all features to ±5σ
             np.clip(chunk, clip_lo[np.newaxis, np.newaxis, :],
                     clip_hi[np.newaxis, np.newaxis, :], out=chunk)
 
-            # Tier 1: additionally standardize (in-place for tier1 features)
+            # Tier 1: standardize fina + market MACD/MTM features
             for fi in tier1_idx:
                 s = float(tier1_std[fi])
                 if s > 1e-8:
                     chunk[:, :, fi] = (chunk[:, :, fi] - tier1_mean[fi]) / s
 
-            obs[start:end] = chunk.astype('float32')
+            if obs_kind == 'memmap':
+                obs[start:end] = chunk.astype('float32')
+            else:
+                obs[start:end] = chunk.astype('float16')   # zarr stores float16
 
-        obs.flush()
+        if obs_kind == 'memmap':
+            obs.flush()
         del obs
         print("done")
 
@@ -748,6 +769,138 @@ def normalize_cache(
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print("  Cache normalization complete.")
+
+
+# ─── Cache compression (float16 zarr) ────────────────────────────────────────
+
+def compress_cache(
+    cache_dir:   str,
+    chunk_size:  int   = 20_000,
+    cname:       str   = 'zstd',
+    clevel:      int   = 3,
+    force:       bool  = False,
+) -> None:
+    """
+    Convert obs and future memmaps → float16 zarr with blosc compression.
+
+    Must be called AFTER normalize_cache() so features are already in [-5,5].
+    Float16 precision is sufficient for z-scored/clipped financial features.
+
+    Compression target (5.5M seqs, 5190 stocks):
+      Float32 memmap (current): ~135 GB obs
+      Float16 zarr  zstd-3:     ~47 GB obs  → total ≤ 50 GB ✓
+      Float16 zarr  zstd-5:     ~32 GB obs  → total ≤ 35 GB ✓
+
+    chunk_size: zarr chunk rows — set equal to ChunkedLoader.chunk_samples
+                so one loader read = one zarr decompression (minimal overhead).
+    cname/clevel: 'zstd'/3 is the default (good speed/ratio). Use 'zstd'/5
+                  for maximum compression (2-3× slower decompress).
+
+    After successful conversion, original .npy files are deleted.
+    Idempotent: re-run safe (checks for .zarr directory first).
+    """
+    try:
+        import zarr
+        from zarr.codecs import BytesCodec, BloscCodec
+    except ImportError:
+        print("  [warn] zarr not installed — skipping compression. "
+              "pip install zarr to enable.")
+        return
+
+    meta_path = os.path.join(cache_dir, 'metadata.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    if meta.get('compressed') and not force:
+        print("  Cache already compressed (use force=True to reapply).")
+        return
+
+    if not meta.get('normalized'):
+        print("  [warn] normalize_cache() should be run before compress_cache().")
+
+    codecs = [
+        BytesCodec(),
+        BloscCodec(cname=cname, clevel=clevel, shuffle='bitshuffle'),
+    ]
+    T      = meta['seq_length']
+    n_past = meta['n_past']
+    n_fut  = meta['n_future']
+    max_fw = meta['max_fw']
+
+    total_saved = 0.0
+
+    for split in ('train', 'val', 'test'):
+        n = meta['splits'].get(split, {}).get('n_samples', 0)
+        if n == 0:
+            continue
+
+        # ── obs: (N, T, n_past) float32 → float16 zarr ───────────────────────
+        npy_path  = os.path.join(cache_dir, f'{split}_obs.npy')
+        zarr_path = os.path.join(cache_dir, f'{split}_obs.zarr')
+
+        if os.path.isdir(zarr_path) and not force:
+            print(f"  {split}_obs.zarr already exists — skipping")
+        elif os.path.exists(npy_path):
+            print(f"  Compressing {split}_obs ({n:,} seqs)...", end=' ', flush=True)
+            src = np.memmap(npy_path, dtype='float32', mode='r', shape=(n, T, n_past))
+            z   = zarr.open(zarr_path, mode='w', shape=(n, T, n_past), dtype='float16',
+                            chunks=(min(chunk_size, n), T, n_past), codecs=codecs)
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                z[start:end] = src[start:end].astype('float16')
+            del src
+            orig_gb  = os.path.getsize(npy_path) / 1e9
+            z_sz     = sum(os.path.getsize(os.path.join(r, f))
+                           for r, d, fs in os.walk(zarr_path) for f in fs)
+            comp_gb  = z_sz / 1e9
+            ratio    = orig_gb / comp_gb if comp_gb > 0 else 1.0
+            saved    = orig_gb - comp_gb
+            total_saved += saved
+            print(f"{orig_gb:.1f}GB → {comp_gb:.1f}GB ({ratio:.2f}x)")
+            os.remove(npy_path)
+
+        # ── future: (N, max_fw, n_future) float32 → float16 zarr ─────────────
+        fut_npy  = os.path.join(cache_dir, f'{split}_future.npy')
+        fut_zarr = os.path.join(cache_dir, f'{split}_future.zarr')
+        if os.path.isdir(fut_zarr) and not force:
+            pass
+        elif os.path.exists(fut_npy):
+            src = np.memmap(fut_npy, dtype='float32', mode='r', shape=(n, max_fw, n_fut))
+            z   = zarr.open(fut_zarr, mode='w', shape=(n, max_fw, n_fut), dtype='float16',
+                            chunks=(min(chunk_size, n), max_fw, n_fut), codecs=codecs)
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                z[start:end] = src[start:end].astype('float16')
+            del src
+            orig_gb = os.path.getsize(fut_npy) / 1e9
+            z_sz = sum(os.path.getsize(os.path.join(r, f))
+                       for r, d, fs in os.walk(fut_zarr) for f in fs)
+            total_saved += orig_gb - z_sz / 1e9
+            os.remove(fut_npy)
+
+    meta['compressed']   = True
+    meta['zarr_cname']   = cname
+    meta['zarr_clevel']  = clevel
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"  Compression complete. Saved {total_saved:.1f} GB.")
+
+
+def _open_zarr_or_memmap(path_base: str, dtype, shape):
+    """Open zarr if available, fall back to float32 memmap (backward compat)."""
+    zarr_path = path_base + '.zarr'
+    npy_path  = path_base + '.npy'
+    if os.path.isdir(zarr_path):
+        try:
+            import zarr as _zarr
+            z = _zarr.open(zarr_path, mode='r')
+            return z, 'zarr'
+        except Exception:
+            pass
+    if os.path.exists(npy_path):
+        arr = np.memmap(npy_path, dtype=dtype, mode='r', shape=shape)
+        return arr, 'memmap'
+    return np.zeros(shape, dtype=dtype), 'zeros'
 
 
 # ─── Cache helpers ─────────────────────────────────────────────────────────────
