@@ -411,70 +411,75 @@ def plot_error_distribution(
 # ─── Plot 8: Sector cross-attention pattern ────────────────────────────────────
 
 def plot_sector_cross_attention(
-    sector_attn_weights: np.ndarray,   # (N, K)
-    sector_ids: np.ndarray,            # (N,) — which sector each sample belongs to
+    sector_attn_weights: np.ndarray,   # (B, B) stock×stock GAT weights
+    sector_ids: np.ndarray,            # (B,) sector index per stock in batch
     sector_names: List[str] = None,
 ):
-    K = sector_attn_weights.shape[1]
+    """
+    SectorGAT returns (B, B) stock-to-stock attention.
+    Aggregate by sector to produce a sector×sector heatmap.
+    """
+    if sector_attn_weights.ndim != 2:
+        return
+    B = sector_attn_weights.shape[0]
+    # Handle both (B,B) and old (B,K) formats
+    if sector_attn_weights.shape[1] != B:
+        # Old format (B, K) — treat as before using sector_ids as row index
+        K = sector_attn_weights.shape[1]
+        active_secs = sorted(set(int(s) % K for s in sector_ids))
+        n = len(active_secs)
+        agg = np.zeros((n, n))
+        cnts = np.zeros((n, n))
+        s2r = {s: i for i, s in enumerate(active_secs)}
+        for b in range(len(sector_attn_weights)):
+            r = s2r.get(int(sector_ids[b]) % K, -1)
+            if r < 0: continue
+            for j, s in enumerate(active_secs):
+                if s < K:
+                    agg[r, j] += sector_attn_weights[b, s]
+                    cnts[r, j] += 1
+        cnts = cnts.clip(min=1); agg /= cnts
+        names = [sector_names[s] if sector_names and s < len(sector_names) else f'S{s}' for s in active_secs]
+    else:
+        # New (B, B) format from SectorGAT
+        unique_secs = sorted(set(int(s) for s in sector_ids))
+        n = len(unique_secs)
+        if n < 2:
+            return
+        s2r = {s: i for i, s in enumerate(unique_secs)}
+        agg = np.zeros((n, n)); cnts = np.zeros((n, n))
+        for bi in range(B):
+            for bj in range(B):
+                ri = s2r.get(int(sector_ids[bi]), -1)
+                rj = s2r.get(int(sector_ids[bj]), -1)
+                if ri >= 0 and rj >= 0:
+                    agg[ri, rj] += sector_attn_weights[bi, bj]
+                    cnts[ri, rj] += 1
+        cnts = cnts.clip(min=1); agg /= cnts
+        names = [sector_names[s] if sector_names and s < len(sector_names) else f'S{s}' for s in unique_secs]
 
-    # Only keep sectors that actually appear in the data
-    active_secs = sorted(set(int(s) % K for s in sector_ids))
-    n_active = len(active_secs)
+    row_std = agg.std(axis=1)
+    is_diag = np.trace(agg) / (agg.sum() + 1e-8) > 0.5
 
-    # Build active-sector × all-sector attention matrix
-    attn_matrix = np.zeros((n_active, K))
-    counts      = np.zeros(n_active)
-    sec_to_row  = {s: i for i, s in enumerate(active_secs)}
-    for b in range(len(sector_attn_weights)):
-        s = int(sector_ids[b]) % K
-        r = sec_to_row[s]
-        attn_matrix[r] += sector_attn_weights[b]
-        counts[r]       += 1
-    counts = counts.clip(min=1)
-    attn_matrix = attn_matrix / counts[:, np.newaxis]
-
-    # Also compute active×active sub-matrix
-    sub = attn_matrix[:, active_secs]   # (n_active, n_active)
-
-    # Diagnostic: is attention degenerate (uniform)?
-    attn_std = attn_matrix.std(axis=1).mean()
-    is_uniform = attn_std < 1e-4
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, max(5, n_active * 0.5 + 2)))
-    fig.suptitle('deeptime — Sector Cross-Attention  '
-                 f'({"UNIFORM — no sector differentiation learned" if is_uniform else "learned co-movements"})',
-                 fontsize=12, fontweight='bold',
-                 color='darkred' if is_uniform else 'black')
-
-    names_active = ([sector_names[s] for s in active_secs]
-                    if sector_names and max(active_secs) < len(sector_names)
-                    else [f'Sector {s}' for s in active_secs])
+    fig, axes = plt.subplots(1, 2, figsize=(14, max(5, n * 0.5 + 2)))
+    fig.suptitle(
+        'deeptime SectorGAT — Stock attention aggregated by Sector\n'
+        + ('Intra-sector dominant (diagonal)' if is_diag else 'Cross-sector attention active'),
+        fontsize=11, fontweight='bold')
 
     ax = axes[0]
-    im = ax.imshow(sub, cmap='Blues', aspect='auto', vmin=0)
+    im = ax.imshow(agg, cmap='Blues', aspect='auto', vmin=0)
     plt.colorbar(im, ax=ax, label='Mean Attention Weight')
-    ax.set_xticks(range(n_active)); ax.set_xticklabels(names_active, rotation=45, ha='right', fontsize=8)
-    ax.set_yticks(range(n_active)); ax.set_yticklabels(names_active, fontsize=8)
-    ax.set(title=f'Active sectors only ({n_active}/{K})',
-           xlabel='Attended sector', ylabel='Source sector')
+    ax.set_xticks(range(n)); ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
+    ax.set_yticks(range(n)); ax.set_yticklabels(names, fontsize=8)
+    ax.set(title='Sector × Sector aggregated GAT', xlabel='Attended', ylabel='Source')
 
     ax = axes[1]
-    # Show distribution of attention weight std per source sector
-    stds = attn_matrix.std(axis=1)
-    ax.barh(names_active, stds, color=['steelblue' if s > 1e-3 else 'lightgrey' for s in stds])
-    ax.axvline(0, color='k', linewidth=0.5)
-    ax.set(title='Attention selectivity per sector\n(0 = uniform, higher = more selective)',
-           xlabel='Std of attention weights', ylabel='Source sector')
+    ax.barh(names, row_std, color=['steelblue' if v > row_std.mean() else 'lightsteelblue' for v in row_std])
+    ax.set(title='Row selectivity (higher = more selective)', xlabel='Std')
     ax.grid(alpha=0.3, axis='x')
 
-    if is_uniform:
-        fig.text(0.5, 0.01,
-                 'All sectors attend uniformly to all others — sector cross-attention did not learn '
-                 'differentiated co-movement patterns in this run.',
-                 ha='center', fontsize=9, color='darkred',
-                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.tight_layout()
     _save(fig, 'sector_cross_attention.png')
 
 
