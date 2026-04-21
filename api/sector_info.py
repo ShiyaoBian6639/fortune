@@ -20,19 +20,38 @@ TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR      = Path('./stock_data')
 OUTPUT_FILE   = DATA_DIR / 'stock_sectors.csv'
 CALL_INTERVAL = 0.25   # conservative rate for classify / member calls
+API_TIMEOUT   = 120    # seconds
 
 
 def init_tushare():
     ts.set_token(TUSHARE_TOKEN)
-    return ts.pro_api(TUSHARE_TOKEN)
+    pro = ts.pro_api(TUSHARE_TOKEN)
+    try:
+        pro._DataApi__timeout = API_TIMEOUT
+    except AttributeError:
+        pass
+    return pro
+
+
+def _retry(fn, *args, label='call', max_retries=5, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            wait = 10 * (2 ** attempt)
+            if attempt < max_retries - 1:
+                print(f"  [{label}] attempt {attempt+1}/{max_retries}: {type(e).__name__}. Retry in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(f"{label} failed: {e}") from e
 
 
 def get_stock_basic(pro) -> pd.DataFrame:
     """Fetch ts_code, symbol, name, area, market, list_date, is_hs for all A-shares."""
     fields = 'ts_code,symbol,name,area,market,list_date,is_hs'
-    df_L = pro.stock_basic(exchange='', list_status='L', fields=fields)
-    df_P = pro.stock_basic(exchange='', list_status='P', fields=fields)
-    df_D = pro.stock_basic(exchange='', list_status='D', fields=fields)
+    df_L = _retry(pro.stock_basic, exchange='', list_status='L', fields=fields, label='stock_basic(L)')
+    df_P = _retry(pro.stock_basic, exchange='', list_status='P', fields=fields, label='stock_basic(P)')
+    df_D = _retry(pro.stock_basic, exchange='', list_status='D', fields=fields, label='stock_basic(D)')
     df   = pd.concat([df_L, df_P, df_D], ignore_index=True)
     df['exchange'] = df['ts_code'].str.split('.').str[1]
     df = df[df['exchange'].isin(['SH', 'SZ'])].copy()
@@ -48,12 +67,12 @@ def get_sw_classification(pro) -> pd.DataFrame:
     Returns DataFrame with columns: ts_code, sw_l1_code, sw_l1_name, sw_l2_code, sw_l2_name
     """
     # ── Get SW L1 and L2 index codes ─────────────────────────────────────────
-    print("  Fetching SW Level-1 industry list...")
-    l1_df = pro.index_classify(level='L1', src='SW')
+    print("  Fetching SW2021 Level-1 industry list...")
+    l1_df = _retry(pro.index_classify, level='L1', src='SW2021', label='index_classify(L1)')
     time.sleep(CALL_INTERVAL)
 
-    print("  Fetching SW Level-2 industry list...")
-    l2_df = pro.index_classify(level='L2', src='SW')
+    print("  Fetching SW2021 Level-2 industry list...")
+    l2_df = _retry(pro.index_classify, level='L2', src='SW2021', label='index_classify(L2)')
     time.sleep(CALL_INTERVAL)
 
     print(f"  SW L1: {len(l1_df)} sectors  |  SW L2: {len(l2_df)} sub-industries")
@@ -64,7 +83,7 @@ def get_sw_classification(pro) -> pd.DataFrame:
         code = row['index_code']
         name = row['industry_name']
         try:
-            members = pro.index_member(index_code=code)
+            members = _retry(pro.index_member, index_code=code, label=f'index_member(L1/{code})')
             if members is not None and not members.empty:
                 members = members[members['is_new'] == 'Y'].copy()
                 members['sw_l1_code'] = code
@@ -80,7 +99,7 @@ def get_sw_classification(pro) -> pd.DataFrame:
         code = row['index_code']
         name = row['industry_name']
         try:
-            members = pro.index_member(index_code=code)
+            members = _retry(pro.index_member, index_code=code, label=f'index_member(L2/{code})')
             if members is not None and not members.empty:
                 members = members[members['is_new'] == 'Y'].copy()
                 members['sw_l2_code'] = code

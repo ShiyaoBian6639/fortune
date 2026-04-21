@@ -51,12 +51,46 @@ TARGET_START   = '20170101'
 FLUSH_EVERY    = 30
 CALL_INTERVAL  = 0.13   # ~7.5 calls/s ≈ 450/min, safe for 7000-pt accounts
 
+# Network settings — increase for slow/unstable connections (remote servers)
+API_TIMEOUT    = 120    # seconds; default tushare SDK uses 30 which is too short
+MAX_RETRIES    = 5
+RETRY_BASE_SEC = 10     # exponential back-off: 10, 20, 40, 80, 160 seconds
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def init_tushare():
     ts.set_token(TUSHARE_TOKEN)
-    return ts.pro_api(TUSHARE_TOKEN)
+    pro = ts.pro_api(TUSHARE_TOKEN)
+    # Override the SDK's 30-second timeout — remote servers often need more
+    try:
+        pro._DataApi__timeout = API_TIMEOUT
+    except AttributeError:
+        pass   # SDK version doesn't expose it; best-effort
+    return pro
+
+
+def _retry(fn, *args, label='call', max_retries=MAX_RETRIES, **kwargs):
+    """
+    Call fn(*args, **kwargs) with exponential back-off on any exception.
+    Handles: ReadTimeout, connection errors, Tushare rate limits.
+    """
+    for attempt in range(max_retries):
+        try:
+            result = fn(*args, **kwargs)
+            return result
+        except Exception as e:
+            msg = str(e).lower()
+            is_rate  = 'exceed' in msg or 'limit' in msg or '频率' in msg
+            is_net   = 'timeout' in msg or 'connection' in msg or 'timed out' in msg
+            wait = (60 * (attempt + 1)) if is_rate else (RETRY_BASE_SEC * (2 ** attempt))
+            if attempt < max_retries - 1:
+                print(f"  [{label}] attempt {attempt+1}/{max_retries} failed: "
+                      f"{type(e).__name__}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(f"{label} failed after {max_retries} attempts: {e}") from e
+    return None
 
 
 def setup_directories():
@@ -93,7 +127,7 @@ def save_checkpoint(ck: dict):
 
 # ─── Stock list ───────────────────────────────────────────────────────────────
 
-def get_stock_list(pro=None, refresh=False, max_retries=5) -> pd.DataFrame:
+def get_stock_list(pro=None, refresh=False) -> pd.DataFrame:
     """Fetch SH/SZ stock list from Tushare Pro stock_basic (no akshare needed)."""
     if STOCK_LIST_FILE.exists() and not refresh:
         return pd.read_csv(STOCK_LIST_FILE)
@@ -103,18 +137,9 @@ def get_stock_list(pro=None, refresh=False, max_retries=5) -> pd.DataFrame:
 
     print("Fetching stock list from Tushare Pro (stock_basic)...")
     fields = 'ts_code,symbol,name,area,market,list_date,is_hs'
-    for attempt in range(max_retries):
-        try:
-            df_L = pro.stock_basic(exchange='', list_status='L', fields=fields)
-            df_P = pro.stock_basic(exchange='', list_status='P', fields=fields)
-            stock_list = pd.concat([df_L, df_P], ignore_index=True)
-            break
-        except Exception as e:
-            wait = 5 * (attempt + 1)
-            print(f"  Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
-    else:
-        raise RuntimeError("Failed to fetch stock list after all retries")
+    df_L = _retry(pro.stock_basic, exchange='', list_status='L', fields=fields, label='stock_basic(L)')
+    df_P = _retry(pro.stock_basic, exchange='', list_status='P', fields=fields, label='stock_basic(P)')
+    stock_list = pd.concat([df_L, df_P], ignore_index=True)
 
     stock_list['exchange'] = stock_list['ts_code'].str.split('.').str[1]
     stock_list = stock_list[stock_list['exchange'].isin(['SH', 'SZ'])].copy()
@@ -131,32 +156,26 @@ def get_stock_list(pro=None, refresh=False, max_retries=5) -> pd.DataFrame:
 
 def get_trading_dates(pro, start_date: str, end_date: str) -> list:
     """Return sorted list of trading dates (YYYYMMDD strings) in [start, end]."""
-    df = pro.trade_cal(exchange='SSE', start_date=start_date,
-                       end_date=end_date, is_open='1')
+    df = _retry(
+        pro.trade_cal,
+        exchange='SSE', start_date=start_date, end_date=end_date, is_open='1',
+        label='trade_cal',
+    )
     return sorted(df['cal_date'].astype(str).tolist())
 
 
 # ─── Per-date download ────────────────────────────────────────────────────────
 
-def download_date(pro, trade_date: str, max_retries: int = 3) -> pd.DataFrame:
-    """Download all stocks' daily OHLCV for one trading date."""
-    for attempt in range(max_retries):
-        try:
-            df = pro.daily(trade_date=trade_date)
-            if df is not None and not df.empty:
-                return df
-            return pd.DataFrame()
-        except Exception as e:
-            msg = str(e).lower()
-            if 'exceed' in msg or 'limit' in msg or '频率' in msg:
-                wait = 60 * (attempt + 1)
-                print(f"\n  [rate limit] waiting {wait}s...")
-                time.sleep(wait)
-            elif attempt < max_retries - 1:
-                time.sleep(3)
-            else:
-                return None   # signal failure
-    return None
+def download_date(pro, trade_date: str) -> pd.DataFrame:
+    """Download all stocks' daily OHLCV for one trading date (with retries)."""
+    try:
+        df = _retry(pro.daily, trade_date=trade_date, label=f'daily({trade_date})')
+        if df is not None and not df.empty:
+            return df
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  [{trade_date}] FAILED after all retries: {e}")
+        return None   # signal permanent failure
 
 
 # ─── Buffer flush ─────────────────────────────────────────────────────────────
