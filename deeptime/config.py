@@ -217,9 +217,9 @@ DEFAULT_CONFIG = {
     # For the full 5190-stock run, try 3e-5 or 5e-5.
     'learning_rate':            2e-5,
 
-    # Weight decay raised 0.01→0.05: restrains weight-magnitude growth
-    # that drives gradient norms upward under high LR.
-    'weight_decay':             0.05,
+    # Weight decay: 0.05→0.1 to fight overfitting (train IC 0.47 vs val IC 0.05
+    # after 13 epochs indicates severe overfit; stronger L2 is the right lever).
+    'weight_decay':             0.1,
 
     # Gradient clip lowered 1.0→0.5: pre-clip norms of 15-20 with max_norm=1.0
     # scales each step to 5-7% of raw gradient (direction-distorting).
@@ -227,9 +227,8 @@ DEFAULT_CONFIG = {
     'max_grad_norm':            0.5,
 
     'early_stopping_patience':  15,
-    'plateau_patience':         5,    # ReduceLROnPlateau: halve LR if val IC flat for N epochs
     'base_batch_for_lr':        192,  # reference batch size for LR linear scaling
-    'warmup_epochs':            8,
+    'warmup_epochs':            2,
     'use_amp':                  True,
     'random_seed':              42,
 

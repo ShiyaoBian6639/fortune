@@ -373,7 +373,7 @@ def main():
     print("\nCompressing cache (float16 zarr + blosc-zstd)...")
     compress_cache(config['cache_dir'],
                    chunk_size=config.get('chunk_samples', 20_000),
-                   cname='zstd', clevel=3)
+                   cname='zstd', clevel=5)
 
     # ── GPU memory limit: dedicated VRAM only (RTX 4070 Super = 12 GB) ───────
     if torch.cuda.is_available():

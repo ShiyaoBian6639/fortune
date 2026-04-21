@@ -255,31 +255,20 @@ def train_model(
         betas=(0.9, 0.95), weight_decay=weight_decay,
     )
 
-    # Cosine warmup (not linear) + cosine decay.
-    # WHY cosine warmup: linear warmup makes LR jump in equal steps (e.g. 25%
-    # per epoch). At the transition from low→high LR, the discrete step can
-    # push the model out of a good local basin. Cosine warmup ramps slowly at
-    # first and decelerates near the target LR — the critical "landing" zone
-    # near peak LR is traversed in tiny increments.
+    # Cosine warmup + cosine decay via a single LambdaLR.
+    # NOTE: Do NOT combine LambdaLR with ReduceLROnPlateau — LambdaLR resets
+    # the LR to base_lr*lambda(epoch) each step, overriding any ReduceLROnPlateau
+    # reduction (confirmed: epoch N plateau halves to X, epoch N+1 LambdaLR
+    # restores to 2X). Use only one scheduler.
     def _lr_lambda(epoch):
         if epoch < warmup_ep:
-            # Cosine warmup: starts at 10% of target LR (not 0 — avoids wasted epoch),
-            # ramps up slowly then decelerates near the target to avoid basin escape.
+            # Cosine warmup 10%→100% of peak LR
             progress = epoch / max(warmup_ep, 1)
-            return 0.1 + 0.9 * 0.5 * (1.0 - np.cos(np.pi * progress))  # 10%→100%
-        # Cosine decay after warmup
+            return 0.1 + 0.9 * 0.5 * (1.0 - np.cos(np.pi * progress))
         progress = (epoch - warmup_ep) / max(epochs - warmup_ep, 1)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
     primary_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-
-    # ReduceLROnPlateau as a secondary safeguard: if val IC stops improving
-    # for plateau_patience epochs, halve LR to re-enter nearby basins.
-    plateau_patience = config.get('plateau_patience', 5)
-    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5,
-        patience=plateau_patience, min_lr=scaled_lr * 0.01,
-    )
 
     scaler    = torch.amp.GradScaler('cuda') if use_amp and torch.cuda.is_available() else None
 
@@ -294,14 +283,13 @@ def train_model(
     patience_cnt = 0
 
     print(f"\nTraining on {device} | epochs={epochs} | lr={scaled_lr:.2e} | warmup={warmup_ep} (cosine) | patience={patience}")
-    print(f"  AMP={'on' if scaler else 'off'}  plateau_patience={plateau_patience}")
+    print(f"  AMP={'on' if scaler else 'off'}")
 
     for epoch in range(epochs):
         t0 = time.time()
         tr_loss, tr_ic, gn = train_epoch(model, train_loader, criterion, optimizer, device, scaler, max_gn)
         val_metrics, _, _  = evaluate(model, val_loader, criterion, device)
-        primary_scheduler.step()                    # cosine warmup + decay
-        plateau_scheduler.step(val_metrics['ic_mean'])  # ReduceLROnPlateau on val IC
+        primary_scheduler.step()
 
         val_loss = val_metrics['loss']
         val_ic   = val_metrics['ic_mean']
