@@ -1,0 +1,3 @@
+Stop-Process -Id 13660 -Force -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force stock_data\deeptime_cache\ -ErrorAction SilentlyContinue
+./venv/Scripts/python -m deeptime.main --max_stocks 100 --epochs 10

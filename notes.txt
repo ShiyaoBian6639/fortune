@@ -1,0 +1,11 @@
+1. 特征加入退市股票
+2. 分析哪些板块预测准确
+3. 涨跌模型共同预测
+
+done: index_weight, index_dailybasic, index_classify, index_member_all,index_global, idx_factor_pro
+
+fund_basic,fund_company,fund_manager, fund_share,fund_nav, fund_div, fund_portfolio, fund_factor_pro
+
+use industry and sector in sector.csv, fund
+
+treat calendar holiday as input when making predictions 
