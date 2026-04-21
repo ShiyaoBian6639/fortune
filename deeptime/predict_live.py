@@ -229,6 +229,44 @@ def run_inference(sequences: list, model, device: str, batch_size: int = 256):
     return np.concatenate(all_preds, axis=0)
 
 
+# ─── Inference-time normalization (matches normalize_cache) ───────────────────
+
+def _apply_live_scaler(sequences: list, cache_dir: str) -> list:
+    """
+    Apply the same Tier-1/Tier-2 normalization that was fitted on the training
+    cache to live inference sequences, ensuring training/inference consistency.
+
+    Loads feature_scaler.npz saved by normalize_cache().  If not found (e.g.
+    older cache), logs a warning and returns sequences unchanged.
+    """
+    scaler_path = os.path.join(cache_dir, 'feature_scaler.npz')
+    if not os.path.exists(scaler_path):
+        print("  [warn] No feature_scaler.npz in cache — using unnormalized features")
+        return sequences
+
+    s = np.load(scaler_path)
+    clip_lo    = s['clip_lo'].astype('float64')
+    clip_hi    = s['clip_hi'].astype('float64')
+    tier1_idx  = s['tier1_idx'].astype(int)
+    tier1_mean = s['tier1_mean'].astype('float64')
+    tier1_std  = s['tier1_std'].astype('float64')
+
+    n_past = len(clip_lo)
+    for seq in sequences:
+        obs = seq['obs_seq'][:, :n_past].astype('float64')   # (T, n_past)
+        # Tier 2: global ±5σ safety clip
+        np.clip(obs, clip_lo[np.newaxis, :], clip_hi[np.newaxis, :], out=obs)
+        # Tier 1: standardize fina + market MACD/MTM features
+        for fi in tier1_idx:
+            if fi < obs.shape[1] and tier1_std[fi] > 1e-8:
+                obs[:, fi] = (obs[:, fi] - tier1_mean[fi]) / tier1_std[fi]
+        seq['obs_seq'] = obs.astype('float32')
+
+    print(f"  Applied feature scaler ({len(tier1_idx)} Tier-1 features standardized, "
+          f"all {n_past} features clipped)")
+    return sequences
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -315,6 +353,17 @@ def main():
             sub_ind_to_id[str(sub)] = i
     sub_ind_to_id['Unknown'] = len(sub_ind_to_id)
 
+    # Build int-ID encodings for area and board BEFORE the per-row loop
+    # (area_dict/board_dict must store int IDs, not strings, for torch.tensor)
+    def _enum(series):
+        vals = sorted(set(str(v) for v in series.dropna().unique() if str(v) != 'Unknown'))
+        m = {v: i for i, v in enumerate(vals)}
+        m['Unknown'] = len(m)
+        return m
+
+    area_to_id_enc  = _enum(sector_data['area'])   if 'area'   in sector_data.columns else {'Unknown': 0}
+    board_to_id_enc = _enum(sector_data['market']) if 'market' in sector_data.columns else {'Unknown': 0}
+
     sector_dict = {}; industry_dict = {}; sub_ind_dict = {}
     area_dict = {}; board_dict = {}; ipo_age_dict = {}
     for _, row in sector_data.iterrows():
@@ -323,8 +372,9 @@ def main():
             sector_dict[d]   = str(row.get('sector',   'Unknown'))
             industry_dict[d] = str(row.get('industry', 'Unknown'))
             sub_ind_dict[d]  = 'Unknown'
-            area_dict[d]     = str(row.get('area',   'Unknown'))
-            board_dict[d]    = str(row.get('market', 'Unknown'))
+            # Store int IDs directly (not string names) so torch.tensor works
+            area_dict[d]  = area_to_id_enc.get(str(row.get('area',   'Unknown')), 0)
+            board_dict[d] = board_to_id_enc.get(str(row.get('market', 'Unknown')), 0)
             # IPO age bucket (0-5)
             try:
                 ld = pd.to_datetime(str(row.get('list_date', '')), errors='coerce')
@@ -388,6 +438,9 @@ def main():
             print(f"  {i+1}/{len(stock_files)} stocks built ({skipped} skipped)")
 
     print(f"\n{len(sequences)} sequences built, {skipped} skipped")
+
+    # ── Apply same normalization as training (load scaler from cache) ─────────
+    sequences = _apply_live_scaler(sequences, config['cache_dir'])
 
     # ── Run inference ────────────────────────────────────────────────────────
     print("Running inference...")
