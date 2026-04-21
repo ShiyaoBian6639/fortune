@@ -227,6 +227,8 @@ DEFAULT_CONFIG = {
     'max_grad_norm':            0.5,
 
     'early_stopping_patience':  15,
+    'plateau_patience':         5,    # ReduceLROnPlateau: halve LR if val IC flat for N epochs
+    'base_batch_for_lr':        192,  # reference batch size for LR linear scaling
     'warmup_epochs':            8,
     'use_amp':                  True,
     'random_seed':              42,
