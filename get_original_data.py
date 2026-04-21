@@ -1,8 +1,7 @@
 """
 Historical Stock Data Acquisition for SH and SZ Markets
 - Downloads 5 years of daily data
-- Uses Tushare for historical data (basic account compatible)
-- Gets stock list from AKShare (free, no registration)
+- Uses Tushare Pro for both stock list (stock_basic) and price data
 - Supports resume from checkpoint
 - Stores data in CSV format
 
@@ -15,7 +14,6 @@ Usage (PyCharm/Interactive):
 """
 
 import tushare as ts
-import akshare as ak
 import pandas as pd
 import os
 import time
@@ -84,61 +82,51 @@ def save_checkpoint(checkpoint):
     temp_file.replace(CHECKPOINT_FILE)
 
 
-def get_stock_list(refresh=False, max_retries=5):
+def get_stock_list(pro=None, refresh=False, max_retries=5):
     """
-    Get list of all stocks in SH and SZ markets.
-    Uses AKShare for stock list (free), Tushare for data.
+    Get list of all A-share stocks in SH and SZ markets via Tushare Pro stock_basic.
+
+    Fetches both listed (L) and suspended (P) stocks so the download covers
+    the full universe. Delisted stocks (D) are excluded — their CSVs from a
+    previous download are still usable for historical training.
     """
     if STOCK_LIST_FILE.exists() and not refresh:
         print("Loading cached stock list...")
         return pd.read_csv(STOCK_LIST_FILE)
 
-    print("Fetching stock list from AKShare (free)...")
+    if pro is None:
+        pro = init_tushare()
 
-    # Get all A-share stocks with retry logic
+    print("Fetching stock list from Tushare Pro (stock_basic)...")
+
+    fields = 'ts_code,symbol,name,area,industry,list_date'
     stock_list = None
     for attempt in range(max_retries):
         try:
-            stock_list = ak.stock_info_a_code_name()
+            # Listed + suspended; exclude delisted to keep list lean
+            df_L = pro.stock_basic(exchange='', list_status='L', fields=fields)
+            df_P = pro.stock_basic(exchange='', list_status='P', fields=fields)
+            stock_list = pd.concat([df_L, df_P], ignore_index=True)
             break
         except Exception as e:
             wait_time = 5 * (attempt + 1)
-            print(f"  Connection error (attempt {attempt+1}/{max_retries}): {type(e).__name__}")
+            print(f"  Error (attempt {attempt+1}/{max_retries}): {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 print(f"  Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 raise Exception(f"Failed to fetch stock list after {max_retries} attempts: {e}")
 
-    if stock_list is None:
-        raise Exception("Failed to fetch stock list")
+    if stock_list is None or stock_list.empty:
+        raise Exception("stock_basic returned empty result")
 
-    # stock_list has columns: code, name
-    stock_list = stock_list.rename(columns={'code': 'symbol', 'name': 'name'})
+    # ts_code format: 'XXXXXX.SH' or 'XXXXXX.SZ' (Tushare uses SH/SZ not SSE/SZSE)
+    stock_list['exchange'] = stock_list['ts_code'].str.split('.').str[1]
 
-    # Determine exchange based on code prefix
-    # SH: 600xxx, 601xxx, 603xxx, 605xxx, 688xxx (starts with 6)
-    # SZ: 000xxx, 001xxx, 002xxx, 300xxx, 301xxx (starts with 0 or 3)
-    def get_exchange(code):
-        if code.startswith('6'):
-            return 'SH'
-        elif code.startswith('0') or code.startswith('3'):
-            return 'SZ'
-        else:
-            return 'OTHER'
-
-    stock_list['exchange'] = stock_list['symbol'].apply(get_exchange)
-
-    # Filter only SH and SZ
+    # Keep only SH and SZ (exclude BJ — Beijing exchange, added 2021)
     stock_list = stock_list[stock_list['exchange'].isin(['SH', 'SZ'])].copy()
-
-    # Create ts_code format for Tushare API
-    stock_list['ts_code'] = stock_list['symbol'] + '.' + stock_list['exchange']
-
-    # Sort by symbol
     stock_list = stock_list.sort_values('symbol').reset_index(drop=True)
 
-    # Save to cache
     stock_list.to_csv(STOCK_LIST_FILE, index=False)
 
     sh_count = len(stock_list[stock_list['exchange'] == 'SH'])
@@ -305,7 +293,7 @@ def retry_failed(pro):
 
     print(f"Retrying {len(failed_stocks)} failed stocks...")
 
-    stock_list = get_stock_list()
+    stock_list = get_stock_list(pro=pro)
 
     # Reset failed list
     checkpoint['failed'] = []
@@ -406,7 +394,7 @@ def run(command, batch=None):
         retry_failed(pro)
     elif command == 'download':
         pro = init_tushare()
-        stock_list = get_stock_list()
+        stock_list = get_stock_list(pro=pro)
         download_all_stocks(pro, stock_list, batch_size=batch)
     else:
         print("Available commands: 'init', 'download', 'status', 'retry', 'reset', 'refresh'")
@@ -440,7 +428,8 @@ def main():
         return
 
     if args.init or args.refresh_list:
-        get_stock_list(refresh=args.refresh_list)
+        pro = init_tushare()
+        get_stock_list(pro=pro, refresh=args.refresh_list)
         print("Initialization complete. Run with --download to start downloading.")
         return
 
@@ -451,7 +440,7 @@ def main():
 
     if args.download:
         pro = init_tushare()
-        stock_list = get_stock_list()
+        stock_list = get_stock_list(pro=pro)
         download_all_stocks(pro, stock_list, batch_size=args.batch)
         return
 
