@@ -77,6 +77,7 @@ def load_extend_checkpoint():
 
 def save_extend_checkpoint(checkpoint):
     """Save extension progress checkpoint (deduplicates lists on save)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)  # ensure stock_data/ exists
     deduped = {
         'completed': list(set(checkpoint['completed'])),
         'failed':    list(set(checkpoint['failed'])),
@@ -294,9 +295,19 @@ def extend_all_stocks(
                        Raise to 10–12 if you have a higher-tier account and
                        want to go faster; lower if you see rate-limit errors.
     """
+    # Ensure required directories exist on a fresh machine
+    for subdir in ('sh', 'sz'):
+        (DATA_DIR / subdir).mkdir(parents=True, exist_ok=True)
+
     pro    = init_tushare()
     stocks = get_existing_stocks()
     checkpoint = load_extend_checkpoint()
+
+    if not stocks:
+        print("\n  [INFO] No stock CSV files found in stock_data/sh or stock_data/sz.")
+        print("  Run get_original_data.py first to download the initial dataset.")
+        print("  Example:  python get_original_data.py\n")
+        return
 
     completed_set = set(checkpoint['completed'])
     skipped_set   = set(checkpoint['skipped'])

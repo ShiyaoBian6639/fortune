@@ -112,8 +112,37 @@ def update_block():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _ensure_dirs():
+    """Create required data subdirectories if they don't exist."""
+    import os
+    for d in ('stock_data/sh', 'stock_data/sz', 'stock_data/daily_basic',
+              'stock_data/moneyflow', 'stock_data/stk_limit', 'stock_data/block_trade',
+              'stock_data/index/idx_factor_pro', 'stock_data/index/index_global',
+              'stock_data/index/index_weight', 'stock_data/index/index_dailybasic',
+              'stock_data/fina_indicator'):
+        os.makedirs(d, exist_ok=True)
+
+
+def _check_fresh_install():
+    """Detect empty data folder and prompt for initial download."""
+    import os
+    sh_count = len([f for f in os.listdir('stock_data/sh') if f.endswith('.csv')]) if os.path.isdir('stock_data/sh') else 0
+    if sh_count == 0:
+        print("\n  [WARNING] No stock data found (stock_data/sh is empty).")
+        print("  For a fresh install, run the initial download first:")
+        print("    python get_original_data.py")
+        print("  Then re-run update_all.py for incremental updates.\n")
+        return False
+    return True
+
+
 if __name__ == '__main__':
     print(f"\nStarting full data update — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    _ensure_dirs()
+
+    if not _check_fresh_install():
+        sys.exit(0)
 
     if not skip_stocks:
         _run_group('stocks', update_stocks)
