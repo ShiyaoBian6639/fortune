@@ -192,14 +192,24 @@ class RegressionChunkedLoader:
 
     def _open_memmaps(self):
         s = self.split; n = self.n_samples; d = self.data_dir
-        self._obs     = np.memmap(os.path.join(d, f'{s}_obs.npy'),    dtype='float32', mode='r', shape=(n, self.seq_length, self.n_past))
-        self._future  = np.memmap(os.path.join(d, f'{s}_future.npy'), dtype='float32', mode='r', shape=(n, self.max_fw,    self.n_future))
-        self._targets = np.memmap(os.path.join(d, f'{s}_targets.npy'),dtype='float32', mode='r', shape=(n, self.num_horizons))
-        self._sectors = np.memmap(os.path.join(d, f'{s}_sectors.npy'),   dtype='int64', mode='r', shape=(n,))
-        self._inds    = np.memmap(os.path.join(d, f'{s}_industries.npy'),dtype='int64', mode='r', shape=(n,))
-        self._subs    = np.memmap(os.path.join(d, f'{s}_sub_inds.npy'), dtype='int64', mode='r', shape=(n,))
-        self._sizes   = np.memmap(os.path.join(d, f'{s}_sizes.npy'),    dtype='int64', mode='r', shape=(n,))
-        self._dates   = np.memmap(os.path.join(d, f'{s}_dates.npy'),   dtype='int32', mode='r', shape=(n,))
+
+        def _mm(fname, dtype, shape):
+            path = os.path.join(d, fname)
+            if os.path.exists(path):
+                return np.memmap(path, dtype=dtype, mode='r', shape=shape)
+            return np.zeros(shape, dtype=dtype)   # zero-fill for old caches
+
+        self._obs     = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
+        self._future  = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
+        self._targets = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
+        self._sectors = _mm(f'{s}_sectors.npy',    'int64',   (n,))
+        self._inds    = _mm(f'{s}_industries.npy', 'int64',   (n,))
+        self._subs    = _mm(f'{s}_sub_inds.npy',   'int64',   (n,))
+        self._sizes   = _mm(f'{s}_sizes.npy',      'int64',   (n,))
+        self._areas   = _mm(f'{s}_areas.npy',      'int64',   (n,))
+        self._boards  = _mm(f'{s}_boards.npy',     'int64',   (n,))
+        self._ipo     = _mm(f'{s}_ipo_ages.npy',   'int64',   (n,))
+        self._dates   = _mm(f'{s}_dates.npy',      'int32',   (n,))
 
     def __len__(self):
         return self._n_batches
@@ -209,7 +219,6 @@ class RegressionChunkedLoader:
         if self.shuffle:
             np.random.shuffle(indices)
 
-        chunk_q = deque()
         executor = ThreadPoolExecutor(max_workers=1)
 
         def _load_chunk(chunk_idx):
@@ -224,6 +233,9 @@ class RegressionChunkedLoader:
                 self._inds[idx].copy(),
                 self._subs[idx].copy(),
                 self._sizes[idx].copy(),
+                self._areas[idx].copy(),
+                self._boards[idx].copy(),
+                self._ipo[idx].copy(),
                 self._dates[idx].copy(),
             )
 
@@ -235,14 +247,14 @@ class RegressionChunkedLoader:
             if chunk_i + 1 < n_chunks:
                 fut = executor.submit(_load_chunk, chunk_i + 1)
 
-            obs, future, tgt, sec, ind, sub, sz, dates = chunk
+            obs, future, tgt, sec, ind, sub, sz, area, board, ipo, dates = chunk
             n = len(obs)
-            # Local shuffle within chunk
             if self.shuffle:
                 perm = np.random.permutation(n)
-                obs = obs[perm]; future = future[perm]; tgt = tgt[perm]
-                sec = sec[perm]; ind = ind[perm]; sub = sub[perm]
-                sz  = sz[perm];  dates = dates[perm]
+                obs = obs[perm]; future = future[perm]; tgt   = tgt[perm]
+                sec = sec[perm]; ind    = ind[perm];    sub   = sub[perm]
+                sz  = sz[perm];  area   = area[perm];   board = board[perm]
+                ipo = ipo[perm]; dates  = dates[perm]
 
             for b_start in range(0, n, self.batch_size):
                 b_end = b_start + self.batch_size
@@ -254,6 +266,9 @@ class RegressionChunkedLoader:
                     torch.from_numpy(ind[b_start:b_end]).to(self.device),
                     torch.from_numpy(sub[b_start:b_end]).to(self.device),
                     torch.from_numpy(sz[b_start:b_end]).to(self.device),
+                    torch.from_numpy(area[b_start:b_end]).to(self.device),
+                    torch.from_numpy(board[b_start:b_end]).to(self.device),
+                    torch.from_numpy(ipo[b_start:b_end]).to(self.device),
                 )
 
         executor.shutdown(wait=False)

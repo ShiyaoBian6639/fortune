@@ -331,13 +331,14 @@ def main():
     try:
         with torch.no_grad():
             for batch in loaders['test']:
-                obs    = batch[0].to(config['device'])
-                future = batch[1].to(config['device'])
-                sec    = batch[3].to(config['device']) if isinstance(batch[3], torch.Tensor) else torch.tensor(batch[3], device=config['device'])
-                ind    = batch[4].to(config['device']) if isinstance(batch[4], torch.Tensor) else torch.tensor(batch[4], device=config['device'])
-                sub    = batch[5].to(config['device']) if isinstance(batch[5], torch.Tensor) else torch.tensor(batch[5], device=config['device'])
-                sz     = batch[6].to(config['device']) if isinstance(batch[6], torch.Tensor) else torch.tensor(batch[6], device=config['device'])
-                _ = model(obs, future, sec, ind, sub, sz)
+                def _t(x): return x.to(config['device']) if isinstance(x, torch.Tensor) else torch.tensor(x, device=config['device'])
+                obs    = _t(batch[0]); future = _t(batch[1])
+                sec    = _t(batch[3]); ind    = _t(batch[4])
+                sub    = _t(batch[5]); sz     = _t(batch[6])
+                area   = _t(batch[7])  if len(batch) > 7  else torch.zeros_like(sec)
+                board  = _t(batch[8])  if len(batch) > 8  else torch.zeros_like(sec)
+                ipo    = _t(batch[9])  if len(batch) > 9  else torch.zeros_like(sec)
+                _ = model(obs, future, sec, ind, sub, sz, area, board, ipo)
                 break
     except Exception:
         pass

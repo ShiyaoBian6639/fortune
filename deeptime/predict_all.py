@@ -49,17 +49,18 @@ def predict_split(model, dataset, config, batch_size=512):
     all_preds, all_targets, all_dates, all_sectors = [], [], [], []
 
     for batch in loader:
-        obs    = batch[0].to(device)
-        future = batch[1].to(device)
-        tgt    = batch[2]
-        sec    = batch[3].to(device) if isinstance(batch[3], torch.Tensor) else torch.tensor(batch[3], device=device)
-        ind    = batch[4].to(device) if isinstance(batch[4], torch.Tensor) else torch.tensor(batch[4], device=device)
-        sub    = batch[5].to(device) if isinstance(batch[5], torch.Tensor) else torch.tensor(batch[5], device=device)
-        sz     = batch[6].to(device) if isinstance(batch[6], torch.Tensor) else torch.tensor(batch[6], device=device)
-        dates  = batch[7] if len(batch) > 7 else None
+        def _t(x): return x.to(device) if isinstance(x, torch.Tensor) else torch.tensor(x, device=device)
+        obs    = _t(batch[0]); future = _t(batch[1]); tgt = batch[2]
+        sec    = _t(batch[3]); ind    = _t(batch[4])
+        sub    = _t(batch[5]); sz     = _t(batch[6])
+        area   = _t(batch[7])  if len(batch) > 7  else torch.zeros_like(sec)
+        board  = _t(batch[8])  if len(batch) > 8  else torch.zeros_like(sec)
+        ipo    = _t(batch[9])  if len(batch) > 9  else torch.zeros_like(sec)
+        # anchor_date is index 10 in the 11-tuple
+        dates  = batch[10] if len(batch) > 10 else None
 
         with torch.autocast(device.split(':')[0], torch.float16, enabled=(device != 'cpu')):
-            preds = model(obs, future, sec, ind, sub, sz)
+            preds = model(obs, future, sec, ind, sub, sz, area, board, ipo)
 
         all_preds.append(preds.float().cpu().numpy())
         all_targets.append(tgt.numpy() if isinstance(tgt, torch.Tensor) else np.array(tgt))

@@ -86,8 +86,11 @@ def build_live_sequence(
     fina_dict:       dict,
     block_dict:      dict,
     cs_tech_stats:   dict,
-    future_dates:    list,           # next 5 trading days (pd.Timestamp)
+    future_dates:    list,
     seq_len:         int = 30,
+    area_dict:       dict = None,
+    board_dict:      dict = None,
+    ipo_age_dict:    dict = None,
 ) -> dict | None:
     """
     Build the obs_seq and future_inputs tensors for the most recent window.
@@ -175,15 +178,23 @@ def build_live_sequence(
         # For future_inputs, we need (max_fw, n_future)
         future_arr = future_df[DT_KNOWN_FUTURE_COLUMNS].values[:MAX_FORWARD_WINDOW].astype('float32')
 
+        # Look up new static IDs from enriched sector data
+        area_id  = area_dict.get(ts_code, area_dict.get(bare, 0))     if area_dict  else 0
+        board_id = board_dict.get(ts_code, board_dict.get(bare, 0))   if board_dict else 0
+        ipo_id   = ipo_age_dict.get(ts_code, ipo_age_dict.get(bare, 6)) if ipo_age_dict else 6
+
         return {
             'ts_code':     ts_code,
             'last_date':   last_date,
-            'obs_seq':     obs_seq,        # (seq_len, n_past)
-            'future_inputs': future_arr,   # (5, n_future)
+            'obs_seq':     obs_seq,
+            'future_inputs': future_arr,
             'sector_id':   sector_id,
             'industry_id': industry_id,
             'sub_ind_id':  sub_ind_id,
             'size_id':     size_id,
+            'area_id':     area_id,
+            'board_id':    board_id,
+            'ipo_age_id':  ipo_id,
         }
 
     except Exception as e:
@@ -203,13 +214,15 @@ def run_inference(sequences: list, model, device: str, batch_size: int = 256):
 
         obs    = torch.tensor(np.stack([s['obs_seq']      for s in batch]), dtype=torch.float32).to(device)
         future = torch.tensor(np.stack([s['future_inputs'] for s in batch]), dtype=torch.float32).to(device)
-        sec    = torch.tensor([s['sector_id']   for s in batch], dtype=torch.long).to(device)
-        ind    = torch.tensor([s['industry_id'] for s in batch], dtype=torch.long).to(device)
-        sub    = torch.tensor([s['sub_ind_id']  for s in batch], dtype=torch.long).to(device)
-        sz     = torch.tensor([s['size_id']     for s in batch], dtype=torch.long).to(device)
+        def _ids(key, default=0):
+            return torch.tensor([s.get(key, default) for s in batch], dtype=torch.long).to(device)
+        sec   = _ids('sector_id');  ind  = _ids('industry_id')
+        sub   = _ids('sub_ind_id'); sz   = _ids('size_id')
+        area  = _ids('area_id');    board = _ids('board_id')
+        ipo   = _ids('ipo_age_id', default=6)
 
         with torch.autocast(device.split(':')[0], torch.float16, enabled=(device != 'cpu')):
-            preds = model(obs, future, sec, ind, sub, sz)
+            preds = model(obs, future, sec, ind, sub, sz, area, board, ipo)
 
         all_preds.append(preds.float().cpu().numpy())
 
@@ -303,14 +316,26 @@ def main():
     sub_ind_to_id['Unknown'] = len(sub_ind_to_id)
 
     sector_dict = {}; industry_dict = {}; sub_ind_dict = {}
+    area_dict = {}; board_dict = {}; ipo_age_dict = {}
     for _, row in sector_data.iterrows():
         code = str(row['ts_code']); bare = code.split('.')[0]
-        s = str(row.get('sector', 'Unknown'))
-        sector_dict[code] = s; sector_dict[bare] = s
-        ind = str(row.get('industry', 'Unknown'))
-        industry_dict[code] = ind; industry_dict[bare] = ind
-        sub = str(row.get('sub_industry', 'Unknown'))
-        sub_ind_dict[code] = sub; sub_ind_dict[bare] = sub
+        for d in [code, bare]:
+            sector_dict[d]   = str(row.get('sector',   'Unknown'))
+            industry_dict[d] = str(row.get('industry', 'Unknown'))
+            sub_ind_dict[d]  = 'Unknown'
+            area_dict[d]     = str(row.get('area',   'Unknown'))
+            board_dict[d]    = str(row.get('market', 'Unknown'))
+            # IPO age bucket (0-5)
+            try:
+                ld = pd.to_datetime(str(row.get('list_date', '')), errors='coerce')
+                if pd.isna(ld):
+                    ipo_age_dict[d] = 6
+                else:
+                    yrs = (pd.Timestamp.today() - ld).days / 365.25
+                    ipo_age_dict[d] = (0 if yrs<1 else 1 if yrs<2 else 2 if yrs<3
+                                       else 3 if yrs<5 else 4 if yrs<10 else 5)
+            except Exception:
+                ipo_age_dict[d] = 6
 
     # CS tech stats (lightweight first pass on first 200 stocks)
     from dl.data_processing import compute_cross_section_tech_stats
@@ -350,6 +375,9 @@ def main():
             stk_limit_dict, moneyflow_dict,
             fina_data, block_by_stock,
             cs_tech_stats, future_dates, seq_len,
+            area_dict=area_dict,
+            board_dict=board_dict,
+            ipo_age_dict=ipo_age_dict,
         )
         if result is None:
             skipped += 1

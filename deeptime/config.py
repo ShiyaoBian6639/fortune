@@ -199,10 +199,11 @@ DEFAULT_CONFIG = {
     'num_ipo_age':      NUM_IPO_AGE_BUCKETS,
 
     # Training
-    # batch=256: 984 seqs/s, peak 8.49 GB dedicated VRAM (73% of 11.6 GB hard limit) — optimal
-    # batch=128: 927 seqs/s, peak 4.35 GB — safe fallback if VRAM pressure increases
-    # batch=512: spills into shared memory (16.75 GB) — do not use
-    'batch_size':               256,
+    # batch=192: ~900 seqs/s, peak ~8 GB dedicated VRAM — safe after adding 3 new
+    #            static arrays (areas/boards/ipo_ages) raised peak from 8.5→10.6 GB at 256
+    # batch=256: was 8.5 GB but now 10.6 GB with new static arrays — too close to 11.6 GB limit
+    # batch=128: 927 seqs/s, peak ~5.5 GB — safe fallback
+    'batch_size':               192,
     'epochs':                   50,
     'learning_rate':            5e-5,
     'early_stopping_patience':  15,
