@@ -102,23 +102,25 @@ def train_epoch(
     device_type = device.split(':')[0]
 
     for batch in loader:
-        if len(batch) == 7:
-            obs, future, targets, sector, ind, sub, sz = [b.to(device, non_blocking=True) if isinstance(b, torch.Tensor) else torch.tensor(b, device=device) for b in batch]
-        elif len(batch) >= 7:
-            obs      = batch[0].to(device, non_blocking=True)
-            future   = batch[1].to(device, non_blocking=True)
-            targets  = batch[2].to(device, non_blocking=True)
-            sector   = batch[3].to(device, non_blocking=True) if isinstance(batch[3], torch.Tensor) else torch.tensor(batch[3], device=device)
-            ind      = batch[4].to(device, non_blocking=True) if isinstance(batch[4], torch.Tensor) else torch.tensor(batch[4], device=device)
-            sub      = batch[5].to(device, non_blocking=True) if isinstance(batch[5], torch.Tensor) else torch.tensor(batch[5], device=device)
-            sz       = batch[6].to(device, non_blocking=True) if isinstance(batch[6], torch.Tensor) else torch.tensor(batch[6], device=device)
-        else:
+        if len(batch) < 7:
             continue
+        def _t(x): return x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else torch.tensor(x, device=device)
+        obs     = _t(batch[0])
+        future  = _t(batch[1])
+        targets = _t(batch[2])
+        sector  = _t(batch[3])
+        ind     = _t(batch[4])
+        sub     = _t(batch[5])
+        sz      = _t(batch[6])
+        # New static fields (indices 7-9); zero-fill if old cache without them
+        area    = _t(batch[7])  if len(batch) > 7  else torch.zeros_like(sector)
+        board   = _t(batch[8])  if len(batch) > 8  else torch.zeros_like(sector)
+        ipo_age = _t(batch[9])  if len(batch) > 9  else torch.zeros_like(sector)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=(scaler is not None)):
-            preds = model(obs, future, sector, ind, sub, sz)
+            preds = model(obs, future, sector, ind, sub, sz, area, board, ipo_age)
             loss  = criterion(preds, targets)
 
         # Skip batch if loss is NaN/inf (bad data or numerical instability)
@@ -177,18 +179,16 @@ def evaluate(
     all_targets = []
 
     for batch in loader:
-        if len(batch) >= 7:
-            obs    = batch[0].to(device, non_blocking=True)
-            future = batch[1].to(device, non_blocking=True)
-            tgt    = batch[2].to(device, non_blocking=True)
-            sec    = batch[3].to(device, non_blocking=True) if isinstance(batch[3], torch.Tensor) else torch.tensor(batch[3], device=device)
-            ind    = batch[4].to(device, non_blocking=True) if isinstance(batch[4], torch.Tensor) else torch.tensor(batch[4], device=device)
-            sub    = batch[5].to(device, non_blocking=True) if isinstance(batch[5], torch.Tensor) else torch.tensor(batch[5], device=device)
-            sz     = batch[6].to(device, non_blocking=True) if isinstance(batch[6], torch.Tensor) else torch.tensor(batch[6], device=device)
-        else:
+        if len(batch) < 7:
             continue
+        def _t(x): return x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else torch.tensor(x, device=device)
+        obs    = _t(batch[0]); future = _t(batch[1]); tgt = _t(batch[2])
+        sec    = _t(batch[3]); ind    = _t(batch[4]); sub = _t(batch[5]); sz  = _t(batch[6])
+        area   = _t(batch[7])  if len(batch) > 7  else torch.zeros_like(sec)
+        board  = _t(batch[8])  if len(batch) > 8  else torch.zeros_like(sec)
+        ipo    = _t(batch[9])  if len(batch) > 9  else torch.zeros_like(sec)
 
-        preds = model(obs, future, sec, ind, sub, sz)
+        preds = model(obs, future, sec, ind, sub, sz, area, board, ipo)
         loss  = criterion(preds, tgt)
         total_loss += loss.item()
         n_batches  += 1

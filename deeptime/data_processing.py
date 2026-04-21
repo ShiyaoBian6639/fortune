@@ -505,39 +505,60 @@ def prepare_dataset_regression(
     target_mode   = config.get('target_mode', 'excess')
     max_seqs      = config.get('max_sequences_per_stock', None)
 
-    # Build sector / industry encodings
-    sector_to_id   = {s: i for i, s in enumerate(sector_data['sector'].unique())} if len(sector_data) else {}
-    sector_to_id['Unknown'] = len(sector_to_id)
+    from datetime import datetime as _dt
 
-    industry_to_id = {}
-    sub_ind_to_id  = {}
-    if len(sector_data) and 'industry' in sector_data.columns:
-        for i, ind in enumerate(sector_data['industry'].dropna().unique()):
-            industry_to_id[str(ind)] = i
-    industry_to_id['Unknown'] = len(industry_to_id)
+    def _build_enum(series, col_name):
+        """Build {value: int_id} mapping; 'Unknown' always last."""
+        vals = [v for v in series.dropna().unique() if str(v) != 'Unknown']
+        m = {str(v): i for i, v in enumerate(sorted(vals))}
+        m['Unknown'] = len(m)
+        return m
 
-    if len(sector_data) and 'sub_industry' in sector_data.columns:
-        for i, sub in enumerate(sector_data['sub_industry'].dropna().unique()):
-            sub_ind_to_id[str(sub)] = i
-    sub_ind_to_id['Unknown'] = len(sub_ind_to_id)
+    # ── Sector / industry encodings — use SW L1/L2 from enriched sector_data ──
+    # Prefer sw_l1_name (SW classification) over legacy 'sector' (9-category)
+    sw_l1_col = 'sw_l1_name' if 'sw_l1_name' in sector_data.columns else 'sector'
+    sw_l2_col = 'sw_l2_name' if 'sw_l2_name' in sector_data.columns else 'industry'
+
+    sector_to_id   = _build_enum(sector_data[sw_l1_col], sw_l1_col) if len(sector_data) else {'Unknown': 0}
+    industry_to_id = _build_enum(sector_data[sw_l2_col], sw_l2_col) if len(sector_data) else {'Unknown': 0}
+    sub_ind_to_id  = {'Unknown': 0}   # SW L3 not downloaded; placeholder
+
+    # New static dimensions
+    area_to_id     = _build_enum(sector_data['area'],   'area')   if 'area'   in sector_data.columns else {'Unknown': 0}
+    board_to_id    = _build_enum(sector_data['market'], 'market') if 'market' in sector_data.columns else {'Unknown': 0}
+    # IPO age buckets: 0=<1yr, 1=1-2yr, 2=2-3yr, 3=3-5yr, 4=5-10yr, 5=10yr+, 6=unknown
+    def _ipo_age_bucket(list_date_str) -> int:
+        try:
+            ld = pd.to_datetime(str(list_date_str), errors='coerce')
+            if pd.isna(ld): return 6
+            years = (pd.Timestamp.today() - ld).days / 365.25
+            if years <  1: return 0
+            if years <  2: return 1
+            if years <  3: return 2
+            if years <  5: return 3
+            if years < 10: return 4
+            return 5
+        except Exception:
+            return 6
 
     # Build lookup dicts (O(1) per stock)
     sector_dict   = {}
     industry_dict = {}
     sub_ind_dict  = {}
+    area_dict     = {}
+    board_dict    = {}
+    ipo_age_dict  = {}
     if len(sector_data):
         for _, row in sector_data.iterrows():
             code = str(row['ts_code'])
             bare = code.split('.')[0]
-            s = str(row.get('sector', 'Unknown'))
-            sector_dict[code] = s
-            sector_dict[bare] = s
-            ind = str(row.get('industry', 'Unknown'))
-            industry_dict[code] = ind
-            industry_dict[bare] = ind
-            sub = str(row.get('sub_industry', 'Unknown'))
-            sub_ind_dict[code] = sub
-            sub_ind_dict[bare] = sub
+            for d in [code, bare]:
+                sector_dict[d]   = str(row.get(sw_l1_col, 'Unknown'))
+                industry_dict[d] = str(row.get(sw_l2_col, 'Unknown'))
+                sub_ind_dict[d]  = 'Unknown'
+                area_dict[d]     = str(row.get('area',   'Unknown'))
+                board_dict[d]    = str(row.get('market', 'Unknown'))
+                ipo_age_dict[d]  = _ipo_age_bucket(row.get('list_date', None))
 
     # Pre-group daily_basic
     daily_basic_dict: Dict[str, pd.DataFrame] = {}
@@ -773,24 +794,27 @@ def prepare_dataset_regression(
             targets = np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
             targets = np.clip(targets, -30.0, 30.0).astype('float32')
 
-            # Static IDs
-            sector   = sector_dict.get(ts_code, 'Unknown')
-            sec_id   = sector_to_id.get(sector, sector_to_id['Unknown'])
-            industry = industry_dict.get(ts_code, 'Unknown')
-            ind_id   = industry_to_id.get(industry, industry_to_id['Unknown'])
-            sub_ind  = sub_ind_dict.get(ts_code, 'Unknown')
-            sub_id   = sub_ind_to_id.get(sub_ind, sub_ind_to_id['Unknown'])
+            # Static IDs — all 7 covariates for TFT static context
+            def _get(d, key, fallback): return d.get(ts_code, d.get(bare, fallback))
+            N = len(valid_indices)
+            sec_id   = sector_to_id .get(_get(sector_dict,   ts_code, 'Unknown'), sector_to_id ['Unknown'])
+            ind_id   = industry_to_id.get(_get(industry_dict, ts_code, 'Unknown'), industry_to_id['Unknown'])
+            sub_id   = 0
             size_id  = size_decile_map.get(bare, 10)
+            area_id  = area_to_id.get( _get(area_dict,  ts_code, 'Unknown'), area_to_id ['Unknown'])
+            board_id = board_to_id.get(_get(board_dict, ts_code, 'Unknown'), board_to_id['Unknown'])
+            ipo_id   = ipo_age_dict.get(ts_code, ipo_age_dict.get(bare, 6))
 
-            sectors_arr  = np.full(len(valid_indices), sec_id,  dtype=np.int64)
-            ind_arr      = np.full(len(valid_indices), ind_id,  dtype=np.int64)
-            sub_arr      = np.full(len(valid_indices), sub_id,  dtype=np.int64)
-            size_arr     = np.full(len(valid_indices), size_id, dtype=np.int64)
+            def _fill(v): return np.full(N, v, dtype=np.int64)
 
             # Write directly to pre-allocated split memmaps (no RAM buffering)
             writer.write_batch(
                 obs_seqs, future_seqs, targets,
-                sectors_arr, ind_arr, sub_arr, size_arr, anchor_dates,
+                _fill(sec_id), _fill(ind_id), _fill(sub_id), _fill(size_id),
+                anchor_dates,
+                area_ids    = _fill(area_id),
+                board_ids   = _fill(board_id),
+                ipo_age_ids = _fill(ipo_id),
             )
             total_seqs += len(valid_indices)
             processed  += 1

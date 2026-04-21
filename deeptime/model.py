@@ -145,7 +145,9 @@ from .config import (
     NUM_DT_OBSERVED_PAST, NUM_DT_KNOWN_FUTURE,
     NUM_HORIZONS, FORWARD_WINDOWS,
     SECTOR_EMB_DIM, INDUSTRY_EMB_DIM, SUB_IND_EMB_DIM, SIZE_EMB_DIM,
+    AREA_EMB_DIM, BOARD_EMB_DIM, IPO_AGE_EMB_DIM,
     NUM_SECTORS_EMBED, NUM_INDUSTRIES_EMBED, NUM_SUB_IND_EMBED, NUM_SIZE_DECILES,
+    NUM_AREAS_EMBED, NUM_BOARD_TYPES, NUM_IPO_AGE_BUCKETS,
     TFT_HIDDEN, TFT_HEADS, TFT_LSTM_LAYERS, TFT_DROPOUT,
 )
 
@@ -254,6 +256,9 @@ class DeepTimeModel(nn.Module):
         num_industries:      int   = NUM_INDUSTRIES_EMBED,
         num_sub_industries:  int   = NUM_SUB_IND_EMBED,
         num_size_deciles:    int   = NUM_SIZE_DECILES,
+        num_areas:           int   = NUM_AREAS_EMBED,
+        num_board_types:     int   = NUM_BOARD_TYPES,
+        num_ipo_age:         int   = NUM_IPO_AGE_BUCKETS,
     ):
         super().__init__()
         self._is_deeptime     = True
@@ -265,12 +270,19 @@ class DeepTimeModel(nn.Module):
         self.horizon_dec_pos   = _HORIZON_DEC_POSITIONS  # [0,1,2,3,4]
 
         # ── Static covariate embeddings ──────────────────────────────────────
-        self.sector_emb   = nn.Embedding(num_sectors,       SECTOR_EMB_DIM)
-        self.industry_emb = nn.Embedding(num_industries,    INDUSTRY_EMB_DIM)
-        self.sub_ind_emb  = nn.Embedding(num_sub_industries, SUB_IND_EMB_DIM)
-        self.size_emb     = nn.Embedding(num_size_deciles,  SIZE_EMB_DIM)
+        # Core: SW L1 sector (31), SW L2 sub-industry (~130), size decile (10)
+        self.sector_emb   = nn.Embedding(num_sectors,       SECTOR_EMB_DIM)    # 64
+        self.industry_emb = nn.Embedding(num_industries,    INDUSTRY_EMB_DIM)  # 32
+        self.sub_ind_emb  = nn.Embedding(num_sub_industries, SUB_IND_EMB_DIM)  # 8
+        self.size_emb     = nn.Embedding(num_size_deciles,  SIZE_EMB_DIM)      # 16
+        # New: province/region, exchange board type, IPO age
+        self.area_emb     = nn.Embedding(num_areas,         AREA_EMB_DIM)      # 16
+        self.board_emb    = nn.Embedding(num_board_types,   BOARD_EMB_DIM)     # 8
+        self.ipo_age_emb  = nn.Embedding(num_ipo_age,       IPO_AGE_EMB_DIM)   # 8
 
-        static_dim = SECTOR_EMB_DIM + INDUSTRY_EMB_DIM + SUB_IND_EMB_DIM + SIZE_EMB_DIM  # 192
+        static_dim = (SECTOR_EMB_DIM + INDUSTRY_EMB_DIM + SUB_IND_EMB_DIM
+                      + SIZE_EMB_DIM + AREA_EMB_DIM + BOARD_EMB_DIM + IPO_AGE_EMB_DIM)
+        # = 64 + 32 + 8 + 16 + 16 + 8 + 8 = 152
 
         # 4 static context vectors (TFT paper section 4.1)
         self.static_grn_s = GatedResidualNetwork(static_dim, hidden_dim, hidden_dim, dropout=dropout)
@@ -348,44 +360,55 @@ class DeepTimeModel(nn.Module):
 
     def _static_context(
         self,
-        sector_ids:  torch.Tensor,
+        sector_ids:   torch.Tensor,
         industry_ids: torch.Tensor,
         sub_ind_ids:  torch.Tensor,
         size_ids:     torch.Tensor,
+        area_ids:     torch.Tensor,
+        board_ids:    torch.Tensor,
+        ipo_age_ids:  torch.Tensor,
         B: int, device,
     ):
-        """Concatenate all static embeddings → (B, static_dim=192)."""
-        sec = self.sector_emb(sector_ids.clamp(0, self.sector_emb.num_embeddings - 1))
-        ind = self.industry_emb(industry_ids.clamp(0, self.industry_emb.num_embeddings - 1))
-        sub = self.sub_ind_emb(sub_ind_ids.clamp(0, self.sub_ind_emb.num_embeddings - 1))
-        sz  = self.size_emb(size_ids.clamp(0, self.size_emb.num_embeddings - 1))
-        return torch.cat([sec, ind, sub, sz], dim=-1)   # (B, 192)
+        """Concatenate all static embeddings → (B, static_dim=152)."""
+        def _clamp(t, emb): return emb(t.clamp(0, emb.num_embeddings - 1))
+        sec  = _clamp(sector_ids,   self.sector_emb)    # (B, 64)
+        ind  = _clamp(industry_ids, self.industry_emb)  # (B, 32)
+        sub  = _clamp(sub_ind_ids,  self.sub_ind_emb)   # (B,  8)
+        sz   = _clamp(size_ids,     self.size_emb)      # (B, 16)
+        area = _clamp(area_ids,     self.area_emb)      # (B, 16)
+        brd  = _clamp(board_ids,    self.board_emb)     # (B,  8)
+        ipo  = _clamp(ipo_age_ids,  self.ipo_age_emb)   # (B,  8)
+        return torch.cat([sec, ind, sub, sz, area, brd, ipo], dim=-1)  # (B, 152)
 
     def forward(
         self,
-        past_obs:      torch.Tensor,            # (B, seq_len, 204)
-        future_inputs: torch.Tensor,            # (B, max_fw,  29)
+        past_obs:      torch.Tensor,            # (B, seq_len, n_past)
+        future_inputs: torch.Tensor,            # (B, max_fw,  n_future)
         sector_ids:    torch.Tensor,            # (B,) int64
         industry_ids:  torch.Tensor = None,     # (B,) int64
         sub_ind_ids:   torch.Tensor = None,     # (B,) int64
         size_ids:      torch.Tensor = None,     # (B,) int64
+        area_ids:      torch.Tensor = None,     # (B,) int64  — province/region
+        board_ids:     torch.Tensor = None,     # (B,) int64  — exchange board type
+        ipo_age_ids:   torch.Tensor = None,     # (B,) int64  — IPO age bucket
     ) -> torch.Tensor:
-        """
-        Returns:
-            preds (B, 5)  — one regression value per horizon
-        """
+        """Returns preds (B, 5) — one regression value per horizon."""
         B, T, _ = past_obs.shape
         device = past_obs.device
 
-        if industry_ids is None:
-            industry_ids = torch.zeros(B, dtype=torch.long, device=device)
-        if sub_ind_ids is None:
-            sub_ind_ids  = torch.zeros(B, dtype=torch.long, device=device)
-        if size_ids is None:
-            size_ids     = torch.zeros(B, dtype=torch.long, device=device)
+        def _zeros(): return torch.zeros(B, dtype=torch.long, device=device)
+        if industry_ids is None: industry_ids = _zeros()
+        if sub_ind_ids  is None: sub_ind_ids  = _zeros()
+        if size_ids     is None: size_ids     = _zeros()
+        if area_ids     is None: area_ids     = _zeros()
+        if board_ids    is None: board_ids    = _zeros()
+        if ipo_age_ids  is None: ipo_age_ids  = _zeros()
 
         # ── 1. Static encoder ─────────────────────────────────────────────────
-        static_feat = self._static_context(sector_ids, industry_ids, sub_ind_ids, size_ids, B, device)
+        static_feat = self._static_context(
+            sector_ids, industry_ids, sub_ind_ids, size_ids,
+            area_ids, board_ids, ipo_age_ids, B, device
+        )
         c_s = self.static_grn_s(static_feat)   # (B, H)
         c_e = self.static_grn_e(static_feat)
         c_c = self.static_grn_c(static_feat)
@@ -474,4 +497,7 @@ def create_deeptime_model(config: dict) -> DeepTimeModel:
         num_industries      = config.get('num_industries',   NUM_INDUSTRIES_EMBED),
         num_sub_industries  = config.get('num_sub_ind',      NUM_SUB_IND_EMBED),
         num_size_deciles    = config.get('num_size_deciles', NUM_SIZE_DECILES),
+        num_areas           = config.get('num_areas',        NUM_AREAS_EMBED),
+        num_board_types     = config.get('num_board_types',  NUM_BOARD_TYPES),
+        num_ipo_age         = config.get('num_ipo_age',      NUM_IPO_AGE_BUCKETS),
     )

@@ -35,14 +35,17 @@ class RegressionMemmapDataset(Dataset):
     """
     PyTorch Dataset backed by memory-mapped numpy arrays.
 
-    Returns per-sample:
-        obs_seq       (seq_len, n_past)  float32
+    Returns per-sample (10-tuple):
+        obs_seq       (seq_len, n_past)   float32
         future_inputs (max_fw,  n_future) float32
-        targets       (num_horizons,)    float32
-        sector_id     ()  int64
-        industry_id   ()  int64
-        sub_ind_id    ()  int64
-        size_id       ()  int64
+        targets       (num_horizons,)     float32
+        sector_id     ()  int64  — SW L1 sector
+        industry_id   ()  int64  — SW L2 sub-industry
+        sub_ind_id    ()  int64  — placeholder (zeros if SW L3 not available)
+        size_id       ()  int64  — market-cap decile
+        area_id       ()  int64  — province/region
+        board_id      ()  int64  — exchange board type
+        ipo_age_id    ()  int64  — IPO age bucket
         anchor_date   ()  int32
     """
 
@@ -54,39 +57,43 @@ class RegressionMemmapDataset(Dataset):
             self.metadata = json.load(f)
 
         si = self.metadata['splits'][split]
-        self.n_samples   = si['n_samples']
-        self.seq_length  = self.metadata['seq_length']
-        self.n_past      = self.metadata['n_past']
-        self.n_future    = self.metadata['n_future']
+        self.n_samples    = si['n_samples']
+        self.seq_length   = self.metadata['seq_length']
+        self.n_past       = self.metadata['n_past']
+        self.n_future     = self.metadata['n_future']
         self.num_horizons = self.metadata['num_horizons']
-        self.max_fw      = self.metadata['max_fw']
+        self.max_fw       = self.metadata['max_fw']
 
         self._open_memmaps()
 
     def _open_memmaps(self):
-        s = self.split
-        n = self.n_samples
-        d = self.data_dir
+        s = self.split; n = self.n_samples; d = self.data_dir
 
-        self.obs_seqs = np.memmap(
-            os.path.join(d, f'{s}_obs.npy'), dtype='float32', mode='r',
-            shape=(n, self.seq_length, self.n_past))
-        self.future_inputs = np.memmap(
-            os.path.join(d, f'{s}_future.npy'), dtype='float32', mode='r',
-            shape=(n, self.max_fw, self.n_future))
-        self.targets = np.memmap(
-            os.path.join(d, f'{s}_targets.npy'), dtype='float32', mode='r',
-            shape=(n, self.num_horizons))
-        self.sector_ids  = np.memmap(os.path.join(d, f'{s}_sectors.npy'),   dtype='int64', mode='r', shape=(n,))
-        self.industry_ids = np.memmap(os.path.join(d, f'{s}_industries.npy'), dtype='int64', mode='r', shape=(n,))
-        self.sub_ind_ids = np.memmap(os.path.join(d, f'{s}_sub_inds.npy'),  dtype='int64', mode='r', shape=(n,))
-        self.size_ids    = np.memmap(os.path.join(d, f'{s}_sizes.npy'),     dtype='int64', mode='r', shape=(n,))
-        self.anchor_dates = np.memmap(os.path.join(d, f'{s}_dates.npy'),   dtype='int32', mode='r', shape=(n,))
+        def _mm(fname, dtype, shape):
+            path = os.path.join(d, fname)
+            if os.path.exists(path):
+                return np.memmap(path, dtype=dtype, mode='r', shape=shape)
+            return np.zeros(shape, dtype=dtype)   # graceful fallback for old caches
+
+        self.obs_seqs      = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
+        self.future_inputs = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
+        self.targets       = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
+        self.sector_ids    = _mm(f'{s}_sectors.npy',    'int64',   (n,))
+        self.industry_ids  = _mm(f'{s}_industries.npy', 'int64',   (n,))
+        self.sub_ind_ids   = _mm(f'{s}_sub_inds.npy',   'int64',   (n,))
+        self.size_ids      = _mm(f'{s}_sizes.npy',      'int64',   (n,))
+        self.area_ids      = _mm(f'{s}_areas.npy',      'int64',   (n,))
+        self.board_ids     = _mm(f'{s}_boards.npy',     'int64',   (n,))
+        self.ipo_age_ids   = _mm(f'{s}_ipo_ages.npy',   'int64',   (n,))
+        self.anchor_dates  = _mm(f'{s}_dates.npy',      'int32',   (n,))
+
+    _STATIC_KEYS = ('obs_seqs', 'future_inputs', 'targets',
+                    'sector_ids', 'industry_ids', 'sub_ind_ids', 'size_ids',
+                    'area_ids', 'board_ids', 'ipo_age_ids', 'anchor_dates')
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for key in ('obs_seqs', 'future_inputs', 'targets',
-                    'sector_ids', 'industry_ids', 'sub_ind_ids', 'size_ids', 'anchor_dates'):
+        for key in self._STATIC_KEYS:
             state.pop(key, None)
         return state
 
@@ -106,6 +113,9 @@ class RegressionMemmapDataset(Dataset):
             int(self.industry_ids[idx]),
             int(self.sub_ind_ids[idx]),
             int(self.size_ids[idx]),
+            int(self.area_ids[idx]),
+            int(self.board_ids[idx]),
+            int(self.ipo_age_ids[idx]),
             int(self.anchor_dates[idx]),
         )
 
@@ -320,6 +330,9 @@ class RegressionDataWriter:
                 'industries': np.memmap(os.path.join(d, f'{split}_industries.npy'), dtype='int64',   mode='w+', shape=(n,)),
                 'sub_inds':   np.memmap(os.path.join(d, f'{split}_sub_inds.npy'),   dtype='int64',   mode='w+', shape=(n,)),
                 'sizes':      np.memmap(os.path.join(d, f'{split}_sizes.npy'),      dtype='int64',   mode='w+', shape=(n,)),
+                'areas':      np.memmap(os.path.join(d, f'{split}_areas.npy'),      dtype='int64',   mode='w+', shape=(n,)),
+                'boards':     np.memmap(os.path.join(d, f'{split}_boards.npy'),     dtype='int64',   mode='w+', shape=(n,)),
+                'ipo_ages':   np.memmap(os.path.join(d, f'{split}_ipo_ages.npy'),   dtype='int64',   mode='w+', shape=(n,)),
                 'dates':      np.memmap(os.path.join(d, f'{split}_dates.npy'),      dtype='int32',   mode='w+', shape=(n,)),
             }
 
@@ -335,10 +348,16 @@ class RegressionDataWriter:
         sub_ids:      np.ndarray,  # (N,)
         size_ids:     np.ndarray,  # (N,)
         anchor_dates: np.ndarray,  # (N,)
+        area_ids:     np.ndarray = None,  # (N,)
+        board_ids:    np.ndarray = None,  # (N,)
+        ipo_age_ids:  np.ndarray = None,  # (N,)
     ) -> None:
         """Write sequences directly to the appropriate pre-allocated split memmaps."""
-        SPLIT_CODE = {'train': 'train', 'val': 'val', 'test': 'test'}
         N = len(obs_seqs)
+        _zeros = lambda: np.zeros(N, dtype=np.int64)
+        if area_ids    is None: area_ids    = _zeros()
+        if board_ids   is None: board_ids   = _zeros()
+        if ipo_age_ids is None: ipo_age_ids = _zeros()
 
         # Route each sequence to its split
         split_masks: Dict[str, np.ndarray] = {}
@@ -356,7 +375,6 @@ class RegressionDataWriter:
             idx = self._write_idx[split]
             cap = self._capacities[split]
             if idx + n > cap:
-                # Capacity exceeded (over-estimate was insufficient): skip excess
                 n = max(0, cap - idx)
                 mask_idx = np.where(mask)[0][:n]
                 mask = np.zeros(len(anchor_dates), dtype=bool)
@@ -370,6 +388,9 @@ class RegressionDataWriter:
             mms['industries'][idx:idx+n] = ind_ids[mask]
             mms['sub_inds'][idx:idx+n]   = sub_ids[mask]
             mms['sizes'][idx:idx+n]      = size_ids[mask]
+            mms['areas'][idx:idx+n]      = area_ids[mask]
+            mms['boards'][idx:idx+n]     = board_ids[mask]
+            mms['ipo_ages'][idx:idx+n]   = ipo_age_ids[mask]
             mms['dates'][idx:idx+n]      = anchor_dates[mask]
             self._write_idx[split] += n
             self.total_written += n

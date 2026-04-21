@@ -119,15 +119,25 @@ DT_CS_NORMALIZE_TECH_FEATURES = [
 ]
 
 # ─── Sector / static embeddings ───────────────────────────────────────────────
-NUM_SECTORS_EMBED     = 32    # Shenwan L1 + 1 padding
-NUM_INDUSTRIES_EMBED  = 120   # Shenwan L2 + padding
-NUM_SUB_IND_EMBED     = 220   # Shenwan L3 + padding
+# Shenwan (申万) classification from api/sector_info.py
+NUM_SECTORS_EMBED     = 35    # SW L1: 31 sectors + padding
+NUM_INDUSTRIES_EMBED  = 140   # SW L2: ~130 sub-industries + padding
+NUM_SUB_IND_EMBED     = 10    # unused (kept for compat); SW L3 not downloaded
 NUM_SIZE_DECILES      = 11    # market-cap decile 0-9 + unknown
 
-SECTOR_EMB_DIM     = 96
-INDUSTRY_EMB_DIM   = 48
-SUB_IND_EMB_DIM    = 24
-SIZE_EMB_DIM       = 24
+# New static variates from stock_basic / sector_info.py
+NUM_AREAS_EMBED       = 45    # provinces/regions (~35 unique + padding)
+NUM_BOARD_TYPES       = 6     # 主板/中小板/创业板/科创板/北交所 + unknown
+NUM_IPO_AGE_BUCKETS   = 7     # <1yr, 1-2yr, 2-3yr, 3-5yr, 5-10yr, >10yr + unknown
+
+SECTOR_EMB_DIM     = 64   # SW L1 sector (31 → 64-dim)
+INDUSTRY_EMB_DIM   = 32   # SW L2 sub-industry (~130 → 32-dim)
+SUB_IND_EMB_DIM    = 8    # placeholder (SW L3 not used)
+SIZE_EMB_DIM       = 16   # market-cap decile
+AREA_EMB_DIM       = 16   # province/region
+BOARD_EMB_DIM      = 8    # exchange board type
+IPO_AGE_EMB_DIM    = 8    # IPO age bucket
+# Total static_dim = 64+32+8+16+16+8+8 = 152
 
 # ─── Model architecture ───────────────────────────────────────────────────────
 # RTX 4070 Super (12 GB VRAM) budget:
@@ -184,6 +194,9 @@ DEFAULT_CONFIG = {
     'num_industries':   NUM_INDUSTRIES_EMBED,
     'num_sub_ind':      NUM_SUB_IND_EMBED,
     'num_size_deciles': NUM_SIZE_DECILES,
+    'num_areas':        NUM_AREAS_EMBED,
+    'num_board_types':  NUM_BOARD_TYPES,
+    'num_ipo_age':      NUM_IPO_AGE_BUCKETS,
 
     # Training
     # batch=256: 984 seqs/s, peak 8.49 GB dedicated VRAM (73% of 11.6 GB hard limit) — optimal

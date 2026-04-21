@@ -104,6 +104,12 @@ def update_fina():
     run('update')
 
 
+def update_sector_info():
+    """Download enriched SW sector classification and static stock attributes."""
+    from api.sector_info import run
+    run()
+
+
 def update_block():
     """Update block trade data to yesterday."""
     from api.block_trade import run
@@ -150,7 +156,8 @@ if __name__ == '__main__':
     _run_group('basics', update_basics)
     _run_group('index',  update_index)
     _run_group('fund',   update_fund)
-    _run_group('fina',   update_fina)
-    _run_group('block',  update_block)
+    _run_group('fina',    update_fina)
+    _run_group('block',   update_block)
+    _run_group('sectors', update_sector_info)
 
     print(f"\nAll updates complete — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
