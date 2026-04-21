@@ -92,7 +92,15 @@ def update_index():
 
 def update_fund():
     """Update fund time-series datasets (nav, share, factor)."""
+    import os
     from api.get_data import run
+
+    # fund_basic.csv is a prerequisite — download it if missing
+    fund_basic_path = os.path.join('stock_data', 'fund', 'fund_basic.csv')
+    if not os.path.exists(fund_basic_path):
+        print("[fund_basic] Not found — downloading prerequisite ...")
+        run('fund_basic')
+
     for ds in ('fund_share', 'fund_nav', 'fund_factor_pro'):
         print(f"\n[{ds}] incremental update ...")
         run(ds)
