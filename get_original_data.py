@@ -1,35 +1,31 @@
 """
-Historical Stock Data Acquisition — Date-first approach.
+Historical Stock Data Acquisition — Date-first approach with parallel workers.
 
-Tushare Pro efficiency tip: pro.daily(trade_date=YYYYMMDD) returns ALL
-~5000 stocks for one trading day in a single API call, vs calling
-pro.daily(ts_code=X, ...) once per stock.
+Rate limit (7000-pt account): 500 calls/min = 8.3 calls/sec
+Network latency on remote:    ~0.3-0.5s/call  →  2-3 calls/sec single-threaded
+With 4 workers sharing limit: 4 × 2 calls/sec  →  ~4× faster end-to-end
 
-Result: 2254 API calls (one per trading date) instead of 5190 (one per stock).
-Each call returns ~5000 rows; total data is identical.
-
-Data is written to per-stock CSVs (sh/{symbol}.csv, sz/{symbol}.csv) for
-full backward compatibility with dl/, deeptime/, and extend_stock_data.py.
+Architecture:
+  N worker threads each download different dates, sharing one RateLimiter.
+  A single writer thread consumes from a queue and flushes to per-stock CSVs.
+  No file race conditions — only the writer touches the CSV files.
 
 Usage:
-    python get_original_data.py --download          # full download 2017→today
-    python get_original_data.py --download --batch 60   # 60 dates per run
+    python get_original_data.py --download              # 1 worker (default)
+    python get_original_data.py --download --workers 4  # 4x faster on remote
     python get_original_data.py --status
     python get_original_data.py --retry-failed
     python get_original_data.py --reset
-
-    # PyCharm/Jupyter:
-    from get_original_data import run
-    run('download')
-    run('download', batch=60)
-    run('status')
 """
 
 import argparse
 import json
 import os
+import queue
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -125,6 +121,27 @@ def save_checkpoint(ck: dict):
     ck.update(ck_clean)
 
 
+# ─── Thread-safe rate limiter ─────────────────────────────────────────────────
+
+class RateLimiter:
+    """
+    Token-bucket rate limiter shared across multiple worker threads.
+    Ensures combined call rate never exceeds the Tushare account limit.
+    7000-pt account: 500 calls/min = 8.3/sec → use 8.0 for safety margin.
+    """
+    def __init__(self, calls_per_sec: float = 8.0):
+        self._interval = 1.0 / calls_per_sec
+        self._last     = 0.0
+        self._lock     = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            gap = self._interval - (time.perf_counter() - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.perf_counter()
+
+
 # ─── Stock list ───────────────────────────────────────────────────────────────
 
 def get_stock_list(pro=None, refresh=False) -> pd.DataFrame:
@@ -217,32 +234,37 @@ def flush_buffer(buffer: dict, initial_download: bool = False):
 # ─── Main download loop ───────────────────────────────────────────────────────
 
 def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
-                 batch: int = None, initial: bool = False):
+                 batch: int = None, initial: bool = False,
+                 workers: int = 1, rate: float = 8.0):
     """
     Download all A-share daily OHLCV by iterating trading dates.
 
     Args:
-        pro:        Tushare Pro API instance.
-        start_date: First date to download (YYYYMMDD).
-        end_date:   Last date (default: today).
-        batch:      Stop after this many dates (for safe incremental runs).
-        initial:    True = no existing files, skip read-merge on flush (~3x faster).
-                    Auto-detected if stock_data/sh/ is empty.
+        pro:      Tushare Pro API instance.
+        start_date / end_date: Date range (YYYYMMDD).
+        batch:    Stop after this many dates (safe incremental runs).
+        initial:  Skip read-merge on flush (auto-detected on empty sh/).
+        workers:  Parallel download threads (default 1).
+                  Recommended: 4 for remote servers (hides network latency).
+                  Max effective workers ≈ rate_limit / avg_latency.
+        rate:     Total API calls/sec budget shared across all workers.
+                  7000-pt account: 8.0 (≈480/min). Don't exceed this.
     """
     if end_date is None:
         end_date = datetime.now().strftime('%Y%m%d')
 
-    # Auto-detect initial download (no stock files exist yet)
     sh_files = list((DATA_DIR / 'sh').glob('*.csv')) if (DATA_DIR / 'sh').exists() else []
     if initial or not sh_files:
         initial = True
-        print("  [Mode] Initial download — flush writes new files only (fastest)")
+        print("  [Mode] Initial download — write-only flush (fastest)")
 
     ck = load_checkpoint()
     completed_set = set(ck['completed_dates'])
 
     all_dates = get_trading_dates(pro, start_date, end_date)
     pending   = [d for d in all_dates if d not in completed_set]
+    if batch:
+        pending = pending[:batch]
 
     total     = len(all_dates)
     done      = len(completed_set)
@@ -253,77 +275,164 @@ def download_all(pro, start_date: str = TARGET_START, end_date: str = None,
     print(f"  Total trading days : {total}")
     print(f"  Already downloaded : {done}")
     print(f"  Remaining          : {remaining}")
-    if batch:
-        print(f"  This run limit     : {batch} dates")
-    # Time estimate at 0.5s/call avg
-    eta_min = remaining * 0.5 / 60
-    print(f"  ETA (network only) : ~{eta_min:.0f} min")
+    print(f"  Workers            : {workers}  |  rate cap: {rate:.1f} calls/s")
+    eta_single = remaining * 0.5 / 60
+    eta_multi  = eta_single / workers
+    print(f"  ETA (1 worker)     : ~{eta_single:.0f} min")
+    if workers > 1:
+        print(f"  ETA ({workers} workers)    : ~{eta_multi:.0f} min  ({workers}x speedup)")
     print(f"{'='*60}\n")
 
     if not pending:
         print("  All dates already downloaded.")
         return
 
-    buffer: dict = {}
-    dates_this_run = 0
-    t_start = time.time()
+    if workers == 1:
+        _download_single(pro, pending, done, total, initial, ck, rate)
+    else:
+        _download_parallel(pro, pending, done, total, initial, ck, workers, rate)
 
-    for i, trade_date in enumerate(pending):
-        if batch and dates_this_run >= batch:
-            print(f"\nBatch limit ({batch} dates) reached. Run again to continue.")
-            break
 
-        t0 = time.time()
+def _download_single(pro, pending, done, total, initial, ck, rate):
+    """Single-threaded download (original logic)."""
+    limiter   = RateLimiter(rate)
+    buffer    = {}
+    n_run     = 0
+    t_start   = time.time()
+
+    for trade_date in pending:
+        limiter.wait()
         df = download_date(pro, trade_date)
-        elapsed = time.time() - t0
 
         if df is None:
             ck['failed_dates'].append(trade_date)
-            print(f"  [{done+dates_this_run+1:4d}/{total}] {trade_date}  FAILED")
+            print(f"  [{done+n_run+1:4d}/{total}] {trade_date}  FAILED")
         elif df.empty:
             ck['completed_dates'].append(trade_date)
         else:
             for ts_code, grp in df.groupby('ts_code'):
-                if ts_code not in buffer:
-                    buffer[ts_code] = []
-                buffer[ts_code].append(grp)
-
+                buffer.setdefault(ts_code, []).append(grp)
             ck['completed_dates'].append(trade_date)
-            n_stocks = df['ts_code'].nunique()
-
-            # ETA update every 50 dates
-            dates_done_total = done + dates_this_run + 1
-            if (dates_this_run + 1) % 50 == 0:
-                rate = (dates_this_run + 1) / (time.time() - t_start)
-                left = total - dates_done_total
-                eta  = left / rate / 60
-                print(f"  [{dates_done_total:4d}/{total}] {trade_date}  "
-                      f"{n_stocks:4d} stocks  ({rate:.1f} dates/s, ETA ~{eta:.0f} min)")
+            n_done = done + n_run + 1
+            if (n_run + 1) % 50 == 0:
+                rate_act = (n_run + 1) / (time.time() - t_start)
+                eta = (total - n_done) / rate_act / 60
+                print(f"  [{n_done:4d}/{total}] {trade_date}  "
+                      f"{df['ts_code'].nunique()} stocks  "
+                      f"({rate_act:.1f}/s ETA ~{eta:.0f}min)")
             else:
-                print(f"  [{dates_done_total:4d}/{total}] {trade_date}  {n_stocks:4d} stocks")
+                print(f"  [{n_done:4d}/{total}] {trade_date}  {df['ts_code'].nunique()} stocks")
 
-        dates_this_run += 1
-        time.sleep(max(0, CALL_INTERVAL - elapsed))
-
-        # Flush buffer periodically
-        if dates_this_run % FLUSH_EVERY == 0:
-            t_flush = time.time()
+        n_run += 1
+        if n_run % FLUSH_EVERY == 0:
+            t0 = time.time()
             flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
             buffer.clear()
             save_checkpoint(ck)
-            print(f"  ... checkpoint saved  "
-                  f"({done+dates_this_run}/{total} dates, flush={time.time()-t_flush:.1f}s)")
+            print(f"  ... checkpoint  ({done+n_run}/{total} done, flush={time.time()-t0:.1f}s)")
 
-    # Final flush
     if buffer:
         flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
-        buffer.clear()
-
     save_checkpoint(ck)
-    total_time = (time.time() - t_start) / 60
+    _print_summary(t_start, n_run, total, ck)
+
+
+def _download_parallel(pro, pending, done, total, initial, ck, workers, rate):
+    """
+    Parallel download: N worker threads share one RateLimiter,
+    a single writer thread handles all disk I/O (no file race conditions).
+
+    Architecture:
+        workers → shared RateLimiter → results_queue → writer thread → CSV files
+    """
+    limiter      = RateLimiter(rate)
+    results_q    = queue.Queue(maxsize=workers * 4)  # bound to limit RAM
+    ck_lock      = threading.Lock()
+    counter      = {'n': 0, 'failed': 0}
+    counter_lock = threading.Lock()
+    t_start      = time.time()
+
+    def worker_fn(date_chunk):
+        for trade_date in date_chunk:
+            limiter.wait()
+            df = download_date(pro, trade_date)
+            results_q.put((trade_date, df))   # None df = failed
+
+    def writer_fn():
+        buffer   = {}
+        n_flushed = 0
+        while True:
+            item = results_q.get()
+            if item is None:
+                break   # all workers done
+
+            trade_date, df = item
+            with counter_lock:
+                counter['n'] += 1
+                n_total = counter['n']
+
+            if df is None:
+                with ck_lock:
+                    ck['failed_dates'].append(trade_date)
+                counter['failed'] += 1
+                print(f"  [{done+n_total:4d}/{total}] {trade_date}  FAILED")
+            elif df.empty:
+                with ck_lock:
+                    ck['completed_dates'].append(trade_date)
+            else:
+                for ts_code, grp in df.groupby('ts_code'):
+                    buffer.setdefault(ts_code, []).append(grp)
+                with ck_lock:
+                    ck['completed_dates'].append(trade_date)
+
+                n_done = done + n_total
+                if n_total % 50 == 0:
+                    rate_act = n_total / (time.time() - t_start)
+                    eta = (total - n_done) / rate_act / 60
+                    print(f"  [{n_done:4d}/{total}] {trade_date}  "
+                          f"{df['ts_code'].nunique()} stocks  "
+                          f"({rate_act:.1f}/s ETA ~{eta:.0f}min)")
+                else:
+                    print(f"  [{n_done:4d}/{total}] {trade_date}  {df['ts_code'].nunique()} stocks")
+
+            # Flush every FLUSH_EVERY dates processed by the writer
+            if (n_total - counter['failed']) % FLUSH_EVERY == 0 and buffer:
+                t0 = time.time()
+                flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
+                buffer.clear()
+                with ck_lock:
+                    save_checkpoint(ck)
+                print(f"  ... checkpoint  ({done+n_total}/{total} done, flush={time.time()-t0:.1f}s)")
+
+            results_q.task_done()
+
+        # Final flush
+        if buffer:
+            flush_buffer({k: pd.concat(v) for k, v in buffer.items()}, initial)
+        save_checkpoint(ck)
+
+    # Partition dates across workers (round-robin preserves temporal spread)
+    chunks = [pending[i::workers] for i in range(workers)]
+
+    writer_thread = threading.Thread(target=writer_fn, daemon=True)
+    writer_thread.start()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(worker_fn, chunk) for chunk in chunks]
+        for f in as_completed(futs):
+            f.result()   # propagate exceptions
+
+    results_q.put(None)   # signal writer to finish
+    writer_thread.join()
+
+    _print_summary(t_start, counter['n'], total, ck)
+
+
+def _print_summary(t_start, n_run, total, ck):
+    elapsed = (time.time() - t_start) / 60
     print(f"\n{'='*60}")
-    print(f"Session complete in {total_time:.1f} min")
-    print(f"  Dates this run : {dates_this_run}")
+    print(f"Session complete in {elapsed:.1f} min")
+    print(f"  Dates this run : {n_run}")
     print(f"  Total done     : {len(ck['completed_dates'])}/{total}")
     if ck['failed_dates']:
         print(f"  Failed dates   : {len(ck['failed_dates'])} → run --retry-failed")
@@ -395,23 +504,22 @@ def reset_progress():
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def run(command: str = 'status', batch: int = None):
+def run(command: str = 'status', batch: int = None,
+        workers: int = 1, rate: float = 8.0):
     """
     Scripted entry point.
 
-    Commands:
-        'init'     — fetch and cache stock list only
-        'download' — download all trading dates (resumable)
-        'status'   — show progress
-        'retry'    — retry failed dates
-        'reset'    — clear checkpoint (keep CSVs)
+    Commands: 'init', 'download', 'status', 'retry', 'reset'
 
     Args:
-        batch: Maximum number of dates to download per run (default: all).
+        batch:   Max dates per run (default: all).
+        workers: Parallel threads (default 1; use 4 on remote servers).
+        rate:    Total API calls/sec across all workers (default 8.0).
 
     Examples:
-        run('download')           # download everything
-        run('download', batch=60) # 60 dates per run (~3 min)
+        run('download')                     # single-threaded
+        run('download', workers=4)          # 4x faster on remote
+        run('download', batch=100, workers=4)
         run('status')
     """
     setup_directories()
@@ -421,8 +529,8 @@ def run(command: str = 'status', batch: int = None):
         get_stock_list(pro=pro)
         print("Done. Run run('download') to start.")
     elif command == 'download':
-        get_stock_list(pro=pro)   # ensure stock_list.csv exists
-        download_all(pro, batch=batch)
+        get_stock_list(pro=pro)
+        download_all(pro, batch=batch, workers=workers, rate=rate)
     elif command == 'status':
         show_status()
     elif command == 'retry':
@@ -439,6 +547,10 @@ def main():
     parser = argparse.ArgumentParser(
         description='Download SH/SZ daily OHLCV — date-first (efficient)')
     parser.add_argument('--download',      action='store_true', help='Download all dates')
+    parser.add_argument('--workers',       type=int, default=1,
+                        help='Parallel download threads (default 1; use 4 on remote servers)')
+    parser.add_argument('--rate',          type=float, default=8.0,
+                        help='Total API calls/sec across all workers (default 8.0 = 480/min)')
     parser.add_argument('--batch',         type=int, default=None,
                         help='Max dates per run (default: all)')
     parser.add_argument('--initial',       action='store_true',
@@ -462,13 +574,14 @@ def main():
         retry_failed(pro)
     elif args.download:
         get_stock_list(pro=pro)
-        download_all(pro, batch=args.batch, initial=args.initial)
+        download_all(pro, batch=args.batch, initial=args.initial,
+                     workers=args.workers, rate=args.rate)
     else:
         parser.print_help()
-        print("\nQuick start (fresh server):")
-        print("  python get_original_data.py --download          # auto-detects initial mode")
-        print("  python get_original_data.py --status            # check progress")
-        print("  python get_original_data.py --retry-failed      # retry any failed dates")
+        print("\nQuick start (fresh server, 4 workers ≈ 4× faster):")
+        print("  python get_original_data.py --download --workers 4")
+        print("  python get_original_data.py --status")
+        print("  python get_original_data.py --retry-failed")
 
 
 if __name__ == '__main__':
