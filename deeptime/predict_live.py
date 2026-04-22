@@ -274,9 +274,27 @@ def main():
     p.add_argument('--max_stocks', type=int, default=0, help='0 = all stocks')
     p.add_argument('--top',        type=int, default=20, help='Show top/bottom N predictions')
     p.add_argument('--batch_size', type=int, default=256)
+    # Model architecture (must match training checkpoint)
+    p.add_argument('--hidden',      type=int, default=None,
+                   help='TFT hidden dim (default from config: 128)')
+    p.add_argument('--heads',       type=int, default=None,
+                   help='Attention heads (default from config: 4)')
+    p.add_argument('--lstm_layers', type=int, default=None,
+                   help='LSTM layers (default from config: 2)')
+    p.add_argument('--dropout',     type=float, default=None,
+                   help='Dropout rate (default: 0.15)')
+    p.add_argument('--seed',        type=int, default=42,
+                   help='Random seed for stock sampling')
     args = p.parse_args()
 
-    config   = get_config()
+    # Build config with CLI overrides
+    overrides = {}
+    if args.hidden      is not None: overrides['tft_hidden']      = args.hidden
+    if args.heads       is not None: overrides['tft_heads']       = args.heads
+    if args.lstm_layers is not None: overrides['tft_lstm_layers'] = args.lstm_layers
+    if args.dropout     is not None: overrides['tft_dropout']     = args.dropout
+
+    config   = get_config(**overrides)
     data_dir = config['data_dir']
     device   = config['device']
     seq_len  = config['sequence_length']
@@ -299,9 +317,14 @@ def main():
                     ts_code = f.replace('.csv', '')
                     stock_files.append((ts_code, os.path.join(d, f)))
 
-    if args.max_stocks > 0:
-        stock_files = stock_files[:args.max_stocks]
-    print(f"Predicting {len(stock_files)} stocks...")
+    if args.max_stocks > 0 and args.max_stocks < len(stock_files):
+        # Use seeded random sampling (same as main.py training)
+        import random
+        rng = random.Random(args.seed)
+        stock_files = rng.sample(stock_files, args.max_stocks)
+        print(f"Sampled {len(stock_files)} stocks (seed={args.seed})")
+    else:
+        print(f"Predicting {len(stock_files)} stocks...")
 
     # ── Load auxiliary data ─────────────────────────────────────────────────
     sector_data    = load_sector_data(data_dir)
