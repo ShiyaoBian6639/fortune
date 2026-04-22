@@ -206,6 +206,11 @@ def build_cache(args, config):
         load_fina_indicator_data, load_block_trade_data, _pregroup_block_trade,
         prepare_dataset_regression,
     )
+    from .extended_features import (
+        load_forecast_data, load_express_data,
+        load_limit_data_by_stock, load_dragon_tiger_by_stock,
+        load_chip_perf_by_stock,
+    )
 
     data_dir = config['data_dir']
     max_stocks = config['max_stocks']
@@ -292,6 +297,39 @@ def build_cache(args, config):
         stock_files, min_data_points=config.get('min_data_points', 100)
     )
 
+    # ── Extended data sources ─────────────────────────────────────────────
+    print("\nLoading extended data sources...")
+
+    # Earnings forecast and express
+    forecast_data = load_forecast_data(data_dir, ts_codes)
+    if bare_codes_set:
+        forecast_data = {k: v for k, v in forecast_data.items() if k in bare_codes_set}
+    print(f"  forecast: {len(forecast_data)} stocks")
+
+    express_data = load_express_data(data_dir, ts_codes)
+    if bare_codes_set:
+        express_data = {k: v for k, v in express_data.items() if k in bare_codes_set}
+    print(f"  express: {len(express_data)} stocks")
+
+    # Limit and dragon-tiger data
+    limit_data_by_stock = load_limit_data_by_stock(data_dir)
+    if bare_codes_set:
+        limit_data_by_stock = {k: v for k, v in limit_data_by_stock.items() if k in bare_codes_set}
+    print(f"  limit_data: {len(limit_data_by_stock)} stocks")
+
+    dragon_tiger_data = load_dragon_tiger_by_stock(data_dir)
+    if bare_codes_set:
+        dragon_tiger_data = {k: v for k, v in dragon_tiger_data.items() if k in bare_codes_set}
+    print(f"  dragon_tiger: {len(dragon_tiger_data)} stocks")
+
+    # Chip distribution data
+    chip_perf_data = load_chip_perf_by_stock(data_dir)
+    if bare_codes_set:
+        chip_perf_data = {k: v for k, v in chip_perf_data.items() if k in bare_codes_set}
+    print(f"  chip_perf: {len(chip_perf_data)} stocks")
+
+    _gc.collect()
+
     # ── Run sanity checks (pre-cache) ─────────────────────────────────────
     run_all_checks(data_dir, cache_dir=None, config=config)
 
@@ -312,6 +350,12 @@ def build_cache(args, config):
         moneyflow            = moneyflow,
         cs_tech_stats        = cs_tech_stats,
         split_mode           = config.get('split_mode', 'rolling_window'),
+        # Extended data sources
+        forecast_data        = forecast_data,
+        express_data         = express_data,
+        limit_data_by_stock  = limit_data_by_stock,
+        dragon_tiger_data    = dragon_tiger_data,
+        chip_perf_data       = chip_perf_data,
     )
     print(f"\nCache built in {(time.time()-t0)/60:.1f} min → {config['cache_dir']}")
     return metadata

@@ -42,12 +42,25 @@ from .config import (
     _DT_FUTURE_FEAT_IDX, _DT_OBS_PAST_FEAT_IDX,
     FINA_INDICATOR_COLUMNS, BLOCK_TRADE_COLUMNS, EXTRA_MONEYFLOW_COLUMNS,
     PRICE_LIMIT_RATIO_COLUMNS,
+    FORECAST_FEATURES, EXPRESS_FEATURES, LIMIT_TS_FEATURES, CHIP_FEATURES,
     FORWARD_WINDOWS, NUM_HORIZONS, SEQUENCE_LENGTH, MAX_FORWARD_WINDOW,
     NUM_DT_FEATURES, NUM_DT_KNOWN_FUTURE, NUM_DT_OBSERVED_PAST,
     DT_CS_NORMALIZE_TECH_FEATURES,
     INTERLEAVED_TEST_START,
     ROLLING_TRAIN_MONTHS, ROLLING_VAL_MONTHS, ROLLING_TEST_MONTHS,
     ROLLING_STEP_MONTHS, PURGE_GAP_DAYS,
+)
+
+from .extended_features import (
+    load_forecast_data,
+    load_express_data,
+    load_limit_data_by_stock,
+    load_dragon_tiger_by_stock,
+    load_chip_perf_by_stock,
+    merge_forecast_features,
+    merge_express_features,
+    merge_limit_features,
+    merge_chip_features,
 )
 
 
@@ -513,6 +526,12 @@ def prepare_dataset_regression(
     moneyflow:            Optional[pd.DataFrame] = None,
     cs_tech_stats:        Optional[Dict] = None,
     split_mode:           str = 'rolling_window',
+    # Extended data sources
+    forecast_data:        Optional[Dict[str, pd.DataFrame]] = None,
+    express_data:         Optional[Dict[str, pd.DataFrame]] = None,
+    limit_data_by_stock:  Optional[Dict[str, pd.DataFrame]] = None,
+    dragon_tiger_data:    Optional[Dict[str, pd.DataFrame]] = None,
+    chip_perf_data:       Optional[Dict[str, pd.DataFrame]] = None,
 ) -> dict:
     """
     Process stocks streaming one-at-a-time and write to memmap cache.
@@ -769,6 +788,20 @@ def prepare_dataset_regression(
             # ── Block trades ───────────────────────────────────────────────
             bt_df = block_trade_by_stock.get(bare) if block_trade_by_stock else None
             df = merge_block_trade_features(df, bt_df)
+
+            # ── Extended features: forecast, express, limits, chips ───────
+            fc_df = forecast_data.get(bare) if forecast_data else None
+            df = merge_forecast_features(df, fc_df)
+
+            exp_df = express_data.get(bare) if express_data else None
+            df = merge_express_features(df, exp_df)
+
+            lim_df = limit_data_by_stock.get(bare) if limit_data_by_stock else None
+            dt_df = dragon_tiger_data.get(bare) if dragon_tiger_data else None
+            df = merge_limit_features(df, lim_df, dt_df)
+
+            chip_df = chip_perf_data.get(bare) if chip_perf_data else None
+            df = merge_chip_features(df, chip_df)
 
             # ── Ensure all DT_FEATURE_COLUMNS exist ────────────────────────
             for col in DT_FEATURE_COLUMNS:

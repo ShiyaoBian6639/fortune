@@ -65,6 +65,69 @@ PRICE_LIMIT_RATIO_COLUMNS = [
     'up_limit_ratio', 'down_limit_ratio',
 ]
 
+# ─── Extended features from new data sources ─────────────────────────────────
+
+# From earnings forecast (业绩预告)
+FORECAST_FEATURES = [
+    'has_forecast',        # 是否有业绩预告 (0/1)
+    'forecast_direction',  # 预告方向: -1=预减, 0=不确定, 1=预增
+    'forecast_magnitude',  # 预告变化幅度 normalized to [-1, 1]
+]
+
+# From express earnings report (业绩快报)
+EXPRESS_FEATURES = [
+    'has_express',         # 是否有业绩快报 (0/1)
+    'express_growth',      # 业绩快报营收同比增长 normalized
+    'express_profit_yoy',  # 业绩快报利润同比增长 normalized
+]
+
+# From limit/dragon-tiger data (涨跌停/龙虎榜)
+LIMIT_TS_FEATURES = [
+    'limit_times',         # 连板次数 (capped at 10)
+    'on_dragon_tiger',     # 是否上龙虎榜 (0/1)
+    'dragon_tiger_net',    # 龙虎榜净买入比例 [-1, 1]
+]
+
+# From chip distribution (筹码分布)
+CHIP_FEATURES = [
+    'winner_rate',         # 获利比例 [0, 1]
+    'cost_concentration',  # 成本集中度 [0, 2]
+]
+
+# Static features from financial statements (for GAT)
+STATIC_FINANCIAL_FEATURES = [
+    'debt_to_equity',        # 负债/权益比
+    'current_ratio_static',  # 流动比率
+    'asset_turnover',        # 资产周转率
+    'gross_margin_static',   # 毛利率
+    'operating_margin',      # 营业利润率
+    'net_margin_static',     # 净利率
+    'has_dividend',          # 是否有分红
+    'avg_div_yield',         # 平均股息率
+    'div_consistency',       # 分红一致性
+]
+
+# Static features from THS membership
+STATIC_MEMBERSHIP_FEATURES = [
+    'n_ths_concepts',        # 所属概念数量
+    'n_ths_industries',      # 所属行业数量
+    'is_hot_concept',        # 是否热门概念股
+]
+
+# All extended time series features
+EXTENDED_TS_FEATURES = (
+    FORECAST_FEATURES +
+    EXPRESS_FEATURES +
+    LIMIT_TS_FEATURES +
+    CHIP_FEATURES
+)
+
+# All extended static features (for GAT node embeddings)
+EXTENDED_STATIC_FEATURES = (
+    STATIC_FINANCIAL_FEATURES +
+    STATIC_MEMBERSHIP_FEATURES
+)
+
 # ─── All feature columns ──────────────────────────────────────────────────────
 # Import the base features from dl/config and extend them.
 # Importing at module level to keep DT_FEATURE_COLUMNS as a plain list.
@@ -79,6 +142,7 @@ def _build_dt_feature_columns():
         + list(FINA_INDICATOR_COLUMNS)
         + list(BLOCK_TRADE_COLUMNS)
         + list(EXTRA_MONEYFLOW_COLUMNS)
+        + list(EXTENDED_TS_FEATURES)        # NEW: forecast, express, limit, chip features
     )
 
 
@@ -117,8 +181,11 @@ DT_CS_NORMALIZE_TECH_FEATURES = [
     'dist_from_high_20', 'dist_from_low_20',
     'obv_ratio',
     'net_lg_flow_ratio', 'net_elg_flow_ratio',
-    'net_sm_flow_ratio', 'net_md_flow_ratio',  # new
-    'block_vol_ratio', 'block_amt_ratio',       # new
+    'net_sm_flow_ratio', 'net_md_flow_ratio',
+    'block_vol_ratio', 'block_amt_ratio',
+    # Extended features that benefit from cross-sectional normalization
+    'dragon_tiger_net',     # relative to market
+    'cost_concentration',   # chip distribution metric
 ]
 
 # ─── Sector / static embeddings ───────────────────────────────────────────────
@@ -133,6 +200,9 @@ NUM_AREAS_EMBED       = 45    # provinces/regions (~35 unique + padding)
 NUM_BOARD_TYPES       = 6     # 主板/中小板/创业板/科创板/北交所 + unknown
 NUM_IPO_AGE_BUCKETS   = 7     # <1yr, 1-2yr, 2-3yr, 3-5yr, 5-10yr, >10yr + unknown
 
+# THS concept membership (from ths_index)
+NUM_THS_CONCEPTS      = 500   # THS has ~400+ concept indices + padding
+
 SECTOR_EMB_DIM     = 64   # SW L1 sector (31 → 64-dim)
 INDUSTRY_EMB_DIM   = 32   # SW L2 sub-industry (~130 → 32-dim)
 SUB_IND_EMB_DIM    = 8    # placeholder (SW L3 not used)
@@ -140,7 +210,12 @@ SIZE_EMB_DIM       = 16   # market-cap decile
 AREA_EMB_DIM       = 16   # province/region
 BOARD_EMB_DIM      = 8    # exchange board type
 IPO_AGE_EMB_DIM    = 8    # IPO age bucket
-# Total static_dim = 64+32+8+16+16+8+8 = 152
+THS_CONCEPT_EMB_DIM = 16  # THS concept membership (multi-hot → 16-dim)
+
+# Number of continuous static features (from financial statements)
+NUM_STATIC_CONTINUOUS = len(STATIC_FINANCIAL_FEATURES)  # 9 features
+
+# Total static_dim = 64+32+8+16+16+8+8+16 + 9 = 177
 
 # ─── Model architecture ───────────────────────────────────────────────────────
 # RTX 4070 Super (12 GB VRAM) budget:

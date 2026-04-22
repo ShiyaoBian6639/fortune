@@ -17,6 +17,11 @@ Groups:
     fund    – fund_share, fund_nav, fund_factor_pro
     fina    – quarterly financial indicators (fina_indicator)
     block   – block trade data
+    fina_ext – financial statements (income, balancesheet, cashflow)
+    fina_extras – forecast, express, dividend, fina_audit, etc.
+    limits  – limit_list_d, top_list, dragon-tiger data
+    ths     – THS index list, daily, and members
+    chips   – chip distribution data (cyq_perf, cyq_chips)
 """
 
 import sys
@@ -393,6 +398,38 @@ def update_block():
     run('download')
 
 
+def update_fina_statements():
+    """Update financial statements (income, balancesheet, cashflow)."""
+    from api.fina_statements import run
+    run('update')
+
+
+def update_fina_extras():
+    """Update financial extras (forecast, express, dividend, etc.)."""
+    from api.fina_extras import run
+    run('update')
+
+
+def update_limits():
+    """Update limit and dragon-tiger data."""
+    from api.limit_data import run
+    run('update')
+    # Aggregate to per-stock files for easier lookup
+    run('aggregate')
+
+
+def update_ths():
+    """Update THS index data (list, daily, members)."""
+    from api.ths_index import run
+    run('update')
+
+
+def update_chips():
+    """Update chip distribution data."""
+    from api.chip_data import run
+    run('update')
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def _ensure_dirs():
@@ -402,7 +439,26 @@ def _ensure_dirs():
               'stock_data/moneyflow', 'stock_data/stk_limit', 'stock_data/block_trade',
               'stock_data/index/idx_factor_pro', 'stock_data/index/index_global',
               'stock_data/index/index_weight', 'stock_data/index/index_dailybasic',
-              'stock_data/fina_indicator'):
+              'stock_data/fina_indicator',
+              # New directories for extended data
+              'stock_data/fina_statements/income',
+              'stock_data/fina_statements/balancesheet',
+              'stock_data/fina_statements/cashflow',
+              'stock_data/fina_extras/forecast',
+              'stock_data/fina_extras/express',
+              'stock_data/fina_extras/dividend',
+              'stock_data/fina_extras/fina_audit',
+              'stock_data/fina_extras/fina_mainbz',
+              'stock_data/fina_extras/disclosure_date',
+              'stock_data/limit_data/limit_list_d',
+              'stock_data/limit_data/top_list',
+              'stock_data/limit_data/top_inst',
+              'stock_data/ths_index',
+              'stock_data/ths_index/ths_daily',
+              'stock_data/ths_index/ths_member',
+              'stock_data/dc_index',
+              'stock_data/chip_data/cyq_perf',
+              'stock_data/chip_data/cyq_chips'):
         os.makedirs(d, exist_ok=True)
 
 
@@ -457,5 +513,12 @@ if __name__ == '__main__':
     _run_group('fina',    update_fina)
     _run_group('block',   update_block)
     _run_group('sectors', update_sector_info)
+
+    # Extended data sources for deeptime model
+    _run_group('fina_ext',    update_fina_statements)
+    _run_group('fina_extras', update_fina_extras)
+    _run_group('limits',      update_limits)
+    _run_group('ths',         update_ths)
+    _run_group('chips',       update_chips)
 
     print(f"\nAll updates complete — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
