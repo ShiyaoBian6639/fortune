@@ -172,6 +172,9 @@ NUM_DT_KNOWN_FUTURE      = len(DT_KNOWN_FUTURE_COLUMNS)    # 29
 NUM_DT_OBSERVED_PAST     = len(DT_OBSERVED_PAST_COLUMNS)   # 204
 
 # ─── Cross-section normalization (extend dl/'s list with new features) ────────
+# These features are normalized cross-sectionally (ranked within each day) to
+# handle distribution shifts over time. The sanity check flagged ps, ps_ttm,
+# roe, op_yoy as having >5× std shift between 2017-2019 and 2023-2025.
 DT_CS_NORMALIZE_TECH_FEATURES = [
     'returns', 'log_returns', 'volume_change',
     'return_lag_1', 'return_lag_2', 'return_lag_3', 'return_lag_5',
@@ -186,6 +189,10 @@ DT_CS_NORMALIZE_TECH_FEATURES = [
     # Extended features that benefit from cross-sectional normalization
     'dragon_tiger_net',     # relative to market
     'cost_concentration',   # chip distribution metric
+    # Features with detected distribution shift (sanity_checks.py flagged these)
+    'ps', 'ps_ttm',         # P/S ratios: collapsed variance post-2020
+    'roe',                  # earnings quality shift post-COVID
+    'op_yoy',               # YoY operating profit: base effect
 ]
 
 # ─── Sector / static embeddings ───────────────────────────────────────────────
@@ -218,10 +225,19 @@ NUM_STATIC_CONTINUOUS = len(STATIC_FINANCIAL_FEATURES)  # 9 features
 # Total static_dim = 64+32+8+16+16+8+8+16 + 9 = 177
 
 # ─── Model architecture ───────────────────────────────────────────────────────
-# RTX 4070 Super (12 GB VRAM) budget:
-#   VSN activation = B*T × num_vars × hidden × fp16
-#   With B=256, T=30, num_vars=204, hidden=128: 256×30×204×128×2 = 0.40 GB
-#   With gradients + LSTM + attn + optimizer states: ~5 GB total — safe.
+# Default config tuned for RTX 4070 Super (12 GB VRAM).
+# For RTX 5090 (32 GB VRAM), see RTX_5090_CONFIG preset below.
+#
+# VRAM budget formula:
+#   VSN activation = B × T × num_vars × hidden × 2 (FP16)
+#   Example: B=256, T=30, V=204, H=128 → 256×30×204×128×2 = 0.40 GB
+#   Total with gradients + LSTM + attn + optimizer: ~8-10 GB
+#
+# TFT-GAT paper recommendations (https://www.mdpi.com/2673-9909/5/4/176):
+#   hidden_size: 128-512 for large datasets
+#   attention_heads: 4-8 (head_dim = hidden/heads should be 32-64)
+#   dropout: 0.1-0.3 (higher for larger models)
+#   lstm_layers: 2 (diminishing returns beyond)
 TFT_HIDDEN      = 128
 TFT_HEADS       = 4
 TFT_LSTM_LAYERS = 2
@@ -248,9 +264,13 @@ DEFAULT_CONFIG = {
     'max_stocks':               100,
     'max_sequences_per_stock':  None,
     'num_workers':              0,
-    # chunk_samples: controls peak RAM during training
-    # 20K × 30 × 204 × float32 = 0.49 GB per chunk; 3× prefetch depth ≈ 1.5 GB RAM
-    'chunk_samples':            20_000,
+    # chunk_samples: controls peak RAM during training and GPU utilization
+    # Auto-scaled in loader: max(chunk_samples, batch_size * 50)
+    # For batch=4096: auto-scales to 204K samples (~5 GB RAM per chunk)
+    # For batch=192:  20K is fine (~0.5 GB per chunk)
+    # Set higher for better GPU utilization on high-end GPUs (RTX 5090 etc)
+    'chunk_samples':            100_000,   # raised from 20K for better GPU util
+    'prefetch_factor':          2,         # number of chunks to prefetch (double-buffering)
 
     # Target
     'target_mode':   TARGET_MODE,
@@ -311,8 +331,82 @@ DEFAULT_CONFIG = {
 }
 
 
-def get_config(**overrides) -> dict:
+# ─── RTX 5090 Optimized Config (32 GB VRAM) ──────────────────────────────────
+# Based on TFT-GAT paper (https://www.mdpi.com/2673-9909/5/4/176) and
+# RTX 5090 specs (32GB GDDR7, 1.79 TB/s bandwidth, 680 5th-gen Tensor Cores).
+#
+# Usage: python -m deeptime.main --preset rtx5090 ...
+#   Or manually: --batch_size 512 --hidden 256 --heads 8 --seq_len 60 \
+#                --lr 5e-5 --warmup_epochs 5 --dropout 0.2
+#
+# VRAM estimate at these settings: ~8-10 GB (leaves 22GB headroom)
+# Can push to batch=768, hidden=384 if needed.
+RTX_5090_CONFIG = {
+    # Model — larger capacity for 32GB VRAM
+    'tft_hidden':       256,       # 2× default (richer representations)
+    'tft_heads':        8,         # 2× default (multi-aspect attention)
+    'tft_lstm_layers':  2,         # keep 2 (diminishing returns)
+    'tft_dropout':      0.20,      # slightly higher for larger model
+    'sequence_length':  60,        # 2× default (more temporal context)
+
+    # Training — larger batches for better GPU utilization
+    'batch_size':       512,       # 2.7× default (fits in 32GB)
+    'learning_rate':    5e-5,      # sqrt-scaled: 2e-5 × √(512/192) ≈ 3.3e-5, rounded up
+    'warmup_epochs':    5,         # longer warmup for larger batches
+    'weight_decay':     0.1,       # keep same
+    'max_grad_norm':    0.5,       # keep same
+
+    # Data loading — optimized for RTX 5090 bandwidth
+    'chunk_samples':    250_000,   # ~6 GB RAM per chunk, 50+ batches per chunk
+    'prefetch_factor':  3,         # triple-buffering for high bandwidth
+
+    # Early stopping
+    'early_stopping_patience': 20, # more patience for larger model
+    'base_batch_for_lr': 512,      # disable auto LR scaling (already tuned)
+}
+
+# Aggressive RTX 5090 config — use if IC plateaus with conservative settings
+RTX_5090_AGGRESSIVE_CONFIG = {
+    'tft_hidden':       384,
+    'tft_heads':        8,         # head_dim = 384/8 = 48
+    'tft_lstm_layers':  2,
+    'tft_dropout':      0.25,
+    'sequence_length':  60,
+
+    'batch_size':       768,
+    'learning_rate':    8e-5,
+    'warmup_epochs':    8,
+    'weight_decay':     0.15,
+    'max_grad_norm':    0.5,
+
+    # Data loading — max throughput
+    'chunk_samples':    300_000,   # ~8 GB RAM per chunk
+    'prefetch_factor':  3,
+
+    'early_stopping_patience': 25,
+    'base_batch_for_lr': 768,
+}
+
+PRESET_CONFIGS = {
+    'rtx5090': RTX_5090_CONFIG,
+    'rtx5090_aggressive': RTX_5090_AGGRESSIVE_CONFIG,
+}
+
+
+def get_config(preset: str = None, **overrides) -> dict:
+    """
+    Get configuration with optional preset and overrides.
+
+    Args:
+        preset: Optional preset name ('rtx5090', 'rtx5090_aggressive')
+        **overrides: Override any config key
+
+    Returns:
+        Configuration dict
+    """
     cfg = DEFAULT_CONFIG.copy()
+    if preset and preset in PRESET_CONFIGS:
+        cfg.update(PRESET_CONFIGS[preset])
     cfg.update(overrides)
     return cfg
 

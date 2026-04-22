@@ -42,6 +42,9 @@ from .sanity_checks import run_all_checks
 
 def parse_args():
     p = argparse.ArgumentParser(description='deeptime regression pipeline')
+    p.add_argument('--preset', choices=['rtx5090', 'rtx5090_aggressive'],
+                   help='Hardware preset: rtx5090 (batch=512, hidden=256, heads=8), '
+                        'rtx5090_aggressive (batch=768, hidden=384)')
     p.add_argument('--data_dir',    default=DEFAULT_CONFIG['data_dir'])
     p.add_argument('--cache_dir',   default=DEFAULT_CONFIG['cache_dir'])
     p.add_argument('--max_stocks',  type=int, default=100,
@@ -64,6 +67,10 @@ def parse_args():
                    help='Attention heads (default from config: 4)')
     p.add_argument('--lstm_layers', type=int, default=None,
                    help='LSTM layers (default from config: 2)')
+    p.add_argument('--warmup_epochs', type=int, default=None,
+                   help='LR warmup epochs (default: 2; use 5-8 for large batches)')
+    p.add_argument('--patience', type=int, default=None,
+                   help='Early stopping patience (default: 15)')
     p.add_argument('--target_mode', default='excess', choices=['excess', 'raw'])
     p.add_argument('--loss_type',   default='huber', choices=['huber', 'huber+ic'])
     p.add_argument('--seq_len',     type=int, default=None,
@@ -76,6 +83,11 @@ def parse_args():
     p.add_argument('--no_amp',      action='store_true')
     p.add_argument('--sanity_only', action='store_true',
                    help='Run sanity checks only and exit')
+    # Data loading optimization (for high-end GPUs)
+    p.add_argument('--chunk_samples', type=int, default=None,
+                   help='Samples per I/O chunk (default: auto-scaled based on batch)')
+    p.add_argument('--prefetch', type=int, default=None,
+                   help='Prefetch depth (2=double-buffer, 3=triple-buffer)')
     return p.parse_args()
 
 
@@ -389,8 +401,24 @@ def main():
     if args.heads        is not None: overrides['tft_heads']        = args.heads
     if args.lstm_layers  is not None: overrides['tft_lstm_layers']  = args.lstm_layers
     if args.seq_len      is not None: overrides['sequence_length']  = args.seq_len
+    if args.warmup_epochs is not None: overrides['warmup_epochs']   = args.warmup_epochs
+    if args.patience     is not None: overrides['early_stopping_patience'] = args.patience
+    if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
+    if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch
 
-    config = get_config(**overrides)
+    config = get_config(preset=args.preset, **overrides)
+
+    # Log effective config when using preset
+    if args.preset:
+        print(f"\n{'='*60}")
+        print(f"Using {args.preset.upper()} preset")
+        print(f"  hidden={config['tft_hidden']}, heads={config['tft_heads']}, "
+              f"dropout={config['tft_dropout']}")
+        print(f"  batch_size={config['batch_size']}, seq_len={config['sequence_length']}")
+        print(f"  lr={config['learning_rate']:.1e}, warmup={config['warmup_epochs']}ep, "
+              f"weight_decay={config['weight_decay']}")
+        print(f"  chunk_samples={config['chunk_samples']:,}, prefetch={config.get('prefetch_factor', 2)}")
+        print(f"{'='*60}")
 
     if args.sanity_only:
         run_all_checks(config['data_dir'], config['cache_dir'], config)
@@ -430,11 +458,12 @@ def main():
     # ── Create data loaders ────────────────────────────────────────────────
     print("\nLoading datasets...")
     loaders, meta = load_regression_datasets(
-        cache_dir    = config['cache_dir'],
-        batch_size   = config['batch_size'],
-        device       = config['device'],
-        chunk_samples = config['chunk_samples'],
-        use_chunked  = True,
+        cache_dir       = config['cache_dir'],
+        batch_size      = config['batch_size'],
+        device          = config['device'],
+        chunk_samples   = config['chunk_samples'],
+        prefetch_factor = config.get('prefetch_factor', 2),
+        use_chunked     = True,
     )
 
     print(f"  train: {meta['splits']['train']['n_samples']:,} samples")
