@@ -135,12 +135,11 @@ def forward_fill_fundamentals(
     - 'has_fina_data' = 1 when fina data is available, 0 otherwise.
     """
     # All fina columns default to 0 (not NaN) → no rows dropped due to missing fina
-    for col in FINA_INDICATOR_COLUMNS:
-        if col not in stock_df.columns:
-            stock_df[col] = 0.0
-
-    # has_fina_data starts at 0; set to 1 below where data exists
-    stock_df['has_fina_data'] = 0.0
+    # Use assign to avoid DataFrame fragmentation
+    missing_cols = {col: 0.0 for col in FINA_INDICATOR_COLUMNS if col not in stock_df.columns}
+    missing_cols['has_fina_data'] = 0.0
+    if missing_cols:
+        stock_df = stock_df.assign(**missing_cols)
 
     if fina_df is None or len(fina_df) == 0:
         return stock_df
@@ -262,8 +261,8 @@ def merge_block_trade_features(
     Compute block_vol_ratio, block_amt_ratio, block_count_log, block_buy_sell_ratio
     and merge into stock_df.
     """
-    for col in BLOCK_TRADE_COLUMNS:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in BLOCK_TRADE_COLUMNS})
 
     if block_trade_df is None or len(block_trade_df) == 0:
         return stock_df
@@ -325,8 +324,8 @@ def compute_extended_moneyflow(
     moneyflow_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Add net_sm_flow_ratio and net_md_flow_ratio to stock_df."""
-    for col in EXTRA_MONEYFLOW_COLUMNS:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in EXTRA_MONEYFLOW_COLUMNS})
 
     if moneyflow_df is None or len(moneyflow_df) == 0:
         return stock_df
@@ -371,8 +370,8 @@ def compute_price_limit_ratios(
     Add up_limit_ratio and down_limit_ratio to stock_df.
     Default: ±10% for normal stocks.
     """
-    stock_df['up_limit_ratio']   = 0.10
-    stock_df['down_limit_ratio'] = -0.10
+    # Initialize both columns at once to avoid fragmentation
+    stock_df = stock_df.assign(up_limit_ratio=0.10, down_limit_ratio=-0.10)
 
     if stk_limit_df is None or len(stk_limit_df) == 0:
         return stock_df

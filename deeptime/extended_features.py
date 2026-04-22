@@ -330,8 +330,8 @@ def merge_forecast_features(
     forecast_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge forecast features into stock dataframe."""
-    for col in FORECAST_FEATURES:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in FORECAST_FEATURES})
 
     if forecast_df is None or len(forecast_df) == 0:
         return stock_df
@@ -383,8 +383,8 @@ def merge_express_features(
     express_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge express earnings features into stock dataframe."""
-    for col in EXPRESS_FEATURES:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in EXPRESS_FEATURES})
 
     if express_df is None or len(express_df) == 0:
         return stock_df
@@ -426,8 +426,8 @@ def merge_limit_features(
     dragon_tiger_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge limit and dragon-tiger features into stock dataframe."""
-    for col in LIMIT_FEATURES:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in LIMIT_FEATURES})
 
     if not pd.api.types.is_datetime64_any_dtype(stock_df['trade_date']):
         stock_df['trade_date'] = pd.to_datetime(stock_df['trade_date'].astype(str))
@@ -472,8 +472,8 @@ def merge_chip_features(
     chip_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge chip distribution features into stock dataframe."""
-    for col in CHIP_FEATURES:
-        stock_df[col] = 0.0
+    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.assign(**{col: 0.0 for col in CHIP_FEATURES})
 
     if chip_df is None or len(chip_df) == 0:
         return stock_df
