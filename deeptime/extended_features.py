@@ -426,7 +426,9 @@ def merge_limit_features(
     dragon_tiger_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge limit and dragon-tiger features into stock dataframe."""
-    # Initialize all columns at once to avoid fragmentation
+    # .copy() defragments the DataFrame (accumulated from many prior merges)
+    # before adding new columns, eliminating the PerformanceWarning.
+    stock_df = stock_df.copy()
     stock_df = stock_df.assign(**{col: 0.0 for col in LIMIT_FEATURES})
 
     if not pd.api.types.is_datetime64_any_dtype(stock_df['trade_date']):
@@ -472,7 +474,7 @@ def merge_chip_features(
     chip_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge chip distribution features into stock dataframe."""
-    # Initialize all columns at once to avoid fragmentation
+    stock_df = stock_df.copy()   # defragment before adding columns
     stock_df = stock_df.assign(**{col: 0.0 for col in CHIP_FEATURES})
 
     if chip_df is None or len(chip_df) == 0:
