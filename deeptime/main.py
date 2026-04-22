@@ -364,17 +364,6 @@ def main():
     # Run post-cache sanity checks
     run_all_checks(config['data_dir'], config['cache_dir'], config)
 
-    # ── Feature normalization then compression ────────────────────────────────
-    from .memmap_dataset import normalize_cache, compress_cache
-
-    print("\nApplying feature normalization to cache...")
-    normalize_cache(config['cache_dir'], chunk_size=2_000)
-
-    print("\nCompressing cache (float16 zarr + blosc-zstd)...")
-    compress_cache(config['cache_dir'],
-                   chunk_size=config.get('chunk_samples', 20_000),
-                   cname='zstd', clevel=5)
-
     # ── GPU memory limit: dedicated VRAM only (RTX 4070 Super = 12 GB) ───────
     if torch.cuda.is_available():
         # Reserve at most 90% of dedicated VRAM; raises OOM instead of spilling

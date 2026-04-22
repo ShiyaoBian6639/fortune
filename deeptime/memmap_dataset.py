@@ -75,11 +75,9 @@ class RegressionMemmapDataset(Dataset):
                 return np.memmap(path, dtype=dtype, mode='r', shape=shape)
             return np.zeros(shape, dtype=dtype)
 
-        # obs and future may be zarr (compressed) or plain memmap
-        self.obs_seqs, _    = _open_zarr_or_memmap(
-            os.path.join(d, f'{s}_obs'), 'float32', (n, self.seq_length, self.n_past))
-        self.future_inputs, _ = _open_zarr_or_memmap(
-            os.path.join(d, f'{s}_future'), 'float32', (n, self.max_fw, self.n_future))
+        # Use plain .npy memmap files (float32)
+        self.obs_seqs      = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
+        self.future_inputs = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
         self.targets       = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
         self.sector_ids    = _mm(f'{s}_sectors.npy',    'int64',   (n,))
         self.industry_ids  = _mm(f'{s}_industries.npy', 'int64',   (n,))
@@ -108,10 +106,9 @@ class RegressionMemmapDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        # np.asarray cast handles both zarr (float16) and memmap (float32) → float32
         return (
-            torch.from_numpy(np.asarray(self.obs_seqs[idx],     dtype='float32')),
-            torch.from_numpy(np.asarray(self.future_inputs[idx], dtype='float32')),
+            torch.from_numpy(self.obs_seqs[idx].copy()),
+            torch.from_numpy(self.future_inputs[idx].copy()),
             torch.from_numpy(self.targets[idx].copy()),
             int(self.sector_ids[idx]),
             int(self.industry_ids[idx]),
@@ -203,11 +200,9 @@ class RegressionChunkedLoader:
                 return np.memmap(path, dtype=dtype, mode='r', shape=shape)
             return np.zeros(shape, dtype=dtype)   # zero-fill for old caches
 
-        # obs / future: prefer zarr (float16 compressed) over float32 memmap
-        self._obs,    _ = _open_zarr_or_memmap(
-            os.path.join(d, f'{s}_obs'),    'float32', (n, self.seq_length, self.n_past))
-        self._future, _ = _open_zarr_or_memmap(
-            os.path.join(d, f'{s}_future'), 'float32', (n, self.max_fw, self.n_future))
+        # Use plain .npy memmap files (float32)
+        self._obs     = _mm(f'{s}_obs.npy',        'float32', (n, self.seq_length, self.n_past))
+        self._future  = _mm(f'{s}_future.npy',     'float32', (n, self.max_fw, self.n_future))
         self._targets = _mm(f'{s}_targets.npy',    'float32', (n, self.num_horizons))
         self._sectors = _mm(f'{s}_sectors.npy',    'int64',   (n,))
         self._inds    = _mm(f'{s}_industries.npy', 'int64',   (n,))
@@ -232,12 +227,9 @@ class RegressionChunkedLoader:
             start = chunk_idx * self.chunk_samples
             end   = min(start + self.chunk_samples, self.n_samples)
             idx   = indices[start:end]
-            # zarr reads return float16; cast to float32 for model compatibility
-            obs_chunk = np.asarray(self._obs[idx], dtype='float32')
-            fut_chunk = np.asarray(self._future[idx], dtype='float32')
             return (
-                obs_chunk,
-                fut_chunk,
+                self._obs[idx].copy(),
+                self._future[idx].copy(),
                 self._targets[idx].copy(),
                 self._sectors[idx].copy(),
                 self._inds[idx].copy(),
