@@ -14,10 +14,13 @@ from .config import DT_FEATURE_COLUMNS, FORWARD_WINDOWS, NUM_HORIZONS
 
 def check_feature_distribution_shift(
     cache_dir: str,
+    max_samples: int = 50000,  # Sample for speed on large datasets
 ) -> List[str]:
     """
     Flag features with >5× std shift between 2017-2019 and 2023-2025.
     Returns list of flagged feature names.
+
+    Uses sampling to keep runtime under 1 minute even on 5M+ sample datasets.
     """
     import json
     obs_path = os.path.join(cache_dir, 'train_obs.npy')
@@ -32,22 +35,37 @@ def check_feature_distribution_shift(
     n_past = meta['n_past']
     sl    = meta['seq_length']
 
+    # Sample indices for speed on large datasets
+    if n > max_samples:
+        rng = np.random.default_rng(42)
+        sample_idx = rng.choice(n, size=max_samples, replace=False)
+        sample_idx = np.sort(sample_idx)  # Sort for sequential access
+        print(f"  (sampling {max_samples:,} of {n:,} for speed)")
+    else:
+        sample_idx = np.arange(n)
+
     obs   = np.memmap(obs_path,  dtype='float32', mode='r', shape=(n, sl, n_past))
     dates = np.memmap(date_path, dtype='int32',   mode='r', shape=(n,))
 
-    # Use last timestep of each sequence for feature stats
-    last = obs[:, -1, :]   # (N, n_past)
+    # Load only sampled data into RAM
+    sampled_dates = dates[sample_idx]
+    sampled_last  = obs[sample_idx, -1, :]  # (sample_size, n_past)
 
-    early_mask = (dates < 20200101)
-    late_mask  = (dates >= 20230101)
+    early_mask = (sampled_dates < 20200101)
+    late_mask  = (sampled_dates >= 20230101)
+
+    n_early = early_mask.sum()
+    n_late  = late_mask.sum()
+
+    if n_early < 100 or n_late < 100:
+        print(f"  [skip] Not enough early ({n_early}) or late ({n_late}) samples")
+        return []
 
     flagged = []
     from .config import DT_OBSERVED_PAST_COLUMNS
     for i, feat in enumerate(DT_OBSERVED_PAST_COLUMNS[:n_past]):
-        if early_mask.sum() < 100 or late_mask.sum() < 100:
-            continue
-        std_early = float(np.nanstd(last[early_mask, i]))
-        std_late  = float(np.nanstd(last[late_mask,  i]))
+        std_early = float(np.nanstd(sampled_last[early_mask, i]))
+        std_late  = float(np.nanstd(sampled_last[late_mask,  i]))
         if std_early < 1e-8:
             continue
         ratio = std_late / (std_early + 1e-8)
