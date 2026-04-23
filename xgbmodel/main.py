@@ -48,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='0 = all stocks (default from config)')
     p.add_argument('--target', choices=['raw', 'excess'], default=None,
                    help="'raw' = next-day pct_chg; 'excess' = minus CSI300")
+    p.add_argument('--cs_target_norm', choices=['none', 'demean', 'zscore'], default=None,
+                   help="Per-day cross-sectional target normalization "
+                        "(default 'demean'). Kills the per-day-constant signal "
+                        "so XGBoost learns stock-discriminating features.")
     p.add_argument('--forward_window', type=int, default=None,
                    help='Horizon in trading days (default 1)')
 
@@ -97,6 +101,7 @@ def cfg_from_args(args: argparse.Namespace) -> dict:
         'min_rows_per_stock', 'device',
         'fold_train_weeks', 'fold_val_weeks', 'fold_test_weeks', 'fold_step_weeks',
         'purge_days', 'embargo_days', 'max_folds',
+        'cs_target_norm',
     )
     for k in simple_keys:
         v = getattr(args, k, None)
@@ -123,7 +128,9 @@ def main(argv=None) -> int:
     cfg  = cfg_from_args(args)
 
     print(f"[xgbmodel] mode={args.mode}")
-    print(f"[xgbmodel] target_mode={cfg['target_mode']}  forward_window={cfg['forward_window']}  "
+    print(f"[xgbmodel] target_mode={cfg['target_mode']}  "
+          f"cs_target_norm={cfg['cs_target_norm']}  "
+          f"forward_window={cfg['forward_window']}  "
           f"device={cfg['device']}")
     print(f"[xgbmodel] split: train<{cfg['val_start']} ≤ val < {cfg['test_start']} ≤ test")
 

@@ -357,6 +357,10 @@ def train_model(
     # Reference: Izmailov et al. 2018, "Averaging Weights Leads to Wider Optima"
     use_swa        = bool(config.get('use_swa', True))
     swa_start_ep   = int(config.get('swa_start_epoch', warmup_ep))  # default: once warmup ends
+    # Per-epoch SWA val eval doubles val-loader memory pressure; default only
+    # eval every N epochs to keep a trajectory signal without OOM risk. Always
+    # eval once at the end for the [SWA WINS] decision.
+    swa_eval_every = int(config.get('swa_eval_every', 5))
     swa_model      = None
     swa_n_updates  = 0
     if use_swa:
@@ -446,15 +450,21 @@ def train_model(
                 print(f"\n  [WARN] Validation loss diverging: {recent_vl[0]:.4f} → {recent_vl[-1]:.4f}")
                 print(f"         Consider reducing learning rate or model size")
 
-        # SWA update: average-in current model weights once past the start epoch
+        # SWA update: average-in current model weights once past the start epoch.
+        # The *update* is cheap (weighted avg of parameters). We only *evaluate*
+        # the SWA model every `swa_eval_every` epochs since eval doubles the
+        # val-loader memory pressure and can OOM with large chunk settings.
         swa_val_ic = None
         if use_swa and epoch + 1 >= swa_start_ep:
             swa_model.update_parameters(model)
             swa_n_updates += 1
-            # Evaluate the averaged model on val to track its trajectory
-            swa_metrics, _, _ = evaluate(swa_model, val_loader, criterion, device)
-            swa_val_ic = swa_metrics['ic_mean']
-            print(f"    SWA (n={swa_n_updates}): val IC={swa_val_ic:.4f}")
+            should_eval = (swa_n_updates % swa_eval_every == 0)
+            if should_eval:
+                swa_metrics, _, _ = evaluate(swa_model, val_loader, criterion, device)
+                swa_val_ic = swa_metrics['ic_mean']
+                print(f"    SWA (n={swa_n_updates}): val IC={swa_val_ic:.4f}")
+            else:
+                print(f"    SWA (n={swa_n_updates}): weights averaged (eval every {swa_eval_every} ep)")
         history['swa_val_ic'].append(swa_val_ic if swa_val_ic is not None else float('nan'))
 
         # Early stopping on val IC

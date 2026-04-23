@@ -78,6 +78,10 @@ def parse_args():
                    help='Disable Stochastic Weight Averaging (SWA is on by default)')
     p.add_argument('--swa_start', type=int, default=None,
                    help='Epoch to start SWA averaging from (default: warmup_epochs)')
+    p.add_argument('--swa_eval_every', type=int, default=None,
+                   help='Evaluate SWA model on val every N epochs (default: 5). '
+                        'Lower = more trajectory signal, higher memory pressure. '
+                        'Always evaluates once at end regardless.')
     p.add_argument('--patience', type=int, default=None,
                    help='Early stopping patience (default: 15)')
     p.add_argument('--target_mode', default='excess', choices=['excess', 'raw'])
@@ -420,6 +424,7 @@ def main():
     if args.lr_schedule  is not None: overrides['lr_schedule']     = args.lr_schedule
     if args.no_swa:                    overrides['use_swa']         = False
     if args.swa_start    is not None: overrides['swa_start_epoch']  = args.swa_start
+    if args.swa_eval_every is not None: overrides['swa_eval_every']  = args.swa_eval_every
     if args.patience     is not None: overrides['early_stopping_patience'] = args.patience
     if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
     if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch

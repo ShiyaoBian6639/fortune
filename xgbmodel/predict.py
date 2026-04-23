@@ -20,6 +20,7 @@ import xgboost as xgb
 
 from .config import MODEL_DIR, PREDICT_OUT
 from .data_loader import build_panel, list_feature_columns
+from .probability import load_val_residual_model, attach_probabilities
 
 
 def _load_model(cfg: dict) -> Tuple[xgb.XGBRegressor, List[str]]:
@@ -46,8 +47,21 @@ def _align_features(panel: pd.DataFrame, feats: List[str]) -> pd.DataFrame:
     return panel
 
 
-def predict_latest(cfg: dict, out_path: str = PREDICT_OUT) -> pd.DataFrame:
-    """Predict next-day pct_chg for the most recent trade_date in the panel."""
+def predict_latest(cfg: dict, out_path: str = PREDICT_OUT,
+                   with_probability: bool = True) -> pd.DataFrame:
+    """Predict next-day pct_chg — and, optionally, calibrated probabilities.
+
+    The point estimate comes from the XGBRegressor directly. Probabilities
+    are computed by combining the point estimate with a Student-t fit of
+    the validation-set residual distribution (target − pred on OOF val):
+
+        P(return > threshold | pred) = 1 - F((threshold - pred - μ) / σ)
+
+    where F is the Student-t CDF fitted from val residuals. This gives a
+    cheap, model-consistent probability without retraining. For production
+    trading, a dedicated `binary:logistic` classifier will typically be
+    better calibrated in the tails — see xgbmodel.probability for the math.
+    """
     model, feats = _load_model(cfg)
     panel = build_panel(cfg)
     panel = _align_features(panel, feats)
@@ -60,13 +74,36 @@ def predict_latest(cfg: dict, out_path: str = PREDICT_OUT) -> pd.DataFrame:
     X = latest[feats]
     latest['pred_pct_chg_next'] = model.predict(X).astype('float32')
 
+    # Slim output frame — identity + prediction
     keep = ['ts_code', 'trade_date', 'pred_pct_chg_next']
-    out = latest[keep].sort_values('pred_pct_chg_next', ascending=False).reset_index(drop=True)
+    out  = latest[keep].copy()
+
+    # Attach probabilities from the val residual distribution
+    if with_probability:
+        try:
+            resid = load_val_residual_model(cfg)
+            print(f"[xgbmodel.predict] residual model: {resid.summary()}")
+            out = attach_probabilities(
+                out, pred_col='pred_pct_chg_next', resid=resid,
+                thresholds=(-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0),
+                include_pi=True,
+            )
+        except FileNotFoundError as e:
+            print(f"[xgbmodel.predict] skipping probability: {e}")
+        except Exception as e:
+            print(f"[xgbmodel.predict] probability calc failed: {e}")
+
+    out = out.sort_values('pred_pct_chg_next', ascending=False).reset_index(drop=True)
     out.to_csv(out_path, index=False)
+
     print(f"[xgbmodel.predict] {len(out):,} stocks predicted for {last_date.date()} "
           f"(next-day), saved to {out_path}")
-    print(f"  top 10:\n{out.head(10).to_string(index=False)}")
-    print(f"  bottom 10:\n{out.tail(10).to_string(index=False)}")
+    # Show compact preview: point estimate + a few probability columns
+    preview_cols = ['ts_code', 'pred_pct_chg_next', 'prob_up',
+                    'prob_gt_3pct', 'prob_lt_3pct', 'pi_lo_80', 'pi_hi_80']
+    preview_cols = [c for c in preview_cols if c in out.columns]
+    print(f"  top 10:\n{out[preview_cols].head(10).to_string(index=False)}")
+    print(f"  bottom 10:\n{out[preview_cols].tail(10).to_string(index=False)}")
     return out
 
 

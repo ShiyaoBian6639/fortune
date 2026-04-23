@@ -30,11 +30,29 @@ for _d in (CACHE_DIR, MODEL_DIR, PLOT_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # ─── Target ───────────────────────────────────────────────────────────────────
-# 'raw'    = next-day pct_chg (the user's request)
-# 'excess' = next-day pct_chg - csi300 next-day pct_chg (regime-invariant)
-TARGET_MODE       = 'raw'
+# 'raw'    = next-day pct_chg
+# 'excess' = next-day pct_chg - CSI300 next-day pct_chg
+#
+# Note: `CS_TARGET_NORM` below (applied post-concat in build_panel) makes this
+# choice mostly cosmetic — demean/zscore over the full cross-section subsumes
+# subtracting any single per-day constant like csi300_pct_chg.
+TARGET_MODE       = 'excess'
 FORWARD_WINDOW    = 1       # predict t+1
 CLIP_TARGET_PCT   = 11.0    # clip absolute target at 11% (daily limit-down/up band)
+
+# Cross-sectional target normalization, applied per trade_date after the full
+# panel is assembled. Options:
+#   'none'   — leave target as-is (raw or excess per TARGET_MODE)
+#   'demean' — subtract per-day mean across the full universe  ← default
+#   'zscore' — subtract per-day mean + divide by per-day std
+#
+# Why this matters: daily rank IC (our real objective) is invariant to any
+# per-day constant shift and, for zscore, per-day scaling. The earlier
+# 212-fold walk-forward showed that with target_mode='excess' the top-20
+# features by total_gain were STILL all per-day constants (macro indices,
+# global lags, dow). Demeaning kills that degree of freedom and forces
+# XGBoost to learn stock-discriminating splits.
+CS_TARGET_NORM    = 'demean'
 
 # ─── Date split (walk-forward) ───────────────────────────────────────────────
 # Date format YYYYMMDD (int). Train < VAL_START ≤ val < TEST_START ≤ test.
@@ -122,18 +140,26 @@ IDX_FACTOR_CODE = '000300_SH'   # use CSI300 as the market proxy
 XGB_PARAMS = {
     'objective':         'reg:pseudohubererror',  # robust to fat-tailed return distribution
     'huber_slope':       1.0,                     # transition at 1% |residual|
-    'learning_rate':     0.03,
-    'max_depth':         7,
-    'min_child_weight':  50,
-    'subsample':         0.8,
-    'colsample_bytree':  0.7,
-    'colsample_bylevel': 0.8,
-    'reg_alpha':         0.0,
-    'reg_lambda':        1.0,
-    'gamma':             0.0,
+
+    # Tuned after observing that the prior defaults (lr=0.03, depth=7,
+    # min_child_weight=50, reg_lambda=1.0) produced median best_iter≈100 but
+    # heavy overfitting (train IC 0.25 vs val IC 0.04 across 212 folds).
+    # New regime: smaller lr, shallower trees, much stronger regularization so
+    # each boosting step captures a smaller fraction of signal and we train
+    # longer before early stopping fires.
+    'learning_rate':     0.015,     # 0.03 → 0.015  (half)
+    'max_depth':         5,         # 7 → 5         (fewer interactions → less overfit)
+    'min_child_weight':  200,       # 50 → 200      (no split on tiny sub-populations)
+    'subsample':         0.7,       # 0.8 → 0.7
+    'colsample_bytree':  0.6,       # 0.7 → 0.6
+    'colsample_bylevel': 0.7,       # 0.8 → 0.7
+    'reg_alpha':         0.1,       # L1 > 0 to sparsify splits
+    'reg_lambda':        3.0,       # 1.0 → 3.0
+    'gamma':             0.1,       # require min-gain > 0 per split
+
     'tree_method':       'hist',
-    'n_estimators':      4000,
-    'early_stopping_rounds': 100,
+    'n_estimators':      5000,      # higher ceiling for the lower learning rate
+    'early_stopping_rounds': 150,   # 100 → 150 to match the slower descent
     'verbosity':         1,
 }
 
@@ -172,6 +198,7 @@ DEFAULT_CONFIG = {
     'target_mode':            TARGET_MODE,
     'forward_window':         FORWARD_WINDOW,
     'clip_target_pct':        CLIP_TARGET_PCT,
+    'cs_target_norm':         CS_TARGET_NORM,
 
     'split_mode':             'fixed',     # 'fixed' | 'walk_forward'
     'train_start':            TRAIN_START,

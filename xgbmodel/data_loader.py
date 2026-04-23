@@ -688,6 +688,30 @@ def build_panel(cfg: dict) -> pd.DataFrame:
     print("  computing cross-sectional rank + de-mean features ...")
     panel = add_cross_section_features(panel)
 
+    # Cross-sectional target demean (or z-score).
+    # Rationale: without this, per-day-constant features (macro indices, global
+    # lags, calendar) dominate total_gain because they correctly predict the
+    # per-day MEAN of the target across the universe — but a per-day-constant
+    # prediction contributes zero cross-sectional rank IC, which is the metric
+    # we actually optimize. Demeaning the target per trade_date removes this
+    # degree of freedom from the objective, forcing splits on stock-discriminating
+    # features. `target_mode='excess'` only partially fixes this because CSI300
+    # is 300 of ~5100 stocks and the excess-return mean over the full universe
+    # is still nonzero.
+    cs_norm = cfg.get('cs_target_norm', 'demean')
+    if cs_norm in ('demean', 'zscore'):
+        before_std = float(panel['target'].std())
+        mean_by_date = panel.groupby('trade_date')['target'].transform('mean')
+        demeaned = panel['target'] - mean_by_date
+        if cs_norm == 'zscore':
+            std_by_date = panel.groupby('trade_date')['target'].transform('std')
+            demeaned = demeaned / std_by_date.replace(0, np.nan)
+            demeaned = demeaned.fillna(0.0)
+        panel['target'] = demeaned.astype('float32')
+        after_std = float(panel['target'].std())
+        print(f"  applied cs_target_norm={cs_norm}  "
+              f"target std {before_std:.4f} → {after_std:.4f}")
+
     # Canonical column order: ts_code, trade_date, ..., target
     cols = ['ts_code', 'trade_date'] + \
            [c for c in panel.columns if c not in ('ts_code', 'trade_date', 'target')] + \
