@@ -90,6 +90,8 @@ def parse_args():
                    help='Prefetch depth (2=double-buffer, 3=triple-buffer)')
     p.add_argument('--num_workers', type=int, default=None,
                    help='DataLoader workers (0=chunked loader, 4-8=parallel workers)')
+    p.add_argument('--preload', action='store_true',
+                   help='Preload entire train set to RAM for max GPU throughput')
     return p.parse_args()
 
 
@@ -408,6 +410,7 @@ def main():
     if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
     if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch
     if args.num_workers  is not None: overrides['num_workers']     = args.num_workers
+    if args.preload:                  overrides['preload']         = True
 
     config = get_config(preset=args.preset, **overrides)
 
@@ -469,6 +472,7 @@ def main():
         chunk_samples   = config['chunk_samples'],
         prefetch_factor = config.get('prefetch_factor', 2),
         num_workers     = config.get('num_workers', 0),
+        preload         = config.get('preload', False),
         use_chunked     = True,
     )
 

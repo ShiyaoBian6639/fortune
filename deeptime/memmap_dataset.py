@@ -153,6 +153,119 @@ class DateStratifiedSampler(Sampler):
         return len(self.dataset)
 
 
+# ─── RAM-cached loader (fastest if you have enough RAM) ───────────────────────
+
+class RegressionRAMLoader:
+    """
+    Loads entire dataset into RAM at startup for maximum throughput.
+
+    Use this if you have enough RAM (dataset size + ~50% overhead).
+    For seq_len=60, n_past=204, n_samples=4.8M: ~250 GB RAM needed.
+
+    For smaller datasets or subsets, this gives near 100% GPU utilization.
+    """
+
+    def __init__(
+        self,
+        data_dir:   str,
+        split:      str,
+        batch_size: int,
+        device:     str = 'cpu',
+        shuffle:    bool = True,
+    ):
+        self.batch_size = batch_size
+        self.device     = device
+        self.shuffle    = shuffle
+
+        with open(os.path.join(data_dir, 'metadata.json')) as f:
+            meta = json.load(f)
+
+        si = meta['splits'][split]
+        self.n_samples = si['n_samples']
+        seq_len  = meta['seq_length']
+        n_past   = meta['n_past']
+        n_future = meta['n_future']
+        max_fw   = meta['max_fw']
+        n_horiz  = meta['num_horizons']
+
+        # Estimate RAM needed
+        bytes_total = (
+            self.n_samples * seq_len * n_past * 4 +      # obs
+            self.n_samples * max_fw * n_future * 4 +     # future
+            self.n_samples * n_horiz * 4 +               # targets
+            self.n_samples * 7 * 8                        # int64 static IDs
+        )
+        gb_needed = bytes_total / 1024**3
+        print(f"  [RAM Loader] Loading {self.n_samples:,} samples ({gb_needed:.1f} GB) into RAM...")
+
+        import time
+        t0 = time.time()
+
+        # Load ALL data into RAM (contiguous numpy arrays)
+        def _load(fname, dtype, shape):
+            path = os.path.join(data_dir, fname)
+            mm = np.memmap(path, dtype=dtype, mode='r', shape=shape)
+            return np.array(mm)  # copy to RAM
+
+        self._obs     = _load(f'{split}_obs.npy',        'float32', (self.n_samples, seq_len, n_past))
+        self._future  = _load(f'{split}_future.npy',     'float32', (self.n_samples, max_fw, n_future))
+        self._targets = _load(f'{split}_targets.npy',    'float32', (self.n_samples, n_horiz))
+        self._sectors = _load(f'{split}_sectors.npy',    'int64',   (self.n_samples,))
+        self._inds    = _load(f'{split}_industries.npy', 'int64',   (self.n_samples,))
+        self._subs    = _load(f'{split}_sub_inds.npy',   'int64',   (self.n_samples,))
+        self._sizes   = _load(f'{split}_sizes.npy',      'int64',   (self.n_samples,))
+        self._areas   = _load(f'{split}_areas.npy',      'int64',   (self.n_samples,))
+        self._boards  = _load(f'{split}_boards.npy',     'int64',   (self.n_samples,))
+        self._ipo     = _load(f'{split}_ipo_ages.npy',   'int64',   (self.n_samples,))
+
+        print(f"  [RAM Loader] Loaded in {time.time()-t0:.1f}s")
+
+        self._n_batches = (self.n_samples + batch_size - 1) // batch_size
+        self._use_pinned = (device != 'cpu' and torch.cuda.is_available())
+
+    def __len__(self):
+        return self._n_batches
+
+    def __iter__(self):
+        indices = np.arange(self.n_samples)
+        if self.shuffle:
+            np.random.shuffle(indices)
+
+        for b_start in range(0, self.n_samples, self.batch_size):
+            b_end = min(b_start + self.batch_size, self.n_samples)
+            idx = indices[b_start:b_end]
+
+            # Direct RAM access (no disk I/O)
+            obs_t    = torch.from_numpy(self._obs[idx])
+            future_t = torch.from_numpy(self._future[idx])
+            tgt_t    = torch.from_numpy(self._targets[idx])
+            sec_t    = torch.from_numpy(self._sectors[idx])
+            ind_t    = torch.from_numpy(self._inds[idx])
+            sub_t    = torch.from_numpy(self._subs[idx])
+            sz_t     = torch.from_numpy(self._sizes[idx])
+            area_t   = torch.from_numpy(self._areas[idx])
+            board_t  = torch.from_numpy(self._boards[idx])
+            ipo_t    = torch.from_numpy(self._ipo[idx])
+
+            if self._use_pinned:
+                obs_t = obs_t.pin_memory()
+                future_t = future_t.pin_memory()
+                tgt_t = tgt_t.pin_memory()
+
+            yield (
+                obs_t.to(self.device, non_blocking=True),
+                future_t.to(self.device, non_blocking=True),
+                tgt_t.to(self.device, non_blocking=True),
+                sec_t.to(self.device, non_blocking=True),
+                ind_t.to(self.device, non_blocking=True),
+                sub_t.to(self.device, non_blocking=True),
+                sz_t.to(self.device, non_blocking=True),
+                area_t.to(self.device, non_blocking=True),
+                board_t.to(self.device, non_blocking=True),
+                ipo_t.to(self.device, non_blocking=True),
+            )
+
+
 # ─── Chunked background loader (optimized for RTX 5090) ───────────────────────
 
 class RegressionChunkedLoader:
@@ -989,6 +1102,7 @@ def load_regression_datasets(
     chunk_samples: int = 100_000,
     prefetch_factor: int = 2,
     num_workers: int = 0,
+    preload: bool = False,
     use_chunked: bool = True,
 ):
     """
@@ -999,12 +1113,20 @@ def load_regression_datasets(
         prefetch_factor: Number of chunks to prefetch (2=double-buffer, 3=triple-buffer).
         num_workers: Number of DataLoader workers. If >0, uses PyTorch DataLoader instead
                      of RegressionChunkedLoader for better parallelism.
+        preload: If True, loads entire dataset into RAM for maximum GPU throughput.
+                 Requires sufficient RAM (dataset_size * 1.5).
     """
     meta = get_cache_info(cache_dir)
     loaders = {}
 
-    # Use PyTorch DataLoader with multiple workers (better for high-end GPUs)
+    # WARNING: DataLoader with num_workers > 0 is SLOWER with memmap files!
+    # Each worker opens separate file handles → no page cache sharing → random seeks
+    # Use chunked loader (num_workers=0) for memmap-backed datasets
     use_dataloader = (num_workers > 0)
+
+    if use_dataloader:
+        print(f"\n  [WARN] num_workers={num_workers} with memmap is often SLOWER than chunked loader!")
+        print(f"         Each worker does random disk seeks. Try --num_workers 0 if slow.\n")
 
     for split in ('train', 'val', 'test'):
         n = meta['splits'].get(split, {}).get('n_samples', 0)
@@ -1012,15 +1134,23 @@ def load_regression_datasets(
             loaders[split] = None
             continue
 
-        if use_dataloader:
+        if preload and split == 'train':
+            # RAM Loader: preload entire dataset for maximum GPU throughput
+            # Best for datasets that fit in RAM (~50GB for 4.8M samples)
+            loaders[split] = RegressionRAMLoader(
+                cache_dir, split, batch_size, device, shuffle=True,
+            )
+            print(f"  [Preload] Train data loaded to RAM for max GPU throughput")
+        elif use_dataloader:
             # PyTorch DataLoader with multiprocessing workers
+            # NOTE: This is often slower due to memmap + multiprocessing conflict
             from torch.utils.data import DataLoader
             ds = RegressionMemmapDataset(cache_dir, split)
             nw = num_workers if split == 'train' else min(2, num_workers)
             loaders[split] = DataLoader(
                 ds, batch_size=batch_size, shuffle=(split == 'train'),
                 num_workers=nw, pin_memory=(device != 'cpu'),
-                persistent_workers=(nw > 0),  # keep workers alive between epochs
+                persistent_workers=(nw > 0),
                 prefetch_factor=2 if nw > 0 else None,
             )
             if split == 'train':
