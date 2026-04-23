@@ -331,10 +331,15 @@ class RegressionChunkedLoader:
             except:
                 avail_ram = 16 * 1024**3
 
-        # Use 50% of available RAM, divided by prefetch buffers
-        usable_ram = int(avail_ram * 0.5)
-        target_chunk_bytes = usable_ram // prefetch_factor
-        target_chunk_bytes = max(target_chunk_bytes, 2 * 1024**3)  # minimum 2GB
+        # Memory budget: prefetch buffers + active chunk + shuffle temp copy
+        # Peak usage = (prefetch_factor + 2) × chunk_size
+        # Use 60% of available RAM for safety margin
+        usable_ram = int(avail_ram * 0.6)
+        n_buffers = prefetch_factor + 2  # prefetch + active + shuffle copy
+        target_chunk_bytes = usable_ram // n_buffers
+        # Safety bounds: 2GB min, 15GB max per chunk (avoid OOM from RAM misdetection)
+        target_chunk_bytes = max(target_chunk_bytes, 2 * 1024**3)
+        target_chunk_bytes = min(target_chunk_bytes, 15 * 1024**3)  # cap at 15GB
         mem_limited_chunk = int(target_chunk_bytes / bytes_per_sample)
 
         # Also ensure at least 20 batches per chunk for GPU efficiency
