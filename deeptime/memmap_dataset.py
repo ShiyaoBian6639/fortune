@@ -310,23 +310,47 @@ class RegressionChunkedLoader:
         self.num_horizons = meta['num_horizons']
         self.max_fw       = meta['max_fw']
 
-        # Auto-scale chunk size based on memory budget
-        # Target: ~2 GB per chunk to avoid OOM with prefetch buffering
+        # Auto-scale chunk size based on AVAILABLE system RAM
         # obs array: chunk_samples × seq_len × n_past × 4 bytes
         bytes_per_sample = self.seq_length * self.n_past * 4 + self.max_fw * self.n_future * 4 + 100
-        target_chunk_bytes = 2 * 1024**3  # 2 GB target per chunk
+
+        # Detect available RAM and use 50% for data loading
+        try:
+            import psutil
+            avail_ram = psutil.virtual_memory().available
+        except ImportError:
+            # Fallback: read from /proc/meminfo (Linux)
+            try:
+                with open('/proc/meminfo') as f:
+                    for line in f:
+                        if line.startswith('MemAvailable:'):
+                            avail_ram = int(line.split()[1]) * 1024  # KB to bytes
+                            break
+                    else:
+                        avail_ram = 16 * 1024**3  # conservative 16GB fallback
+            except:
+                avail_ram = 16 * 1024**3
+
+        # Use 50% of available RAM, divided by prefetch buffers
+        usable_ram = int(avail_ram * 0.5)
+        target_chunk_bytes = usable_ram // prefetch_factor
+        target_chunk_bytes = max(target_chunk_bytes, 2 * 1024**3)  # minimum 2GB
         mem_limited_chunk = int(target_chunk_bytes / bytes_per_sample)
 
         # Also ensure at least 20 batches per chunk for GPU efficiency
         min_chunk = batch_size * 20
 
-        # Use the smaller of: user request, memory limit, or dataset size
-        auto_chunk = max(min_chunk, min(chunk_samples, mem_limited_chunk))
-        self.chunk_samples = min(auto_chunk, self.n_samples)
+        # Honor user request if it fits in memory, otherwise cap
+        if chunk_samples <= mem_limited_chunk:
+            effective = max(min_chunk, chunk_samples)
+        else:
+            effective = max(min_chunk, mem_limited_chunk)
+        self.chunk_samples = min(effective, self.n_samples)
 
         # Log effective chunk size
         chunk_gb = self.chunk_samples * bytes_per_sample / 1024**3
-        print(f"  Chunk: {self.chunk_samples:,} samples ({chunk_gb:.1f} GB) × {prefetch_factor} prefetch")
+        avail_gb = avail_ram / 1024**3
+        print(f"  Chunk: {self.chunk_samples:,} samples ({chunk_gb:.1f} GB) × {prefetch_factor} prefetch | {avail_gb:.0f}GB RAM avail")
 
         self._open_memmaps()
         self._n_batches = max(1, (self.n_samples + batch_size - 1) // batch_size)
