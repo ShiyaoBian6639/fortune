@@ -107,6 +107,17 @@ def train_epoch(
     t_gpu_total  = 0.0
     t_last = time.time()
 
+    # Real GPU utilization via nvidia-smi (pynvml)
+    gpu_utils = []
+    nvml_handle = None
+    if profile:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            pass
+
     for batch in loader:
         # Measure data loading time
         t_data_end = time.time()
@@ -161,6 +172,14 @@ def train_epoch(
         # Measure GPU compute time (sync to get accurate timing)
         if profile and n_batches <= 100:  # only profile first 100 batches
             torch.cuda.synchronize()
+            # Sample real GPU utilization
+            if nvml_handle is not None:
+                try:
+                    import pynvml
+                    util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+                    gpu_utils.append(util.gpu)
+                except Exception:
+                    pass
         t_gpu_end = time.time()
         t_gpu_total += (t_gpu_end - t_data_end)
         t_last = t_gpu_end
@@ -184,6 +203,7 @@ def train_epoch(
         't_gpu': t_gpu_total,
         'n_batches': n_batches,
         'gpu_util': t_gpu_total / max(t_data_total + t_gpu_total, 1e-6) * 100,
+        'real_gpu_util': float(np.mean(gpu_utils)) if gpu_utils else None,
     }
     return avg_loss, metrics.get('ic_mean', 0.0), avg_gn, profile_stats
 
@@ -358,11 +378,15 @@ def train_model(
 
         # Show profile stats on first epoch
         if do_profile:
-            gpu_pct = pstats['gpu_util']
+            time_pct = pstats['gpu_util']
+            real_pct = pstats.get('real_gpu_util')
             data_ms = pstats['t_data'] / pstats['n_batches'] * 1000
             gpu_ms  = pstats['t_gpu']  / pstats['n_batches'] * 1000
-            print(f"\n  [PROFILE] GPU util: {gpu_pct:.1f}% | data: {data_ms:.1f}ms/batch | gpu: {gpu_ms:.1f}ms/batch")
-            if gpu_pct < 50:
+            real_str = f" | SM util: {real_pct:.0f}%" if real_pct is not None else ""
+            print(f"\n  [PROFILE] time ratio: {time_pct:.1f}% | data: {data_ms:.1f}ms/batch | gpu: {gpu_ms:.1f}ms/batch{real_str}")
+            if real_pct is not None and real_pct < 50:
+                print(f"  [WARN] Low SM util ({real_pct:.0f}%). Model too small for GPU. Try: --tft_hidden 256 --batch_size 2048\n")
+            elif time_pct < 50:
                 print(f"  [WARN] GPU starving for data! Consider: --num_workers 4 or larger --chunk_samples\n")
 
         print(f"  Epoch {epoch+1:3d}/{epochs} | "
