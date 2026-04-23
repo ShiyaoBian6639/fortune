@@ -444,6 +444,7 @@ class RegressionChunkedLoader:
             end   = min(start + self.chunk_samples, self.n_samples)
 
             # SEQUENTIAL slice access — fast memmap read (~100 MB/s)
+            # NO shuffle here - shuffle batch order instead (avoids slow random access)
             chunk_data = (
                 self._obs[start:end].copy(),
                 self._future[start:end].copy(),
@@ -456,10 +457,6 @@ class RegressionChunkedLoader:
                 self._boards[start:end].copy(),
                 self._ipo[start:end].copy(),
             )
-            # Shuffle IN MEMORY after sequential load (fast)
-            if self.shuffle:
-                perm = np.random.permutation(end - start)
-                chunk_data = tuple(arr[perm] for arr in chunk_data)
             return chunk_data
 
         # Submit first prefetch_factor chunks
@@ -492,7 +489,12 @@ class RegressionChunkedLoader:
             board_t  = self._to_pinned(board)
             ipo_t    = self._to_pinned(ipo)
 
-            for b_start in range(0, n, self.batch_size):
+            # Shuffle BATCH ORDER (not samples) - avoids slow 8GB random access
+            batch_starts = list(range(0, n, self.batch_size))
+            if self.shuffle:
+                np.random.shuffle(batch_starts)
+
+            for b_start in batch_starts:
                 b_end = min(b_start + self.batch_size, n)
                 # Async transfer with non_blocking=True
                 yield (
