@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from . import features as F
+from .cross_section import add_cross_section_features
 from .config import (
     DAILY_BASIC_RAW_KEEP, FINA_COLUMNS, INDEX_CODES, MONEYFLOW_TIERS,
     GLOBAL_INDEX_CODES, IDX_FACTOR_COLUMNS, IDX_FACTOR_CODE,
@@ -367,7 +368,8 @@ def load_fina_for_codes(data_dir: str, ts_codes: List[str]) -> Dict[str, pd.Data
             head = pd.read_csv(path, nrows=0).columns
             use  = [c for c in needed if c in head]
             df   = pd.read_csv(path, usecols=use)
-            df['ann_date'] = pd.to_datetime(df['ann_date'].astype(str), errors='coerce')
+            df['ann_date'] = pd.to_datetime(df['ann_date'].astype(str),
+                                             format='%Y%m%d', errors='coerce')
             df = df.dropna(subset=['ann_date']).sort_values('ann_date')
             df = df.drop_duplicates(subset=['ann_date'], keep='last').reset_index(drop=True)
             for c in FINA_COLUMNS:
@@ -389,10 +391,13 @@ def merge_fina_point_in_time(stock_df: pd.DataFrame,
     yet" from genuine zeros.
     """
     if fina_df is None or len(fina_df) == 0:
-        for c in FINA_COLUMNS:
-            stock_df[c] = np.float32(0.0)
-        stock_df['has_fina_data'] = np.int8(0)
-        return stock_df
+        # Build all missing columns in one shot via concat — this avoids the
+        # per-column inserts that fragment the block manager.
+        idx = stock_df.index
+        fill = {c: pd.Series(np.float32(0.0), index=idx) for c in FINA_COLUMNS}
+        fill['has_fina_data'] = pd.Series(np.int8(0), index=idx)
+        right = pd.DataFrame(fill, index=idx)
+        return pd.concat([stock_df, right], axis=1, copy=False)
 
     merged = pd.merge_asof(
         stock_df.sort_values('trade_date'),
@@ -677,6 +682,12 @@ def build_panel(cfg: dict) -> pd.DataFrame:
         raise RuntimeError("No stocks assembled — check data_dir / min_rows_per_stock")
 
     panel = pd.concat(assembled, ignore_index=True, sort=False)
+
+    # Compute cross-sectional daily rank / de-meaned features on the merged
+    # panel — must happen after assembly so ranks cover the full cross-section.
+    print("  computing cross-sectional rank + de-mean features ...")
+    panel = add_cross_section_features(panel)
+
     # Canonical column order: ts_code, trade_date, ..., target
     cols = ['ts_code', 'trade_date'] + \
            [c for c in panel.columns if c not in ('ts_code', 'trade_date', 'target')] + \

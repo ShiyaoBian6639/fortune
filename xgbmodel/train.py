@@ -47,15 +47,28 @@ def time_split(panel: pd.DataFrame, cfg: dict) -> Tuple[pd.DataFrame, pd.DataFra
 # ─── Metrics ────────────────────────────────────────────────────────────────
 
 def daily_rank_ic(df: pd.DataFrame, pred_col: str = 'pred', target_col: str = 'target') -> float:
-    """Mean cross-sectional Spearman IC across trade dates."""
+    """Mean cross-sectional Spearman IC across trade dates.
+
+    Silently skips days with zero-variance pred or target (those produce NaN
+    correlations from `corr()` — e.g. when the model barely trained and
+    outputs a near-constant value).
+    """
     ics = []
-    for _, grp in df.groupby('trade_date'):
-        if len(grp) < 10:
-            continue
-        r = grp[[pred_col, target_col]].rank(method='average')
-        c = r.corr().iloc[0, 1]
-        if np.isfinite(c):
-            ics.append(c)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        for _, grp in df.groupby('trade_date'):
+            if len(grp) < 10:
+                continue
+            p = grp[pred_col].values
+            y = grp[target_col].values
+            # Zero-variance days cannot produce a rank correlation — skip.
+            if not (np.isfinite(p).all() and np.isfinite(y).all()):
+                continue
+            if p.std() == 0 or y.std() == 0:
+                continue
+            r = grp[[pred_col, target_col]].rank(method='average')
+            c = r.corr().iloc[0, 1]
+            if np.isfinite(c):
+                ics.append(c)
     return float(np.mean(ics)) if ics else float('nan')
 
 
@@ -74,14 +87,27 @@ class Metrics:
 
 def compute_metrics(df: pd.DataFrame, split_name: str,
                     pred_col: str = 'pred', target_col: str = 'target') -> Metrics:
-    y = df[target_col].values
-    p = df[pred_col].values
+    y = df[target_col].values.astype('float64', copy=False)
+    p = df[pred_col ].values.astype('float64', copy=False)
+    # Drop non-finite rows (shouldn't happen, but be defensive)
+    mask = np.isfinite(p) & np.isfinite(y)
+    p, y = p[mask], y[mask]
+    if len(y) == 0:
+        return Metrics(split=split_name, n=0,
+                       rmse=float('nan'), mae=float('nan'),
+                       pearson=float('nan'), rank_ic=float('nan'))
+
     resid = p - y
     rmse = float(np.sqrt(np.mean(resid ** 2)))
     mae  = float(np.mean(np.abs(resid)))
-    pe   = float(np.corrcoef(p, y)[0, 1]) if len(y) > 2 else float('nan')
-    ic   = daily_rank_ic(df, pred_col, target_col)
-    m = Metrics(split=split_name, n=len(df), rmse=rmse, mae=mae, pearson=pe, rank_ic=ic)
+    # Zero-variance inputs → corrcoef divides by zero. Guard explicitly.
+    if len(y) < 2 or p.std() == 0 or y.std() == 0:
+        pe = float('nan')
+    else:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pe = float(np.corrcoef(p, y)[0, 1])
+    ic = daily_rank_ic(df, pred_col, target_col)
+    m = Metrics(split=split_name, n=len(y), rmse=rmse, mae=mae, pearson=pe, rank_ic=ic)
     print(f"  {split_name}: n={m.n:,}  RMSE={m.rmse:.4f}  MAE={m.mae:.4f}  "
           f"Pearson={m.pearson:+.4f}  Daily-IC={m.rank_ic:+.4f}")
     return m
@@ -281,20 +307,32 @@ def train_walk_forward(cfg: dict) -> dict:
     if not per_fold:
         raise RuntimeError("walk_forward produced no folds with data")
 
-    # Aggregate: mean / std of daily-IC across folds (the most portfolio-relevant metric)
-    def _agg(metric_name: str, split: str) -> Tuple[float, float]:
-        vals = [f['metrics'][split][metric_name]
-                for f in per_fold if split in f['metrics']]
-        return float(np.mean(vals)), float(np.std(vals))
+    # Aggregate: NaN-safe mean / std of daily-IC across folds. Folds with
+    # degenerate inputs (e.g. barely-trained model → constant preds → no
+    # computable IC) yield NaN metrics; we skip those via np.nanmean.
+    def _agg(metric_name: str, split: str) -> Tuple[float, float, int]:
+        vals = np.array([
+            f['metrics'][split][metric_name]
+            for f in per_fold if split in f['metrics']
+        ], dtype='float64')
+        n_valid = int(np.isfinite(vals).sum())
+        if n_valid == 0:
+            return float('nan'), float('nan'), 0
+        return float(np.nanmean(vals)), float(np.nanstd(vals)), n_valid
 
-    ic_val_m,   ic_val_s   = _agg('rank_ic', 'val')
-    ic_test_m,  ic_test_s  = _agg('rank_ic', 'test')
-    rmse_test_m, rmse_test_s = _agg('rmse',   'test')
+    ic_val_m,   ic_val_s,   n_val_valid  = _agg('rank_ic', 'val')
+    ic_test_m,  ic_test_s,  n_test_valid = _agg('rank_ic', 'test')
+    rmse_test_m, rmse_test_s, _          = _agg('rmse',   'test')
+    # Count positive-IC folds only among those that produced a valid IC
+    pos_test = sum(1 for f in per_fold
+                   if np.isfinite(f['metrics']['test']['rank_ic'])
+                   and f['metrics']['test']['rank_ic'] > 0)
 
-    print(f"\n[xgbmodel.wf] summary over {len(per_fold)} folds:")
+    print(f"\n[xgbmodel.wf] summary over {len(per_fold)} folds "
+          f"({n_val_valid} val / {n_test_valid} test with valid IC):")
     print(f"  val  IC: mean={ic_val_m:+.4f}  std={ic_val_s:.4f}")
     print(f"  test IC: mean={ic_test_m:+.4f}  std={ic_test_s:.4f}  "
-          f"(positive ratio = {sum(1 for f in per_fold if f['metrics']['test']['rank_ic'] > 0)}/{len(per_fold)})")
+          f"(positive ratio = {pos_test}/{n_test_valid})")
     print(f"  test RMSE: mean={rmse_test_m:.4f}  std={rmse_test_s:.4f}")
 
     # ─── Persist OOF predictions & per-fold metrics ─────────────────────────
@@ -307,12 +345,28 @@ def train_walk_forward(cfg: dict) -> dict:
         os.path.join(preds_dir, 'test.csv'), index=False)
 
     # ─── Refit canonical model on the full pool using average best_iteration ─
-    # Use median best_iteration as a robust stopping point — mitigates one
-    # outlier fold that overfit / underfit.
-    if best_iters:
-        canonical_n = int(np.median(best_iters)) + 1
+    # Robust stopping-point estimate: drop folds that triggered early-stopping
+    # almost immediately (best_iter<min_iter_floor) — those folds failed to
+    # learn anything useful and would pull the median toward 0. Then take the
+    # median of the survivors. If ALL folds are pathological, fall back to
+    # 1/10 of the requested n_estimators so we at least ship a real model.
+    MIN_ITER_FLOOR  = cfg.get('canonical_min_iter_floor', 20)
+    ABS_FLOOR       = cfg.get('canonical_abs_floor',      100)
+    configured_n    = cfg['xgb_params'].get('n_estimators', 1000)
+
+    good_iters = [b for b in best_iters if b is not None and b >= MIN_ITER_FLOOR]
+    if good_iters:
+        canonical_n = int(np.median(good_iters)) + 1
     else:
-        canonical_n = cfg['xgb_params'].get('n_estimators', 1000)
+        canonical_n = max(ABS_FLOOR, configured_n // 10)
+        print(f"[xgbmodel.wf] WARN: no folds reached best_iter>={MIN_ITER_FLOOR}; "
+              f"falling back to canonical_n={canonical_n}")
+    # Always enforce the absolute floor so we never save a 3-tree model
+    canonical_n = max(canonical_n, ABS_FLOOR)
+    print(f"[xgbmodel.wf] best_iterations: n={len(best_iters)}  "
+          f"survivors≥{MIN_ITER_FLOOR}: {len(good_iters)}  "
+          f"median_survivor={int(np.median(good_iters)) if good_iters else 'n/a'}  "
+          f"→ canonical_n={canonical_n}")
 
     print(f"\n[xgbmodel.wf] refitting canonical model on full pool with "
           f"n_estimators={canonical_n}")

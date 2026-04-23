@@ -328,6 +328,15 @@ DEFAULT_CONFIG = {
     # escaping its basin under decay pressure) — held peak LR with high weight
     # decay lets it converge inside the basin.
     'lr_schedule':              'cosine',
+
+    # Stochastic Weight Averaging (SWA): maintains a running average of model
+    # weights across later epochs; picks whichever of best-checkpoint / SWA
+    # has higher val IC at end of training. Helps close the val→test gap on
+    # non-stationary financial data by landing in a flatter loss basin.
+    'use_swa':                  True,
+    # swa_start_epoch defaults to warmup_epochs; override via --swa_start.
+    # A later start (e.g. 4-5 if you see val IC peak at epoch 3-4) avoids
+    # averaging in early-warmup weights that are far from any good basin.
     'use_amp':                  True,
     'random_seed':              42,
 

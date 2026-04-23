@@ -74,6 +74,10 @@ def parse_args():
     p.add_argument('--lr_schedule', choices=['cosine', 'flat'], default=None,
                    help="After warmup: 'cosine' decays to 0 (default), "
                         "'flat' holds peak LR for the rest of training")
+    p.add_argument('--no_swa', action='store_true',
+                   help='Disable Stochastic Weight Averaging (SWA is on by default)')
+    p.add_argument('--swa_start', type=int, default=None,
+                   help='Epoch to start SWA averaging from (default: warmup_epochs)')
     p.add_argument('--patience', type=int, default=None,
                    help='Early stopping patience (default: 15)')
     p.add_argument('--target_mode', default='excess', choices=['excess', 'raw'])
@@ -414,6 +418,8 @@ def main():
     if args.seq_len      is not None: overrides['sequence_length']  = args.seq_len
     if args.warmup_epochs is not None: overrides['warmup_epochs']   = args.warmup_epochs
     if args.lr_schedule  is not None: overrides['lr_schedule']     = args.lr_schedule
+    if args.no_swa:                    overrides['use_swa']         = False
+    if args.swa_start    is not None: overrides['swa_start_epoch']  = args.swa_start
     if args.patience     is not None: overrides['early_stopping_patience'] = args.patience
     if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
     if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch

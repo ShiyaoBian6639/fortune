@@ -348,10 +348,27 @@ def train_model(
 
     scaler    = torch.amp.GradScaler('cuda') if use_amp and torch.cuda.is_available() else None
 
+    # ── Stochastic Weight Averaging (SWA) ─────────────────────────────────────
+    # Maintains a running average of model weights across the later epochs. At
+    # the end of training the SWA-averaged model is often more robust on
+    # out-of-distribution periods (the val→test gap we care about) because it
+    # sits in a flatter basin than any single-epoch checkpoint. We keep both
+    # best-checkpoint and SWA copies and pick the higher val IC at the end.
+    # Reference: Izmailov et al. 2018, "Averaging Weights Leads to Wider Optima"
+    use_swa        = bool(config.get('use_swa', True))
+    swa_start_ep   = int(config.get('swa_start_epoch', warmup_ep))  # default: once warmup ends
+    swa_model      = None
+    swa_n_updates  = 0
+    if use_swa:
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+        swa_model.to(device)
+
     history = {
         'train_loss': [], 'val_loss': [],
         'train_ic': [],   'val_ic': [],
         'lr': [],         'grad_norm': [],
+        'swa_val_ic': [],
     }
 
     best_val_ic  = -np.inf
@@ -360,7 +377,8 @@ def train_model(
 
     print(f"\nTraining on {device} | epochs={epochs} | lr={scaled_lr:.2e} | "
           f"warmup={warmup_ep} (cosine) | schedule={lr_schedule} | patience={patience}")
-    print(f"  AMP={'on' if scaler else 'off'}")
+    print(f"  AMP={'on' if scaler else 'off'}"
+          f" | SWA={'on (from ep '+str(swa_start_ep+1)+')' if use_swa else 'off'}")
 
     for epoch in range(epochs):
         t0 = time.time()
@@ -428,6 +446,17 @@ def train_model(
                 print(f"\n  [WARN] Validation loss diverging: {recent_vl[0]:.4f} → {recent_vl[-1]:.4f}")
                 print(f"         Consider reducing learning rate or model size")
 
+        # SWA update: average-in current model weights once past the start epoch
+        swa_val_ic = None
+        if use_swa and epoch + 1 >= swa_start_ep:
+            swa_model.update_parameters(model)
+            swa_n_updates += 1
+            # Evaluate the averaged model on val to track its trajectory
+            swa_metrics, _, _ = evaluate(swa_model, val_loader, criterion, device)
+            swa_val_ic = swa_metrics['ic_mean']
+            print(f"    SWA (n={swa_n_updates}): val IC={swa_val_ic:.4f}")
+        history['swa_val_ic'].append(swa_val_ic if swa_val_ic is not None else float('nan'))
+
         # Early stopping on val IC
         if val_ic > best_val_ic + 1e-4:
             best_val_ic  = val_ic
@@ -453,14 +482,39 @@ def train_model(
                 print(f"\n  Early stopping at epoch {epoch+1} (best: epoch {best_epoch}, IC={best_val_ic:.4f})")
                 break
 
+    # ── Pick final weights: SWA if it beats best checkpoint, else best ────────
+    best_swa_ic = float('nan')
+    if use_swa and swa_n_updates > 0:
+        # Re-eval SWA model once more with whatever state it's in
+        swa_metrics_final, _, _ = evaluate(swa_model, val_loader, criterion, device)
+        best_swa_ic = swa_metrics_final['ic_mean']
+        print(f"\n  SWA model final val IC: {best_swa_ic:.4f}  (vs best checkpoint: {best_val_ic:.4f})")
+        if best_swa_ic > best_val_ic:
+            # SWA wins — transplant its weights onto the base model and overwrite checkpoint
+            # AveragedModel exposes the wrapped module under .module
+            model.load_state_dict(swa_model.module.state_dict())
+            torch.save({
+                'epoch':      epoch + 1,
+                'model_state': model.state_dict(),
+                'val_ic':     float(best_swa_ic),
+                'swa':        True,
+                'swa_n_updates': swa_n_updates,
+            }, save_path)
+            best_val_ic = best_swa_ic
+            best_epoch  = f"SWA-avg(n={swa_n_updates})"
+            print(f"  [SWA WINS] Using averaged weights as final model.")
+        else:
+            print(f"  Best-checkpoint beats SWA — keeping epoch {best_epoch} weights.")
+
     # Load best checkpoint (weights_only=True safe now — only model weights saved)
     if os.path.exists(save_path):
         ckpt = torch.load(save_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt['model_state'])
-        print(f"\n  Loaded best checkpoint (epoch {best_epoch}, val IC={best_val_ic:.4f})")
+        print(f"\n  Loaded final checkpoint (epoch {best_epoch}, val IC={best_val_ic:.4f})")
 
     history['best_epoch']  = best_epoch
     history['best_val_ic'] = best_val_ic
+    history['best_swa_ic'] = best_swa_ic
     return history
 
 

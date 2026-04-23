@@ -16,6 +16,14 @@ import pandas as pd
 
 from .config import MA_WINDOWS, VOL_WINDOWS, MOMENTUM_WINDOWS, RETURN_LAGS
 
+# Numba pattern detectors live in dl/ — import lazily so a corrupted numba cache
+# in dl/ doesn't block xgbmodel imports.
+try:
+    from dl.numba_optimizations import detect_w_bottom_numba, detect_m_top_numba
+    _HAS_NUMBA_PATTERNS = True
+except Exception:
+    _HAS_NUMBA_PATTERNS = False
+
 
 def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
     return a / b.replace(0, np.nan)
@@ -128,6 +136,46 @@ def compute_price_features(df: pd.DataFrame) -> pd.DataFrame:
     obv_flow  = (vol * direction).astype('float32')
     out['obv_flow_ma5']  = obv_flow.rolling(5).mean().astype('float32')
     out['obv_flow_ma20'] = obv_flow.rolling(20).mean().astype('float32')
+
+    # ─── Limit-up / limit-down detection and streaks ────────────────────────
+    # Chinese A-shares: main board = 10% daily limit, ChiNext/STAR = 20%.
+    # We detect hits by |pct_chg| proximity to the known caps rather than
+    # via up_limit/down_limit columns (those aren't merged at this stage).
+    # Streaks (连板) are among the strongest short-term momentum signals in
+    # Chinese retail markets — 2-3 consecutive 涨停 often leads to mean reversion.
+    pct_np = pct.values
+    hit_up   = ((pct_np >= 9.7)  | (pct_np >= 19.5)).astype(np.int8)
+    hit_down = ((pct_np <= -9.7) | (pct_np <= -19.5)).astype(np.int8)
+    out['hit_up_limit']   = hit_up
+    out['hit_down_limit'] = hit_down
+
+    # Consecutive streaks via cumulative-sum-of-blocks trick
+    def _streak(flags: np.ndarray) -> np.ndarray:
+        n = len(flags)
+        streak = np.zeros(n, dtype=np.int16)
+        c = 0
+        for i in range(n):
+            c = c + 1 if flags[i] else 0
+            streak[i] = c
+        return streak
+    out['limit_up_streak']   = _streak(hit_up)
+    out['limit_down_streak'] = _streak(hit_down)
+    # 20-day count of limit hits — captures recently-hot stocks even after
+    # streak breaks.
+    out['limit_up_count_20']   = pd.Series(hit_up,   index=df.index).rolling(20).sum().astype('float32')
+    out['limit_down_count_20'] = pd.Series(hit_down, index=df.index).rolling(20).sum().astype('float32')
+
+    # ─── Chart patterns (W-bottom, M-top) from dl/numba_optimizations.py ────
+    # Reuses the already-compiled numba detectors. 0.0/0.5/1.0 signal strengths.
+    if _HAS_NUMBA_PATTERNS and len(close) >= 25:
+        close_np = close.values.astype(np.float64)
+        try:
+            out['w_bottom_10'] = detect_w_bottom_numba(close_np, window=10).astype('float32')
+            out['w_bottom_20'] = detect_w_bottom_numba(close_np, window=20).astype('float32')
+            out['m_top_10']    = detect_m_top_numba(close_np,    window=10).astype('float32')
+            out['m_top_20']    = detect_m_top_numba(close_np,    window=20).astype('float32')
+        except Exception:
+            pass
 
     return df.assign(**out)
 
