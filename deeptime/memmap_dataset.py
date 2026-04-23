@@ -291,6 +291,7 @@ class RegressionChunkedLoader:
         device:     str = 'cpu',
         shuffle:    bool = True,
         prefetch_factor: int = 2,   # number of chunks to prefetch
+        max_chunk_gb: float = None, # manual override for max chunk size in GB
     ):
         self.data_dir   = data_dir
         self.split      = split
@@ -314,32 +315,61 @@ class RegressionChunkedLoader:
         # obs array: chunk_samples × seq_len × n_past × 4 bytes
         bytes_per_sample = self.seq_length * self.n_past * 4 + self.max_fw * self.n_future * 4 + 100
 
-        # Detect available RAM and use 50% for data loading
+        # Detect available RAM - check container cgroup limits first
+        avail_ram = None
+        cgroup_limit = None
+
+        # Check cgroup memory limit (Docker/K8s containers)
+        for cgroup_path in [
+            '/sys/fs/cgroup/memory/memory.limit_in_bytes',  # cgroup v1
+            '/sys/fs/cgroup/memory.max',                     # cgroup v2
+        ]:
+            try:
+                with open(cgroup_path) as f:
+                    val = f.read().strip()
+                    if val != 'max' and int(val) < 500 * 1024**3:  # ignore if >500GB (no limit)
+                        cgroup_limit = int(val)
+                        break
+            except:
+                pass
+
+        # Get system available RAM
         try:
             import psutil
-            avail_ram = psutil.virtual_memory().available
+            sys_avail = psutil.virtual_memory().available
         except ImportError:
-            # Fallback: read from /proc/meminfo (Linux)
             try:
                 with open('/proc/meminfo') as f:
                     for line in f:
                         if line.startswith('MemAvailable:'):
-                            avail_ram = int(line.split()[1]) * 1024  # KB to bytes
+                            sys_avail = int(line.split()[1]) * 1024
                             break
                     else:
-                        avail_ram = 16 * 1024**3  # conservative 16GB fallback
+                        sys_avail = 64 * 1024**3
             except:
-                avail_ram = 16 * 1024**3
+                sys_avail = 64 * 1024**3
+
+        # Use container limit if set, otherwise system available
+        if cgroup_limit is not None:
+            avail_ram = int(cgroup_limit * 0.8)  # 80% of container limit
+            print(f"  [Container] cgroup limit: {cgroup_limit/1024**3:.0f}GB, using {avail_ram/1024**3:.0f}GB")
+        else:
+            avail_ram = sys_avail
 
         # Memory budget: prefetch buffers + active chunk + shuffle temp copy
         # Peak usage = (prefetch_factor + 2) × chunk_size
-        # Use 60% of available RAM for safety margin
-        usable_ram = int(avail_ram * 0.6)
-        n_buffers = prefetch_factor + 2  # prefetch + active + shuffle copy
-        target_chunk_bytes = usable_ram // n_buffers
-        # Safety bounds: 2GB min, 15GB max per chunk (avoid OOM from RAM misdetection)
-        target_chunk_bytes = max(target_chunk_bytes, 2 * 1024**3)
-        target_chunk_bytes = min(target_chunk_bytes, 15 * 1024**3)  # cap at 15GB
+        if max_chunk_gb is not None:
+            # User override - trust their memory knowledge
+            target_chunk_bytes = int(max_chunk_gb * 1024**3)
+            print(f"  [Manual] max_chunk_gb={max_chunk_gb} → {target_chunk_bytes/1024**3:.1f}GB per chunk")
+        else:
+            # Auto-detect: Use 60% of available RAM for safety margin
+            usable_ram = int(avail_ram * 0.6)
+            n_buffers = prefetch_factor + 2  # prefetch + active + shuffle copy
+            target_chunk_bytes = usable_ram // n_buffers
+            # Safety bounds: 2GB min, 8GB max per chunk (conservative for containers)
+            target_chunk_bytes = max(target_chunk_bytes, 2 * 1024**3)
+            target_chunk_bytes = min(target_chunk_bytes, 8 * 1024**3)  # cap at 8GB
         mem_limited_chunk = int(target_chunk_bytes / bytes_per_sample)
 
         # Also ensure at least 20 batches per chunk for GPU efficiency
@@ -1132,6 +1162,7 @@ def load_regression_datasets(
     prefetch_factor: int = 2,
     num_workers: int = 0,
     preload: bool = False,
+    max_chunk_gb: float = None,
     use_chunked: bool = True,
 ):
     """
@@ -1188,6 +1219,7 @@ def load_regression_datasets(
             loaders[split] = RegressionChunkedLoader(
                 cache_dir, split, batch_size, chunk_samples, device,
                 shuffle=True, prefetch_factor=prefetch_factor,
+                max_chunk_gb=max_chunk_gb,
             )
         else:
             from torch.utils.data import DataLoader
