@@ -265,12 +265,11 @@ DEFAULT_CONFIG = {
     'max_sequences_per_stock':  None,
     'num_workers':              0,
     # chunk_samples: controls peak RAM during training and GPU utilization
-    # Auto-scaled in loader: max(chunk_samples, batch_size * 50)
-    # For batch=4096: auto-scales to 204K samples (~5 GB RAM per chunk)
-    # For batch=192:  20K is fine (~0.5 GB per chunk)
-    # Set higher for better GPU utilization on high-end GPUs (RTX 5090 etc)
-    'chunk_samples':            100_000,   # raised from 20K for better GPU util
-    'prefetch_factor':          2,         # number of chunks to prefetch (double-buffering)
+    # Auto-scaled in loader based on memory budget (~2GB per chunk target)
+    # Formula: chunk_samples × seq_len × n_past × 4 bytes ≈ 2GB
+    # seq_len=30: ~100K samples/chunk; seq_len=60: ~50K samples/chunk
+    'chunk_samples':            100_000,   # auto-limited by loader
+    'prefetch_factor':          2,         # double-buffering (2 × 2GB = 4GB RAM)
 
     # Target
     'target_mode':   TARGET_MODE,
@@ -359,9 +358,11 @@ RTX_5090_CONFIG = {
     'weight_decay':     0.15,      # stronger L2 for larger batch
     'max_grad_norm':    0.3,       # tighter clipping
 
-    # Data loading — optimized for RTX 5090 bandwidth
-    'chunk_samples':    200_000,   # ~5 GB RAM per chunk (seq_len=60)
-    'prefetch_factor':  3,         # triple-buffering for high bandwidth
+    # Data loading — auto-scaled based on seq_len to prevent OOM
+    # seq_len=60: ~50KB/sample → 40K samples = 2GB/chunk × 2 prefetch = 4GB RAM
+    # Note: chunk_samples is auto-limited by loader based on memory budget
+    'chunk_samples':    50_000,    # will be auto-limited by 2GB/chunk target
+    'prefetch_factor':  2,         # double-buffering (safer for RAM)
 
     # Early stopping
     'early_stopping_patience': 25,
@@ -383,9 +384,9 @@ RTX_5090_AGGRESSIVE_CONFIG = {
     'weight_decay':     0.2,       # strong L2
     'max_grad_norm':    0.3,
 
-    # Data loading — max throughput
-    'chunk_samples':    200_000,
-    'prefetch_factor':  3,
+    # Data loading — auto-scaled to prevent OOM
+    'chunk_samples':    50_000,
+    'prefetch_factor':  2,
 
     'early_stopping_patience': 30,
     'base_batch_for_lr': 512,

@@ -197,10 +197,23 @@ class RegressionChunkedLoader:
         self.num_horizons = meta['num_horizons']
         self.max_fw       = meta['max_fw']
 
-        # Auto-scale chunk size: at least 50 batches per chunk to amortize I/O
-        # For batch=4096: min 204K samples per chunk (was 20K = only 5 batches!)
-        auto_chunk = max(chunk_samples, batch_size * 50)
+        # Auto-scale chunk size based on memory budget
+        # Target: ~2 GB per chunk to avoid OOM with prefetch buffering
+        # obs array: chunk_samples × seq_len × n_past × 4 bytes
+        bytes_per_sample = self.seq_length * self.n_past * 4 + self.max_fw * self.n_future * 4 + 100
+        target_chunk_bytes = 2 * 1024**3  # 2 GB target per chunk
+        mem_limited_chunk = int(target_chunk_bytes / bytes_per_sample)
+
+        # Also ensure at least 20 batches per chunk for GPU efficiency
+        min_chunk = batch_size * 20
+
+        # Use the smaller of: user request, memory limit, or dataset size
+        auto_chunk = max(min_chunk, min(chunk_samples, mem_limited_chunk))
         self.chunk_samples = min(auto_chunk, self.n_samples)
+
+        # Log effective chunk size
+        chunk_gb = self.chunk_samples * bytes_per_sample / 1024**3
+        print(f"  Chunk: {self.chunk_samples:,} samples ({chunk_gb:.1f} GB) × {prefetch_factor} prefetch")
 
         self._open_memmaps()
         self._n_batches = max(1, (self.n_samples + batch_size - 1) // batch_size)
