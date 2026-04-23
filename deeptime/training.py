@@ -292,25 +292,31 @@ def train_model(
     #    above 2e-5. Formula: lr ∝ (n_stocks/ref_stocks)^0.25
     #    n_stocks=200  → ×0.67;  n_stocks=1000 → ×1.0;  n_stocks=5000 → ×1.50
     #    User can override both via --lr to disable auto-scaling.
-    base_batch   = config.get('base_batch_for_lr', 192)
-    batch_size   = config.get('batch_size', 192)
-    batch_scale  = (batch_size / base_batch) ** 0.5
-
-    max_stocks   = config.get('max_stocks', 0)
-    ref_stocks   = config.get('ref_stocks_for_lr', 1000)
-    if max_stocks and max_stocks > 0 and max_stocks < ref_stocks * 10:
-        # Only scale down; never scale up beyond the user-specified LR
-        dataset_scale = min(1.0, (max_stocks / ref_stocks) ** 0.25)
+    # LR scaling: disabled if user sets --no_lr_scale
+    no_lr_scale = config.get('no_lr_scale', False)
+    if no_lr_scale:
+        scaled_lr = lr
+        print(f"  LR = {lr:.2e} (scaling disabled)")
     else:
-        dataset_scale = 1.0   # full dataset or max_stocks=0 → no reduction
+        base_batch   = config.get('base_batch_for_lr', 192)
+        batch_size   = config.get('batch_size', 192)
+        batch_scale  = (batch_size / base_batch) ** 0.5
 
-    scale     = batch_scale * dataset_scale
-    scaled_lr = lr * scale
-    if abs(scale - 1.0) > 0.05:
-        parts = [f"√({batch_size}/{base_batch})={batch_scale:.2f} (batch)"]
-        if abs(dataset_scale - 1.0) > 0.02:
-            parts.append(f"({max_stocks}/{ref_stocks})^0.25={dataset_scale:.2f} (dataset size)")
-        print(f"  LR scaled {lr:.2e} × {' × '.join(parts)} = {scaled_lr:.2e}")
+        max_stocks   = config.get('max_stocks', 0)
+        ref_stocks   = config.get('ref_stocks_for_lr', 1000)
+        if max_stocks and max_stocks > 0 and max_stocks < ref_stocks * 10:
+            # Only scale down; never scale up beyond the user-specified LR
+            dataset_scale = min(1.0, (max_stocks / ref_stocks) ** 0.25)
+        else:
+            dataset_scale = 1.0   # full dataset or max_stocks=0 → no reduction
+
+        scale     = batch_scale * dataset_scale
+        scaled_lr = lr * scale
+        if abs(scale - 1.0) > 0.05:
+            parts = [f"√({batch_size}/{base_batch})={batch_scale:.2f} (batch)"]
+            if abs(dataset_scale - 1.0) > 0.02:
+                parts.append(f"({max_stocks}/{ref_stocks})^0.25={dataset_scale:.2f} (dataset size)")
+            print(f"  LR scaled {lr:.2e} × {' × '.join(parts)} = {scaled_lr:.2e}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=scaled_lr,

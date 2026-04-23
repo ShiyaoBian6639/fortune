@@ -55,6 +55,8 @@ def parse_args():
                    help='Batch size (default from config: 128)')
     p.add_argument('--lr',             type=float, default=None,
                    help='Learning rate (default: 2e-5)')
+    p.add_argument('--no_lr_scale', action='store_true',
+                   help='Disable auto LR scaling for batch size (use exact --lr value)')
     p.add_argument('--weight_decay',   type=float, default=None,
                    help='AdamW weight decay (default: 0.05)')
     p.add_argument('--max_grad_norm',  type=float, default=None,
@@ -414,6 +416,7 @@ def main():
     if args.num_workers  is not None: overrides['num_workers']     = args.num_workers
     if args.preload:                  overrides['preload']         = True
     if args.max_chunk_gb is not None: overrides['max_chunk_gb']    = args.max_chunk_gb
+    if args.no_lr_scale:              overrides['no_lr_scale']     = True
 
     config = get_config(preset=args.preset, **overrides)
 
