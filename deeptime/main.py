@@ -88,6 +88,8 @@ def parse_args():
                    help='Samples per I/O chunk (default: auto-scaled based on batch)')
     p.add_argument('--prefetch', type=int, default=None,
                    help='Prefetch depth (2=double-buffer, 3=triple-buffer)')
+    p.add_argument('--num_workers', type=int, default=None,
+                   help='DataLoader workers (0=chunked loader, 4-8=parallel workers)')
     return p.parse_args()
 
 
@@ -405,6 +407,7 @@ def main():
     if args.patience     is not None: overrides['early_stopping_patience'] = args.patience
     if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
     if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch
+    if args.num_workers  is not None: overrides['num_workers']     = args.num_workers
 
     config = get_config(preset=args.preset, **overrides)
 
@@ -417,7 +420,9 @@ def main():
         print(f"  batch_size={config['batch_size']}, seq_len={config['sequence_length']}")
         print(f"  lr={config['learning_rate']:.1e}, warmup={config['warmup_epochs']}ep, "
               f"weight_decay={config['weight_decay']}")
-        print(f"  chunk_samples={config['chunk_samples']:,}, prefetch={config.get('prefetch_factor', 2)}")
+        nw = config.get('num_workers', 0)
+        print(f"  chunk_samples={config['chunk_samples']:,}, prefetch={config.get('prefetch_factor', 2)}, "
+              f"num_workers={nw}")
         print(f"{'='*60}")
 
     if args.sanity_only:
@@ -463,6 +468,7 @@ def main():
         device          = config['device'],
         chunk_samples   = config['chunk_samples'],
         prefetch_factor = config.get('prefetch_factor', 2),
+        num_workers     = config.get('num_workers', 0),
         use_chunked     = True,
     )
 

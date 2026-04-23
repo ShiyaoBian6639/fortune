@@ -86,12 +86,13 @@ def train_epoch(
     device:    str,
     scaler:    Optional['torch.amp.GradScaler'] = None,
     max_grad_norm: float = 1.0,
-) -> Tuple[float, float, float]:
+    profile:   bool = False,
+) -> Tuple[float, float, float, dict]:
     """
     Train for one epoch.
 
     Returns:
-        (avg_loss, avg_ic, avg_grad_norm)
+        (avg_loss, avg_ic, avg_grad_norm, profile_stats)
     """
     model.train()
     total_loss  = 0.0
@@ -101,7 +102,15 @@ def train_epoch(
     grad_norms  = []
     device_type = device.split(':')[0]
 
+    # Profiling counters
+    t_data_total = 0.0
+    t_gpu_total  = 0.0
+    t_last = time.time()
+
     for batch in loader:
+        # Measure data loading time
+        t_data_end = time.time()
+        t_data_total += (t_data_end - t_last)
         if len(batch) < 7:
             continue
         def _t(x): return x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else torch.tensor(x, device=device)
@@ -149,6 +158,13 @@ def train_epoch(
         all_preds.append(preds.detach().float().cpu().numpy())
         all_targets.append(targets.detach().float().cpu().numpy())
 
+        # Measure GPU compute time (sync to get accurate timing)
+        if profile and n_batches <= 100:  # only profile first 100 batches
+            torch.cuda.synchronize()
+        t_gpu_end = time.time()
+        t_gpu_total += (t_gpu_end - t_data_end)
+        t_last = t_gpu_end
+
     all_preds   = np.concatenate(all_preds,   axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
     metrics     = compute_regression_metrics(all_preds, all_targets)
@@ -161,7 +177,15 @@ def train_epoch(
     bad_frac = 1.0 - len(finite_norms) / max(len(grad_norms), 1)
     if bad_frac > 0.05:   # warn if >5% of batches had inf/nan gradients
         print(f"    [WARN] {bad_frac*100:.1f}% of batches had inf/nan gradients (skipped optimizer step)")
-    return avg_loss, metrics.get('ic_mean', 0.0), avg_gn
+
+    # Profile stats
+    profile_stats = {
+        't_data': t_data_total,
+        't_gpu': t_gpu_total,
+        'n_batches': n_batches,
+        'gpu_util': t_gpu_total / max(t_data_total + t_gpu_total, 1e-6) * 100,
+    }
+    return avg_loss, metrics.get('ic_mean', 0.0), avg_gn, profile_stats
 
 
 @torch.no_grad()
@@ -305,7 +329,12 @@ def train_model(
 
     for epoch in range(epochs):
         t0 = time.time()
-        tr_loss, tr_ic, gn = train_epoch(model, train_loader, criterion, optimizer, device, scaler, max_gn)
+        # Profile first epoch to diagnose data loading bottleneck
+        do_profile = (epoch == 0)
+        tr_loss, tr_ic, gn, pstats = train_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, max_gn,
+            profile=do_profile
+        )
         val_metrics, _, _  = evaluate(model, val_loader, criterion, device)
         primary_scheduler.step()
 
@@ -326,6 +355,16 @@ def train_model(
             alloc = torch.cuda.memory_allocated() / 1e9
             reserved = torch.cuda.memory_reserved() / 1e9
             vram_str = f" | VRAM {alloc:.1f}/{reserved:.1f}GB"
+
+        # Show profile stats on first epoch
+        if do_profile:
+            gpu_pct = pstats['gpu_util']
+            data_ms = pstats['t_data'] / pstats['n_batches'] * 1000
+            gpu_ms  = pstats['t_gpu']  / pstats['n_batches'] * 1000
+            print(f"\n  [PROFILE] GPU util: {gpu_pct:.1f}% | data: {data_ms:.1f}ms/batch | gpu: {gpu_ms:.1f}ms/batch")
+            if gpu_pct < 50:
+                print(f"  [WARN] GPU starving for data! Consider: --num_workers 4 or larger --chunk_samples\n")
+
         print(f"  Epoch {epoch+1:3d}/{epochs} | "
               f"loss {tr_loss:.4f}/{val_loss:.4f} | "
               f"IC {tr_ic:.4f}/{val_ic:.4f} | "

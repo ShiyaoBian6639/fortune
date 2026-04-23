@@ -988,23 +988,44 @@ def load_regression_datasets(
     device:     str = 'cpu',
     chunk_samples: int = 100_000,
     prefetch_factor: int = 2,
+    num_workers: int = 0,
     use_chunked: bool = True,
 ):
     """
     Load all three splits as loaders.
 
     Args:
-        chunk_samples: Samples per I/O chunk. Auto-scaled to max(chunk_samples, batch*50).
+        chunk_samples: Samples per I/O chunk. Auto-scaled based on memory budget.
         prefetch_factor: Number of chunks to prefetch (2=double-buffer, 3=triple-buffer).
+        num_workers: Number of DataLoader workers. If >0, uses PyTorch DataLoader instead
+                     of RegressionChunkedLoader for better parallelism.
     """
     meta = get_cache_info(cache_dir)
     loaders = {}
+
+    # Use PyTorch DataLoader with multiple workers (better for high-end GPUs)
+    use_dataloader = (num_workers > 0)
+
     for split in ('train', 'val', 'test'):
         n = meta['splits'].get(split, {}).get('n_samples', 0)
         if n == 0:
             loaders[split] = None
             continue
-        if use_chunked and split == 'train':
+
+        if use_dataloader:
+            # PyTorch DataLoader with multiprocessing workers
+            from torch.utils.data import DataLoader
+            ds = RegressionMemmapDataset(cache_dir, split)
+            nw = num_workers if split == 'train' else min(2, num_workers)
+            loaders[split] = DataLoader(
+                ds, batch_size=batch_size, shuffle=(split == 'train'),
+                num_workers=nw, pin_memory=(device != 'cpu'),
+                persistent_workers=(nw > 0),  # keep workers alive between epochs
+                prefetch_factor=2 if nw > 0 else None,
+            )
+            if split == 'train':
+                print(f"  DataLoader: {nw} workers, batch={batch_size}, pin_memory=True")
+        elif use_chunked and split == 'train':
             loaders[split] = RegressionChunkedLoader(
                 cache_dir, split, batch_size, chunk_samples, device,
                 shuffle=True, prefetch_factor=prefetch_factor,
