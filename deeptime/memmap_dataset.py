@@ -427,70 +427,35 @@ class RegressionChunkedLoader:
 
     def __iter__(self):
         # Shuffle CHUNK ORDER (not sample indices) so each chunk is a contiguous
-        # memmap slice — sequential I/O is 5-10× faster than fancy indexing on
-        # a multi-hundred-GB memmap. Global randomness comes from (a) shuffled
-        # chunk order, (b) a per-epoch random byte offset that shifts chunk
-        # boundaries (wrap-around at the end), and (c) a single intra-chunk
-        # permutation of samples so each batch sees a wide cross-section of
-        # stocks (the writer stores stocks contiguously — without per-sample
-        # shuffle, a batch would contain only 4-5 stocks).
+        # memmap slice. Randomness comes from (a) shuffled chunk order and (b)
+        # a single intra-chunk sample shuffle applied via indexing at yield time
+        # (no full-chunk copy). Pinning runs on the main thread — empirically
+        # moving it to the prefetch thread contended with the main thread's
+        # CUDA memcpy and added ~80 ms/batch stalls on the RTX 5090.
         n_chunks = (self.n_samples + self.chunk_samples - 1) // self.chunk_samples
         chunk_order = np.arange(n_chunks)
-        epoch_offset = 0
         if self.shuffle:
             np.random.shuffle(chunk_order)
-            epoch_offset = int(np.random.randint(0, max(self.chunk_samples, 1)))
 
         executor = ThreadPoolExecutor(max_workers=self.prefetch_factor)
 
-        def _read_range(arr, start, end):
-            """Contiguous memmap slice with wrap-around when start+size > N."""
-            N = self.n_samples
-            if end <= N:
-                return arr[start:end].copy()
-            a = arr[start:N].copy()
-            b = arr[:end - N].copy()
-            return np.concatenate([a, b], axis=0)
-
         def _load_chunk(chunk_idx_in_order):
             actual_chunk = int(chunk_order[chunk_idx_in_order])
-            start = (actual_chunk * self.chunk_samples + epoch_offset) % self.n_samples
-            end   = start + self.chunk_samples  # may overshoot; _read_range wraps
+            start = actual_chunk * self.chunk_samples
+            end   = min(start + self.chunk_samples, self.n_samples)
 
-            obs     = _read_range(self._obs,     start, end)
-            future  = _read_range(self._future,  start, end)
-            targets = _read_range(self._targets, start, end)
-            sectors = _read_range(self._sectors, start, end)
-            inds    = _read_range(self._inds,    start, end)
-            subs    = _read_range(self._subs,    start, end)
-            sizes   = _read_range(self._sizes,   start, end)
-            areas   = _read_range(self._areas,   start, end)
-            boards  = _read_range(self._boards,  start, end)
-            ipo     = _read_range(self._ipo,     start, end)
-
-            # Intra-chunk sample shuffle so each batch has diverse stocks
-            n = len(obs)
-            if self.shuffle and n > 1:
-                perm    = np.random.permutation(n)
-                obs     = obs[perm];     future = future[perm]; targets = targets[perm]
-                sectors = sectors[perm]; inds   = inds[perm];   subs    = subs[perm]
-                sizes   = sizes[perm];   areas  = areas[perm];  boards  = boards[perm]
-                ipo     = ipo[perm]
-
-            # Pin memory in the prefetch thread so the ~0.4-0.6 s pinning cost
-            # overlaps with the GPU consuming the previous chunk. pin_memory()
-            # is thread-safe after CUDA init.
+            # Contiguous slice copies from memmap — sequential I/O
             return (
-                self._to_pinned(obs),
-                self._to_pinned(future),
-                self._to_pinned(targets),
-                self._to_pinned(sectors),
-                self._to_pinned(inds),
-                self._to_pinned(subs),
-                self._to_pinned(sizes),
-                self._to_pinned(areas),
-                self._to_pinned(boards),
-                self._to_pinned(ipo),
+                self._obs[start:end].copy(),
+                self._future[start:end].copy(),
+                self._targets[start:end].copy(),
+                self._sectors[start:end].copy(),
+                self._inds[start:end].copy(),
+                self._subs[start:end].copy(),
+                self._sizes[start:end].copy(),
+                self._areas[start:end].copy(),
+                self._boards[start:end].copy(),
+                self._ipo[start:end].copy(),
             )
 
         n_actual = len(chunk_order)
@@ -507,10 +472,32 @@ class RegressionChunkedLoader:
             if next_chunk_i < n_actual:
                 futures.append(executor.submit(_load_chunk, next_chunk_i))
 
-            obs_t, future_t, tgt_t, sec_t, ind_t, sub_t, sz_t, area_t, board_t, ipo_t = chunk
-            n = obs_t.shape[0]
+            obs, future, tgt, sec, ind, sub, sz, area, board, ipo = chunk
+            n = obs.shape[0]
 
-            for b_start in range(0, n, self.batch_size):
+            # Pin entire chunk once on main thread (old-loader pattern)
+            obs_t    = self._to_pinned(obs)
+            future_t = self._to_pinned(future)
+            tgt_t    = self._to_pinned(tgt)
+            sec_t    = self._to_pinned(sec)
+            ind_t    = self._to_pinned(ind)
+            sub_t    = self._to_pinned(sub)
+            sz_t     = self._to_pinned(sz)
+            area_t   = self._to_pinned(area)
+            board_t  = self._to_pinned(board)
+            ipo_t    = self._to_pinned(ipo)
+
+            # Shuffle batch ORDER through the pinned chunk. Each batch still
+            # contains contiguous samples (so 4-5 stocks per batch), but the
+            # optimizer sees the stocks in random order across the chunk —
+            # equivalent to a larger effective batch when averaged over many
+            # batches. This avoids the 2.5 GB array copy that per-sample
+            # permutation required and matches old-loader memory profile.
+            batch_starts = list(range(0, n, self.batch_size))
+            if self.shuffle:
+                np.random.shuffle(batch_starts)
+
+            for b_start in batch_starts:
                 b_end = min(b_start + self.batch_size, n)
                 yield (
                     obs_t[b_start:b_end].to(self.device, non_blocking=True),
