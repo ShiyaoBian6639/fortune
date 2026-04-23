@@ -241,37 +241,41 @@ class RegressionChunkedLoader:
         return t
 
     def __iter__(self):
-        indices = np.arange(self.n_samples)
+        # CRITICAL: Assign chunks THEN shuffle within chunks
+        # Random memmap access is disastrously slow (seeks for each index)
+        # Sequential access within chunks: ~100 MB/s vs ~1 MB/s random
+        n_chunks = (self.n_samples + self.chunk_samples - 1) // self.chunk_samples
+        chunk_order = np.arange(n_chunks)
         if self.shuffle:
-            np.random.shuffle(indices)
+            np.random.shuffle(chunk_order)  # shuffle chunk order, not indices
 
         # Double-buffering: 2 threads for overlapping I/O
         executor = ThreadPoolExecutor(max_workers=self.prefetch_factor)
 
-        def _load_chunk(chunk_idx):
-            start = chunk_idx * self.chunk_samples
+        def _load_chunk(logical_chunk_idx):
+            # Map to physical chunk (sequential disk access within chunk)
+            phys_chunk = chunk_order[logical_chunk_idx]
+            start = phys_chunk * self.chunk_samples
             end   = min(start + self.chunk_samples, self.n_samples)
-            idx   = indices[start:end]
-            # Copy to contiguous arrays and shuffle within chunk
+
+            # SEQUENTIAL slice access — fast memmap read (~100 MB/s)
             chunk_data = (
-                self._obs[idx].copy(),
-                self._future[idx].copy(),
-                self._targets[idx].copy(),
-                self._sectors[idx].copy(),
-                self._inds[idx].copy(),
-                self._subs[idx].copy(),
-                self._sizes[idx].copy(),
-                self._areas[idx].copy(),
-                self._boards[idx].copy(),
-                self._ipo[idx].copy(),
+                self._obs[start:end].copy(),
+                self._future[start:end].copy(),
+                self._targets[start:end].copy(),
+                self._sectors[start:end].copy(),
+                self._inds[start:end].copy(),
+                self._subs[start:end].copy(),
+                self._sizes[start:end].copy(),
+                self._areas[start:end].copy(),
+                self._boards[start:end].copy(),
+                self._ipo[start:end].copy(),
             )
-            # Intra-chunk shuffle
+            # Shuffle IN MEMORY after sequential load (fast)
             if self.shuffle:
-                perm = np.random.permutation(len(idx))
+                perm = np.random.permutation(end - start)
                 chunk_data = tuple(arr[perm] for arr in chunk_data)
             return chunk_data
-
-        n_chunks = (self.n_samples + self.chunk_samples - 1) // self.chunk_samples
 
         # Submit first prefetch_factor chunks
         futures = []

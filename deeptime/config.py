@@ -343,48 +343,52 @@ DEFAULT_CONFIG = {
 # Can push to batch=768, hidden=384 if needed.
 RTX_5090_CONFIG = {
     # Model — larger capacity for 32GB VRAM
-    'tft_hidden':       256,       # 2× default (richer representations)
-    'tft_heads':        8,         # 2× default (multi-aspect attention)
+    # NOTE: hidden=256 with 6M params showed gradient explosion at lr=3e-5
+    # Reduced to hidden=192 (3.3M params) which is more stable
+    'tft_hidden':       192,       # 1.5× default (balanced capacity)
+    'tft_heads':        8,         # more heads for diverse attention
     'tft_lstm_layers':  2,         # keep 2 (diminishing returns)
-    'tft_dropout':      0.20,      # slightly higher for larger model
+    'tft_dropout':      0.25,      # higher dropout for larger batch
     'sequence_length':  60,        # 2× default (more temporal context)
 
-    # Training — larger batches for better GPU utilization
-    'batch_size':       512,       # 2.7× default (fits in 32GB)
-    'learning_rate':    5e-5,      # sqrt-scaled: 2e-5 × √(512/192) ≈ 3.3e-5, rounded up
-    'warmup_epochs':    5,         # longer warmup for larger batches
-    'weight_decay':     0.1,       # keep same
-    'max_grad_norm':    0.5,       # keep same
+    # Training — conservative LR to prevent gradient explosion
+    # Gradient norms 0.58→3.28→5.63 at lr=3e-5 indicates instability
+    'batch_size':       512,
+    'learning_rate':    1e-5,      # REDUCED: 3e-5 caused grad explosion
+    'warmup_epochs':    10,        # longer warmup for stability
+    'weight_decay':     0.15,      # stronger L2 for larger batch
+    'max_grad_norm':    0.3,       # tighter clipping
 
     # Data loading — optimized for RTX 5090 bandwidth
-    'chunk_samples':    250_000,   # ~6 GB RAM per chunk, 50+ batches per chunk
+    'chunk_samples':    200_000,   # ~5 GB RAM per chunk (seq_len=60)
     'prefetch_factor':  3,         # triple-buffering for high bandwidth
 
     # Early stopping
-    'early_stopping_patience': 20, # more patience for larger model
-    'base_batch_for_lr': 512,      # disable auto LR scaling (already tuned)
+    'early_stopping_patience': 25,
+    'base_batch_for_lr': 512,      # disable auto LR scaling
 }
 
-# Aggressive RTX 5090 config — use if IC plateaus with conservative settings
+# Aggressive RTX 5090 config — larger model, use if IC plateaus
+# WARNING: Requires careful LR tuning; larger models need lower LR
 RTX_5090_AGGRESSIVE_CONFIG = {
-    'tft_hidden':       384,
-    'tft_heads':        8,         # head_dim = 384/8 = 48
+    'tft_hidden':       256,       # larger but not too large
+    'tft_heads':        8,         # head_dim = 256/8 = 32
     'tft_lstm_layers':  2,
-    'tft_dropout':      0.25,
+    'tft_dropout':      0.30,      # stronger regularization for larger model
     'sequence_length':  60,
 
-    'batch_size':       768,
-    'learning_rate':    8e-5,
-    'warmup_epochs':    8,
-    'weight_decay':     0.15,
-    'max_grad_norm':    0.5,
+    'batch_size':       512,
+    'learning_rate':    8e-6,      # very conservative for 6M params
+    'warmup_epochs':    15,        # long warmup
+    'weight_decay':     0.2,       # strong L2
+    'max_grad_norm':    0.3,
 
     # Data loading — max throughput
-    'chunk_samples':    300_000,   # ~8 GB RAM per chunk
+    'chunk_samples':    200_000,
     'prefetch_factor':  3,
 
-    'early_stopping_patience': 25,
-    'base_batch_for_lr': 768,
+    'early_stopping_patience': 30,
+    'base_batch_for_lr': 512,
 }
 
 PRESET_CONFIGS = {

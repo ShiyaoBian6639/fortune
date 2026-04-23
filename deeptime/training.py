@@ -338,6 +338,18 @@ def train_model(
                   f"MAE={val_metrics.get('mae_'+hn, 0):.4f}  "
                   f"HR={val_metrics.get('hr_'+hn, 0):.4f}")
 
+        # Detect training instability (gradient explosion, val divergence)
+        if len(history['grad_norm']) >= 3:
+            recent_gn = history['grad_norm'][-3:]
+            if all(g > 2.0 for g in recent_gn):
+                print(f"\n  [WARN] Gradient norms consistently high ({recent_gn})")
+                print(f"         Consider: --lr {lr*0.5:.1e} or --max_grad_norm 0.2")
+        if len(history['val_loss']) >= 3:
+            recent_vl = history['val_loss'][-3:]
+            if recent_vl[-1] > recent_vl[0] * 1.1:  # val loss increased 10%+
+                print(f"\n  [WARN] Validation loss diverging: {recent_vl[0]:.4f} → {recent_vl[-1]:.4f}")
+                print(f"         Consider reducing learning rate or model size")
+
         # Early stopping on val IC
         if val_ic > best_val_ic + 1e-4:
             best_val_ic  = val_ic
