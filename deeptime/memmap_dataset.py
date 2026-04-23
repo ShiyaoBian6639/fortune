@@ -426,77 +426,92 @@ class RegressionChunkedLoader:
         return t
 
     def __iter__(self):
-        # CRITICAL: Assign chunks THEN shuffle within chunks
-        # Random memmap access is disastrously slow (seeks for each index)
-        # Sequential access within chunks: ~100 MB/s vs ~1 MB/s random
+        # Shuffle CHUNK ORDER (not sample indices) so each chunk is a contiguous
+        # memmap slice — sequential I/O is 5-10× faster than fancy indexing on
+        # a multi-hundred-GB memmap. Global randomness comes from (a) shuffled
+        # chunk order, (b) a per-epoch random byte offset that shifts chunk
+        # boundaries (wrap-around at the end), and (c) a single intra-chunk
+        # permutation of samples so each batch sees a wide cross-section of
+        # stocks (the writer stores stocks contiguously — without per-sample
+        # shuffle, a batch would contain only 4-5 stocks).
         n_chunks = (self.n_samples + self.chunk_samples - 1) // self.chunk_samples
         chunk_order = np.arange(n_chunks)
+        epoch_offset = 0
         if self.shuffle:
-            np.random.shuffle(chunk_order)  # shuffle chunk order, not indices
+            np.random.shuffle(chunk_order)
+            epoch_offset = int(np.random.randint(0, max(self.chunk_samples, 1)))
 
-        # Double-buffering: 2 threads for overlapping I/O
         executor = ThreadPoolExecutor(max_workers=self.prefetch_factor)
 
-        def _load_chunk(logical_chunk_idx):
-            # Map to physical chunk (sequential disk access within chunk)
-            phys_chunk = chunk_order[logical_chunk_idx]
-            start = phys_chunk * self.chunk_samples
-            end   = min(start + self.chunk_samples, self.n_samples)
+        def _read_range(arr, start, end):
+            """Contiguous memmap slice with wrap-around when start+size > N."""
+            N = self.n_samples
+            if end <= N:
+                return arr[start:end].copy()
+            a = arr[start:N].copy()
+            b = arr[:end - N].copy()
+            return np.concatenate([a, b], axis=0)
 
-            # SEQUENTIAL slice access — fast memmap read (~100 MB/s)
-            # NO shuffle here - shuffle batch order instead (avoids slow random access)
-            chunk_data = (
-                self._obs[start:end].copy(),
-                self._future[start:end].copy(),
-                self._targets[start:end].copy(),
-                self._sectors[start:end].copy(),
-                self._inds[start:end].copy(),
-                self._subs[start:end].copy(),
-                self._sizes[start:end].copy(),
-                self._areas[start:end].copy(),
-                self._boards[start:end].copy(),
-                self._ipo[start:end].copy(),
+        def _load_chunk(chunk_idx_in_order):
+            actual_chunk = int(chunk_order[chunk_idx_in_order])
+            start = (actual_chunk * self.chunk_samples + epoch_offset) % self.n_samples
+            end   = start + self.chunk_samples  # may overshoot; _read_range wraps
+
+            obs     = _read_range(self._obs,     start, end)
+            future  = _read_range(self._future,  start, end)
+            targets = _read_range(self._targets, start, end)
+            sectors = _read_range(self._sectors, start, end)
+            inds    = _read_range(self._inds,    start, end)
+            subs    = _read_range(self._subs,    start, end)
+            sizes   = _read_range(self._sizes,   start, end)
+            areas   = _read_range(self._areas,   start, end)
+            boards  = _read_range(self._boards,  start, end)
+            ipo     = _read_range(self._ipo,     start, end)
+
+            # Intra-chunk sample shuffle so each batch has diverse stocks
+            n = len(obs)
+            if self.shuffle and n > 1:
+                perm    = np.random.permutation(n)
+                obs     = obs[perm];     future = future[perm]; targets = targets[perm]
+                sectors = sectors[perm]; inds   = inds[perm];   subs    = subs[perm]
+                sizes   = sizes[perm];   areas  = areas[perm];  boards  = boards[perm]
+                ipo     = ipo[perm]
+
+            # Pin memory in the prefetch thread so the ~0.4-0.6 s pinning cost
+            # overlaps with the GPU consuming the previous chunk. pin_memory()
+            # is thread-safe after CUDA init.
+            return (
+                self._to_pinned(obs),
+                self._to_pinned(future),
+                self._to_pinned(targets),
+                self._to_pinned(sectors),
+                self._to_pinned(inds),
+                self._to_pinned(subs),
+                self._to_pinned(sizes),
+                self._to_pinned(areas),
+                self._to_pinned(boards),
+                self._to_pinned(ipo),
             )
-            return chunk_data
 
-        # Submit first prefetch_factor chunks
+        n_actual = len(chunk_order)
+
         futures = []
-        for i in range(min(self.prefetch_factor, n_chunks)):
+        for i in range(min(self.prefetch_factor, n_actual)):
             futures.append(executor.submit(_load_chunk, i))
 
-        for chunk_i in range(n_chunks):
-            # Wait for current chunk
+        for chunk_i in range(n_actual):
             chunk = futures[0].result()
             futures.pop(0)
 
-            # Submit next chunk if available
             next_chunk_i = chunk_i + self.prefetch_factor
-            if next_chunk_i < n_chunks:
+            if next_chunk_i < n_actual:
                 futures.append(executor.submit(_load_chunk, next_chunk_i))
 
-            obs, future, tgt, sec, ind, sub, sz, area, board, ipo = chunk
-            n = len(obs)
+            obs_t, future_t, tgt_t, sec_t, ind_t, sub_t, sz_t, area_t, board_t, ipo_t = chunk
+            n = obs_t.shape[0]
 
-            # Pre-convert entire chunk to pinned tensors
-            obs_t    = self._to_pinned(obs)
-            future_t = self._to_pinned(future)
-            tgt_t    = self._to_pinned(tgt)
-            sec_t    = self._to_pinned(sec)
-            ind_t    = self._to_pinned(ind)
-            sub_t    = self._to_pinned(sub)
-            sz_t     = self._to_pinned(sz)
-            area_t   = self._to_pinned(area)
-            board_t  = self._to_pinned(board)
-            ipo_t    = self._to_pinned(ipo)
-
-            # Shuffle BATCH ORDER (not samples) - avoids slow 8GB random access
-            batch_starts = list(range(0, n, self.batch_size))
-            if self.shuffle:
-                np.random.shuffle(batch_starts)
-
-            for b_start in batch_starts:
+            for b_start in range(0, n, self.batch_size):
                 b_end = min(b_start + self.batch_size, n)
-                # Async transfer with non_blocking=True
                 yield (
                     obs_t[b_start:b_end].to(self.device, non_blocking=True),
                     future_t[b_start:b_end].to(self.device, non_blocking=True),

@@ -323,16 +323,24 @@ def train_model(
         betas=(0.9, 0.95), weight_decay=weight_decay,
     )
 
-    # Cosine warmup + cosine decay via a single LambdaLR.
+    # LR schedule. Options:
+    #   'cosine' (default): cosine warmup to peak, then cosine decay to 0.
+    #   'flat':   cosine warmup to peak, then hold peak LR for the rest of training.
+    #             Useful when the loss surface has a narrow basin the model escapes
+    #             under decay-to-zero pressure — holding peak lets it converge
+    #             inside the basin rather than ramping through it.
     # NOTE: Do NOT combine LambdaLR with ReduceLROnPlateau — LambdaLR resets
-    # the LR to base_lr*lambda(epoch) each step, overriding any ReduceLROnPlateau
-    # reduction (confirmed: epoch N plateau halves to X, epoch N+1 LambdaLR
-    # restores to 2X). Use only one scheduler.
+    # the LR to base_lr*lambda(epoch) each step, overriding any reduction.
+    lr_schedule = str(config.get('lr_schedule', 'cosine')).lower()
+
     def _lr_lambda(epoch):
         if epoch < warmup_ep:
             # Cosine warmup 10%→100% of peak LR
             progress = epoch / max(warmup_ep, 1)
             return 0.1 + 0.9 * 0.5 * (1.0 - np.cos(np.pi * progress))
+        if lr_schedule == 'flat':
+            return 1.0
+        # cosine decay to 0
         progress = (epoch - warmup_ep) / max(epochs - warmup_ep, 1)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
@@ -350,7 +358,8 @@ def train_model(
     best_epoch   = 0
     patience_cnt = 0
 
-    print(f"\nTraining on {device} | epochs={epochs} | lr={scaled_lr:.2e} | warmup={warmup_ep} (cosine) | patience={patience}")
+    print(f"\nTraining on {device} | epochs={epochs} | lr={scaled_lr:.2e} | "
+          f"warmup={warmup_ep} (cosine) | schedule={lr_schedule} | patience={patience}")
     print(f"  AMP={'on' if scaler else 'off'}")
 
     for epoch in range(epochs):

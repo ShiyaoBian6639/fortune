@@ -323,6 +323,11 @@ DEFAULT_CONFIG = {
     'early_stopping_patience':  15,
     'base_batch_for_lr':        192,  # reference batch size for LR linear scaling
     'warmup_epochs':            2,
+    # LR schedule after warmup: 'cosine' decays to 0, 'flat' holds peak LR.
+    # Use 'flat' when gradient norms grow through training (sign the model is
+    # escaping its basin under decay pressure) — held peak LR with high weight
+    # decay lets it converge inside the basin.
+    'lr_schedule':              'cosine',
     'use_amp':                  True,
     'random_seed':              42,
 
