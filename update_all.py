@@ -1,45 +1,75 @@
 """
 Master Daily Update Script
-Runs all incremental data downloads in dependency order.
-Run this once after market close each trading day to keep all datasets current.
+Runs all incremental data downloads, optionally in parallel across groups.
+Run once after market close each trading day to keep datasets current.
 
 Usage:
-    ./venv/Scripts/python update_all.py             # full update
-    ./venv/Scripts/python update_all.py --skip-stocks  # skip slow OHLCV extension
-    ./venv/Scripts/python update_all.py --only index   # named group only
-    ./venv/Scripts/python update_all.py --check-gaps   # report missing dates without downloading
-    ./venv/Scripts/python update_all.py --fill-gaps    # fill ALL missing dates (not just recent)
+    ./venv/Scripts/python update_all.py                 # full update, parallel groups
+    ./venv/Scripts/python update_all.py --xgb           # only the groups xgbmodel needs (parallel)
+    ./venv/Scripts/python update_all.py --sequential    # legacy serial mode
+    ./venv/Scripts/python update_all.py --skip-stocks   # skip the slow OHLCV extension
+    ./venv/Scripts/python update_all.py --only index    # named group only
+    ./venv/Scripts/python update_all.py --check-gaps    # report missing dates without downloading
+    ./venv/Scripts/python update_all.py --fill-gaps     # fill ALL missing dates (not just recent)
+    ./venv/Scripts/python update_all.py --group-workers 6  # concurrent groups (default 4)
 
-Groups:
-    stocks  – stock OHLCV (extend_stock_data)
-    basics  – daily_basic, moneyflow, stk_limit (per-date files)
-    index   – index_dailybasic, idx_factor_pro, index_global, index_weight
-    fund    – fund_share, fund_nav, fund_factor_pro
-    fina    – quarterly financial indicators (fina_indicator)
-    block   – block trade data
-    fina_ext – financial statements (income, balancesheet, cashflow)
-    fina_extras – forecast, express, dividend, fina_audit, etc.
-    limits  – limit_list_d, top_list, dragon-tiger data
-    ths     – THS index list, daily, and members
-    chips   – chip distribution data (cyq_perf, cyq_chips)
+Groups (xgb-critical marked ★):
+    stocks  ★ stock OHLCV (extend_stock_data)
+    basics  ★ daily_basic, moneyflow, stk_limit (per-date files)
+    index   ★ index_dailybasic, idx_factor_pro, index_global, index_weight
+    fina    ★ quarterly financial indicators (fina_indicator)
+    block   ★ block trade data
+    sectors ★ SW sector classification (stock_sectors.csv)
+    fund      fund_share, fund_nav, fund_factor_pro
+    fina_ext  financial statements (income, balancesheet, cashflow)
+    fina_extras forecast, express, dividend, fina_audit, etc.
+    limits    limit_list_d, top_list, dragon-tiger data
+    ths       THS index list, daily, and members
+    chips     chip distribution data (cyq_perf, cyq_chips)
 """
 
-import sys
-import time
+import argparse
 import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# ─── Optional CLI args ────────────────────────────────────────────────────────
+# ─── CLI parsing ──────────────────────────────────────────────────────────────
 
-args         = set(sys.argv[1:])
-skip_stocks  = '--skip-stocks' in args
-check_gaps   = '--check-gaps' in args
-fill_gaps    = '--fill-gaps' in args
-only_group   = None
-for a in args:
-    if a.startswith('--only'):
-        only_group = a.split('=')[-1] if '=' in a else (sys.argv[sys.argv.index(a)+1] if sys.argv.index(a)+1 < len(sys.argv) else None)
+def _parse_cli():
+    p = argparse.ArgumentParser('update_all', add_help=False)
+    p.add_argument('--skip-stocks', action='store_true',
+                   help='Skip the OHLCV extension group (it is the slowest).')
+    p.add_argument('--xgb', action='store_true',
+                   help='Run only the groups xgbmodel needs: '
+                        'stocks, basics, index, fina, block, sectors.')
+    p.add_argument('--sequential', action='store_true',
+                   help='Run groups one after another (legacy mode). Default is parallel.')
+    p.add_argument('--group-workers', type=int, default=4,
+                   help='Max groups to run concurrently (default 4). '
+                        'Each group has its own internal thread pool, so pushing this '
+                        'too high multiplies concurrent Tushare connections.')
+    p.add_argument('--only', default=None,
+                   help='Run a single named group, e.g. --only index')
+    p.add_argument('--check-gaps', action='store_true',
+                   help='Report missing dates without downloading.')
+    p.add_argument('--fill-gaps', action='store_true',
+                   help='Fill ALL missing trading days, not just recent ones.')
+    p.add_argument('-h', '--help', action='help')
+    return p.parse_args()
+
+
+_cli          = _parse_cli()
+skip_stocks   = _cli.skip_stocks
+check_gaps    = _cli.check_gaps
+fill_gaps     = _cli.fill_gaps
+only_group    = _cli.only
+xgb_only      = _cli.xgb
+run_parallel  = not _cli.sequential
+group_workers = max(1, _cli.group_workers)
 
 
 # ─── Trading calendar helper ─────────────────────────────────────────────────
@@ -302,13 +332,18 @@ def fill_stock_ohlcv_gaps():
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _section(title):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
+_print_lock = threading.Lock()
 
 
-def _run_group(name, fn):
+def _section(title: str):
+    with _print_lock:
+        print(f"\n{'='*60}")
+        print(f"  {title}")
+        print(f"{'='*60}")
+
+
+def _run_group(name: str, fn):
+    """Run a single group serially. Used when --sequential or --only is set."""
     if only_group and only_group != name:
         return
     _section(name.upper())
@@ -316,8 +351,119 @@ def _run_group(name, fn):
     try:
         fn()
     except Exception as e:
-        print(f"  [ERROR] {name}: {e}")
-    print(f"  Elapsed: {time.time()-t0:.1f}s")
+        with _print_lock:
+            print(f"  [ERROR] {name}: {e}")
+    with _print_lock:
+        print(f"  Elapsed: {time.time()-t0:.1f}s")
+
+
+class _TaggedStdout:
+    """Line-buffered stdout wrapper that prefixes every line with a tag.
+
+    Each group runs in its own thread; redirecting sys.stdout per-thread
+    keeps their logs identifiable when they interleave. Uses threading.local
+    so each thread writes to its own buffer.
+    """
+    def __init__(self, real_stdout, tag_getter):
+        self._real = real_stdout
+        self._tag_getter = tag_getter
+        self._buffers = threading.local()
+
+    def _buf(self):
+        if not hasattr(self._buffers, 'b'):
+            self._buffers.b = []
+        return self._buffers.b
+
+    def write(self, text):
+        if not text:
+            return
+        tag = self._tag_getter()
+        if tag is None:
+            return self._real.write(text)
+        buf = self._buf()
+        buf.append(text)
+        joined = ''.join(buf)
+        *complete, leftover = joined.split('\n')
+        # keep the partial-line tail for next write
+        self._buffers.b = [leftover] if leftover else []
+        if complete:
+            with _print_lock:
+                for line in complete:
+                    self._real.write(f'[{tag}] {line}\n')
+                self._real.flush()
+
+    def flush(self):
+        buf = self._buf()
+        if buf:
+            tag = self._tag_getter()
+            leftover = ''.join(buf).rstrip('\n')
+            if leftover:
+                with _print_lock:
+                    if tag:
+                        self._real.write(f'[{tag}] {leftover}\n')
+                    else:
+                        self._real.write(leftover + '\n')
+            self._buffers.b = []
+        self._real.flush()
+
+
+_thread_tag = threading.local()
+_tagged_stdout: _TaggedStdout | None = None
+
+
+def _install_tagged_stdout():
+    """Install the tagged stdout wrapper once. Safe to call repeatedly."""
+    global _tagged_stdout
+    if _tagged_stdout is None:
+        _tagged_stdout = _TaggedStdout(sys.stdout, lambda: getattr(_thread_tag, 'tag', None))
+        sys.stdout = _tagged_stdout
+
+
+def _run_group_parallel(groups: list):
+    """Run the given (name, fn) groups concurrently, tagging log output per group."""
+    # Filter by --only if set
+    if only_group:
+        groups = [(n, f) for n, f in groups if n == only_group]
+        if not groups:
+            print(f"[update_all] no group matches --only {only_group}")
+            return
+
+    _install_tagged_stdout()
+    timings: dict = {}
+    errors: dict = {}
+
+    def _worker(name, fn):
+        _thread_tag.tag = name
+        t0 = time.time()
+        try:
+            fn()
+        except Exception as e:
+            errors[name] = str(e)
+        timings[name] = time.time() - t0
+
+    _section(f"RUNNING {len(groups)} GROUPS IN PARALLEL "
+             f"(up to {group_workers} concurrent)")
+    for name, _ in groups:
+        print(f"  queued: {name}")
+
+    workers = min(group_workers, len(groups))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_worker, n, f): n for n, f in groups}
+        for fut in as_completed(futs):
+            name = futs[fut]
+            with _print_lock:
+                status = 'ERROR' if name in errors else 'done'
+                print(f"\n[update_all] {name} {status} in {timings.get(name, 0):.1f}s")
+
+    # Restore untagged output and print summary
+    _thread_tag.tag = None
+    _section("PARALLEL RUN SUMMARY")
+    for name, _ in groups:
+        t = timings.get(name, 0)
+        if name in errors:
+            print(f"  {name:<12} FAILED  ({t:.1f}s)  {errors[name][:120]}")
+        else:
+            print(f"  {name:<12} ok     ({t:.1f}s)")
 
 
 # ─── Update functions ─────────────────────────────────────────────────────────
@@ -475,8 +621,33 @@ def _check_fresh_install():
     return True
 
 
+def _build_groups():
+    """Return (xgb_groups, extra_groups) as lists of (name, fn) tuples."""
+    xgb_groups = []
+    if not skip_stocks:
+        xgb_groups.append(('stocks', update_stocks))
+    xgb_groups += [
+        ('basics',  update_basics),
+        ('index',   update_index),
+        ('fina',    update_fina),
+        ('block',   update_block),
+        ('sectors', update_sector_info),
+    ]
+    extra_groups = [
+        ('fund',        update_fund),
+        ('fina_ext',    update_fina_statements),
+        ('fina_extras', update_fina_extras),
+        ('limits',      update_limits),
+        ('ths',         update_ths),
+        ('chips',       update_chips),
+    ]
+    return xgb_groups, extra_groups
+
+
 if __name__ == '__main__':
-    print(f"\nStarting full data update — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\nStarting data update — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  mode: {'xgb-priority' if xgb_only else 'full'}  "
+          f"{'sequential' if not run_parallel else f'parallel (group_workers={group_workers})'}")
 
     _ensure_dirs()
 
@@ -503,22 +674,18 @@ if __name__ == '__main__':
         print(f"\nGap filling complete — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         sys.exit(0)
 
-    # Normal incremental update
-    if not skip_stocks:
-        _run_group('stocks', update_stocks)
+    # ─── Normal incremental update ────────────────────────────────────────────
+    xgb_groups, extra_groups = _build_groups()
+    groups = xgb_groups if xgb_only else (xgb_groups + extra_groups)
 
-    _run_group('basics', update_basics)
-    _run_group('index',  update_index)
-    _run_group('fund',   update_fund)
-    _run_group('fina',    update_fina)
-    _run_group('block',   update_block)
-    _run_group('sectors', update_sector_info)
+    t0_total = time.time()
 
-    # Extended data sources for deeptime model
-    _run_group('fina_ext',    update_fina_statements)
-    _run_group('fina_extras', update_fina_extras)
-    _run_group('limits',      update_limits)
-    _run_group('ths',         update_ths)
-    _run_group('chips',       update_chips)
+    if run_parallel and not only_group:
+        _run_group_parallel(groups)
+    else:
+        # Sequential path (legacy) — or --only filter
+        for name, fn in groups:
+            _run_group(name, fn)
 
-    print(f"\nAll updates complete — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\nAll updates complete in {time.time()-t0_total:.1f}s — "
+          f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

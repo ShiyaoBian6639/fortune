@@ -20,17 +20,44 @@ Usage:
 import tushare as ts
 import pandas as pd
 import os
+import threading
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
 # Configuration
 TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR = Path('./stock_data/daily_basic')
-CALL_INTERVAL = 0.3  # seconds between calls (daily_basic may have stricter limits)
+CALL_INTERVAL = 0.3  # legacy: used only by single-date path
 MAX_RETRIES = 5  # max retries for network errors
 RETRY_DELAY = 2  # initial retry delay in seconds
+# Parallelism for batch/range downloads. Tushare 8000-pt tier allows ~500/min
+# for daily_basic; 8 workers × 8 calls/s keeps us well under per-minute quotas.
+WORKERS = 8
+CALLS_PER_SEC = 8.0
+
+
+class _RateLimiter:
+    """Token-bucket-style limiter shared across worker threads."""
+    def __init__(self, rate: float):
+        self._interval = 1.0 / rate
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                wait = self._last + self._interval - now
+                if wait <= 0:
+                    self._last = now
+                    return
+            time.sleep(max(0.001, wait))
+
+
+_limiter = _RateLimiter(CALLS_PER_SEC)
 
 
 def init_tushare():
@@ -59,6 +86,7 @@ def fetch_with_retry(fetch_func, *args, max_retries=MAX_RETRIES, **kwargs):
         Result from fetch_func or None on failure
     """
     for attempt in range(max_retries):
+        _limiter.acquire()
         try:
             return fetch_func(*args, **kwargs)
         except (requests.exceptions.ChunkedEncodingError,
@@ -66,7 +94,13 @@ def fetch_with_retry(fetch_func, *args, max_retries=MAX_RETRIES, **kwargs):
                 requests.exceptions.Timeout,
                 Exception) as e:
             error_name = type(e).__name__
-            if attempt < max_retries - 1:
+            err = str(e)
+            # Tushare rate-limit responses — back off for a minute.
+            if any(k in err for k in ('exceed', '超出', '频率', 'too many')):
+                wait_time = 60 * (attempt + 1)
+                print(f"  [rate limit] sleeping {wait_time}s ...")
+                time.sleep(wait_time)
+            elif attempt < max_retries - 1:
                 wait_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
                 print(f"  {error_name}: Retry {attempt + 1}/{max_retries} in {wait_time}s...")
                 time.sleep(wait_time)
@@ -206,30 +240,49 @@ def download_daily_basic_range(start_date, end_date, save=True, skip_existing=Tr
         print("All dates already downloaded!")
         return []
 
-    results = []
-    failed_dates = []
-
-    for i, date in enumerate(trade_dates):
-        print(f"[{i+1}/{len(trade_dates)}] Processing {date}...")
-
+    def _fetch_one(date):
         df = fetch_with_retry(get_daily_basic, trade_date=date)
-
         if df is not None and not df.empty:
             if save:
                 filepath = DATA_DIR / f'daily_basic_{date}.csv'
                 df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            results.append(df)
-            print(f"  Retrieved {len(df)} records")
-        elif df is not None:
-            print(f"  No data for {date}")
-        else:
-            print(f"  Failed to fetch {date}")
-            failed_dates.append(date)
+            return date, df, 'ok'
+        if df is not None:
+            return date, None, 'empty'
+        return date, None, 'fail'
 
-        time.sleep(CALL_INTERVAL)
+    results = []
+    failed_dates = []
+    total = len(trade_dates)
+    ok = empty = fail = 0
+    t0 = time.monotonic()
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(_fetch_one, d): d for d in trade_dates}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            date, df, status = fut.result()
+            with lock:
+                if status == 'ok':
+                    ok += 1
+                    results.append(df)
+                elif status == 'empty':
+                    empty += 1
+                else:
+                    fail += 1
+                    failed_dates.append(date)
+            if done % 20 == 0 or done == total:
+                elapsed = time.monotonic() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                print(f"  [{done}/{total}]  ok={ok} empty={empty} fail={fail}  "
+                      f"{rate:.1f} dates/s  ETA {eta:.0f}s")
 
     # Summary
-    print(f"\nDownload complete: {len(results)} succeeded, {len(failed_dates)} failed")
+    print(f"\nDownload complete in {time.monotonic()-t0:.0f}s: "
+          f"{ok} succeeded, {empty} empty, {fail} failed")
     if failed_dates:
         print(f"Failed dates: {failed_dates[:10]}{'...' if len(failed_dates) > 10 else ''}")
 

@@ -28,6 +28,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Pre-parse --drop_market before importing .config so the env var is in place
+# when config.py builds DT_FEATURE_COLUMNS at module-load time.
+if '--drop_market' in sys.argv:
+    os.environ['DEEPTIME_DROP_MARKET'] = '1'
+
 from dl.training import set_seed
 
 from .config import get_config, DEFAULT_CONFIG, NUM_HORIZONS, get_horizon_name
@@ -82,6 +87,14 @@ def parse_args():
                    help='Evaluate SWA model on val every N epochs (default: 5). '
                         'Lower = more trajectory signal, higher memory pressure. '
                         'Always evaluates once at end regardless.')
+    p.add_argument('--horizon_weights', type=str, default=None,
+                   help='Comma-separated per-horizon loss weights, one per FORWARD_WINDOW. '
+                        'Default "0.2,0.5,1.0,1.0,1.0" downweights day1/day2 noise.')
+    p.add_argument('--drop_market', action='store_true',
+                   help='Exclude csi*/sse*/gem_/global-index features from '
+                        'observed_past. Target is excess return → market features '
+                        'add regime noise. Requires cache rebuild (feature count '
+                        'changes). Env-var equivalent: DEEPTIME_DROP_MARKET=1.')
     p.add_argument('--patience', type=int, default=None,
                    help='Early stopping patience (default: 15)')
     p.add_argument('--target_mode', default='excess', choices=['excess', 'raw'])
@@ -425,6 +438,12 @@ def main():
     if args.no_swa:                    overrides['use_swa']         = False
     if args.swa_start    is not None: overrides['swa_start_epoch']  = args.swa_start
     if args.swa_eval_every is not None: overrides['swa_eval_every']  = args.swa_eval_every
+    if args.horizon_weights is not None:
+        try:
+            hw = [float(x) for x in args.horizon_weights.split(',')]
+            overrides['horizon_weights'] = hw
+        except Exception as e:
+            raise SystemExit(f"--horizon_weights parse error: {e}")
     if args.patience     is not None: overrides['early_stopping_patience'] = args.patience
     if args.chunk_samples is not None: overrides['chunk_samples']  = args.chunk_samples
     if args.prefetch     is not None: overrides['prefetch_factor'] = args.prefetch

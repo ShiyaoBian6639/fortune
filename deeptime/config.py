@@ -20,7 +20,10 @@ if os.name != 'nt':
 # ─── Prediction horizons ──────────────────────────────────────────────────────
 FORWARD_WINDOWS  = [1, 2, 3, 4, 5]   # trading days ahead
 NUM_HORIZONS     = len(FORWARD_WINDOWS)
-HORIZON_WEIGHTS  = [1.0, 1.0, 1.0, 1.0, 1.0]
+# Per-horizon loss weights. day1/day2 are mostly noise on Chinese equities
+# (test IC = 0.005 / 0.028 in the SWA run) while day3-5 are the useful signal.
+# Downweighting the short horizons stops the model spending capacity on noise.
+HORIZON_WEIGHTS  = [0.2, 0.5, 1.0, 1.0, 1.0]
 
 # ─── Sequence length ──────────────────────────────────────────────────────────
 SEQUENCE_LENGTH  = 30   # matches dl/; seq_len=60 exhausts VRAM on RTX 4070 Super
@@ -132,12 +135,32 @@ EXTENDED_STATIC_FEATURES = (
 # Import the base features from dl/config and extend them.
 # Importing at module level to keep DT_FEATURE_COLUMNS as a plain list.
 
+# Env-var controlled feature exclusion. Set DEEPTIME_DROP_MARKET=1 to exclude
+# all csi*/sse*/gem_/dji_/hsi_/ixic_/n225_/spx_ market-level features from
+# observed_past. Rationale: target is excess return (stock − csi300), which
+# is market-neutral by construction. Market-level features add regime noise
+# without relative predictive power. VSN + AV analysis showed the model was
+# over-relying on these (uni_AUC > 0.70 for PE/PB; top VSN weight on mtm/cci).
+# Requires cache rebuild — feature count changes from 233 → ~165.
+DROP_MARKET_FEATURES = os.environ.get('DEEPTIME_DROP_MARKET', '0') == '1'
+
+
 def _build_dt_feature_columns():
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from dl.config import FEATURE_COLUMNS as DL_FEATURE_COLUMNS
+    import sys, os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from dl.config import FEATURE_COLUMNS as DL_FEATURE_COLUMNS, MARKET_CONTEXT_FEATURES
+
+    base = list(DL_FEATURE_COLUMNS)
+    if DROP_MARKET_FEATURES:
+        market_set = set(MARKET_CONTEXT_FEATURES)
+        filtered   = [c for c in base if c not in market_set]
+        n_dropped  = len(base) - len(filtered)
+        print(f"  [DROP_MARKET] Excluded {n_dropped} market-level features "
+              f"({len(base)} → {len(filtered)})")
+        base = filtered
+
     return (
-        list(DL_FEATURE_COLUMNS)
+        base
         + list(PRICE_LIMIT_RATIO_COLUMNS)   # continuous limit ratios (better than binary)
         + list(FINA_INDICATOR_COLUMNS)
         + list(BLOCK_TRADE_COLUMNS)
@@ -272,9 +295,10 @@ DEFAULT_CONFIG = {
     'prefetch_factor':          2,         # double-buffering (2 × 2GB = 4GB RAM)
 
     # Target
-    'target_mode':   TARGET_MODE,
-    'huber_delta':   HUBER_DELTA,
-    'loss_type':     'huber',   # 'huber' or 'huber+ic'
+    'target_mode':     TARGET_MODE,
+    'huber_delta':     HUBER_DELTA,
+    'loss_type':       'huber',   # 'huber' or 'huber+ic'
+    'horizon_weights': HORIZON_WEIGHTS,   # per-horizon loss weights (list of 5 floats)
 
     # Rolling split
     'split_mode':                  'rolling_window',

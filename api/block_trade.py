@@ -28,8 +28,8 @@ import tushare as ts
 TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR      = Path('./stock_data/block_trade')
 START_DATE    = '20170101'
-WORKERS       = 4       # parallel batch workers
-CALLS_PER_SEC = 4.0     # global token-bucket rate
+WORKERS       = 8       # parallel batch workers
+CALLS_PER_SEC = 8.0     # global token-bucket rate
 MAX_RETRIES   = 3
 RETRY_DELAY   = 2
 BATCH_DAYS    = 10      # trading days fetched per API call (reduces total calls 10×)

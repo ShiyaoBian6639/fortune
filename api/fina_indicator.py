@@ -35,10 +35,11 @@ CKPT_FILE       = DATA_DIR / '_checkpoint.json'
 STOCK_LIST_FILE = Path('./stock_data/stock_list.csv')
 START_DATE      = '20170101'
 
-# Financial-statement APIs have stricter per-minute quotas than OHLCV.
-# 2 workers + 2 calls/sec avoids the burst that caused ReadTimeout clusters.
-WORKERS       = 8     # WORKERS ≥ CALLS_PER_SEC × avg_latency_s (~1.5s → need ≥6)
-CALLS_PER_SEC = 4.0   # conservative for financial-statement endpoints
+# Financial-statement APIs have per-minute quotas. For 8000-pt accounts,
+# 12 workers × 6 calls/s keeps fina_indicator inside its ~500/min bucket
+# (each call fetches one stock's full quarterly history).
+WORKERS       = 12    # WORKERS ≥ CALLS_PER_SEC × avg_latency_s (~1.5s → need ≥9)
+CALLS_PER_SEC = 6.0   # raised from 4.0 for 8000-pt tier
 MAX_RETRIES   = 3
 RETRY_DELAY   = 2
 

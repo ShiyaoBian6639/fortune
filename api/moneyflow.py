@@ -25,8 +25,8 @@ from pathlib import Path
 TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR      = Path('./stock_data/moneyflow')
 START_DATE    = '20170101'
-WORKERS       = 4
-CALLS_PER_SEC = 4.0
+WORKERS       = 8
+CALLS_PER_SEC = 8.0
 MAX_RETRIES   = 5
 RETRY_DELAY   = 2     # base seconds for exponential backoff
 
