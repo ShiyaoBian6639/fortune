@@ -133,7 +133,12 @@ MULTIMODAL_CONFIG = {
     # Measured speed: ~7.5 sec/step (batch=32, gradient checkpointing).
     # 30k samples → 938 steps → ~2h/epoch (practical for 20-epoch training).
     # Increase once you know the full-dataset step time from the progress bar.
-    'phase2_max_samples':  30_000,
+    'phase2_max_samples':       30_000,
+    # Cap val and test for Phase 2 too — uncapped val (~650K samples) ran BERT
+    # inline ~22× longer than training, silently consuming most of each epoch.
+    # 30K samples × ~1 s/step at batch=32 ≈ 5 minutes per val pass.
+    'phase2_val_max_samples':   30_000,
+    'phase2_test_max_samples':  30_000,
     # CE + label_smoothing matches the dl/ pipeline's hard-won lesson.  Class
     # weights stay OFF: with a 10-class label distribution and ~30× imbalance,
     # inverse-frequency weighting collapses the model onto the rarest class

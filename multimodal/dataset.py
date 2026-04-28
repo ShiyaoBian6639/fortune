@@ -504,20 +504,27 @@ def create_phase2_dataloaders(
     config:           dict,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Phase 2: inline-BERT loaders served from raw token tensors."""
-    device      = config.get('device', 'cpu')
-    pin         = device.startswith('cuda')
-    batch_sz    = config.get('batch_size', 64)
-    win         = config.get('news_window', 3)
-    max_samples = config.get('phase2_max_samples')
-    seed        = config.get('random_seed', 42)
-    in_ram      = config.get('load_price_in_ram', False)
+    device         = config.get('device', 'cpu')
+    pin            = device.startswith('cuda')
+    batch_sz       = config.get('batch_size', 64)
+    win            = config.get('news_window', 3)
+    train_max      = config.get('phase2_max_samples')
+    val_max        = config.get('phase2_val_max_samples',  train_max)
+    test_max       = config.get('phase2_test_max_samples', train_max)
+    seed           = config.get('random_seed', 42)
+    in_ram         = config.get('load_price_in_ram', False)
 
     train_ds = Phase2Dataset(cache_dir, token_cache, trading_calendar,
-                             'train', win, max_samples=max_samples,
+                             'train', win, max_samples=train_max,
                              random_seed=seed, load_price_in_ram=in_ram)
+    # Use a fixed offset for val/test so the same subset is evaluated every
+    # epoch — running F1 on a randomly-resampled val each epoch makes the
+    # early-stopping curve unstable.
     val_ds   = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'val',  win,
+                             max_samples=val_max,  random_seed=seed + 1,
                              load_price_in_ram=in_ram)
     test_ds  = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'test', win,
+                             max_samples=test_max, random_seed=seed + 2,
                              load_price_in_ram=in_ram)
 
     train_loader = DataLoader(train_ds, batch_size=batch_sz, shuffle=True,

@@ -290,8 +290,11 @@ def _evaluate_phase2(
     all_probs   = []
     device_type = device.split(':')[0]
 
+    # Make eval visible: without this, val can take longer than train and
+    # the user just sees the screen go quiet.
+    pbar = tqdm(loader, desc='  p2 eval', leave=False, unit='step', dynamic_ncols=True)
     with torch.no_grad():
-        for price_seq, ids_win, masks_win, n_arts, labels in loader:
+        for price_seq, ids_win, masks_win, n_arts, labels in pbar:
             price_seq = price_seq.to(device, non_blocking=True)
             labels    = labels.to(device,    non_blocking=True)
 
@@ -307,6 +310,7 @@ def _evaluate_phase2(
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
+    pbar.close()
 
     return (
         total_loss / len(loader),
