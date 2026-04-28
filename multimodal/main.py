@@ -246,9 +246,12 @@ def run_train(config: dict, phase: int = 1, fresh: bool = False):
         # avoids loading 4M labels into RAM just to bincount them.
         class_counts = _read_class_counts(cache_dir, split='train')
         criterion = create_loss_function(
-            loss_type='focal', num_classes=MM_NUM_CLASSES,
+            loss_type=config.get('loss_type', 'ce'),
+            num_classes=MM_NUM_CLASSES,
             class_counts=class_counts, device=device,
             gamma=config.get('focal_gamma', 2.0),
+            label_smoothing=config.get('label_smoothing', 0.0),
+            use_class_weights=config.get('use_class_weights', True),
         )
 
         # Resume if a Phase 1 checkpoint exists (skip when --fresh is set)
@@ -293,9 +296,12 @@ def run_train(config: dict, phase: int = 1, fresh: bool = False):
         train_labels = train_loader.dataset.get_labels()
         class_counts = np.bincount(train_labels, minlength=MM_NUM_CLASSES).astype(np.float64)
         criterion = create_loss_function(
-            loss_type='focal', num_classes=MM_NUM_CLASSES,
+            loss_type=config.get('loss_type', 'ce'),
+            num_classes=MM_NUM_CLASSES,
             class_counts=class_counts, device=device,
             gamma=config.get('focal_gamma', 2.0),
+            label_smoothing=config.get('label_smoothing', 0.0),
+            use_class_weights=config.get('use_class_weights', True),
         )
 
         # Load BERT only when actually needed (Phase 2 fine-tuning)
@@ -332,7 +338,12 @@ def run_evaluate(config: dict, phase: int = 1):
     # Use validation set class counts from metadata
     class_counts = _read_class_counts(cache_dir, split='val')
     criterion = create_loss_function(
-        'focal', MM_NUM_CLASSES, class_counts, device, gamma=config.get('focal_gamma', 2.0)
+        loss_type=config.get('loss_type', 'ce'),
+        num_classes=MM_NUM_CLASSES,
+        class_counts=class_counts, device=device,
+        gamma=config.get('focal_gamma', 2.0),
+        label_smoothing=config.get('label_smoothing', 0.0),
+        use_class_weights=config.get('use_class_weights', True),
     )
 
     model = create_multimodal_model(config).to(device)

@@ -190,6 +190,10 @@ def main():
     p.add_argument('--horizon_weights', default='1.5,1.0,0.8,0.6,0.5',
                    help='per-horizon loss weights')
     p.add_argument('--early_stop', type=int, default=4)
+    p.add_argument('--no_amp', action='store_true', default=True,
+                   help='Disable AMP (fp16). The TFT VSN with grouped Conv1d '
+                        'has fp16 stability issues (grad overflow); fp32 is '
+                        'stable but ~2× slower. Default: AMP off for safety.')
     p.add_argument('--past_obs_top_k', type=int, default=0,
                    help='If >0, keep only the top-K past-observed features by '
                         'GBM importance (loaded from xgb_pct_chg.meta.json). '
@@ -271,7 +275,10 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.device == 'cuda'))
+    use_amp = (args.device == 'cuda') and not args.no_amp
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    print(f"[mh-tft] AMP fp16: {'ON' if use_amp else 'OFF (fp32 — stable for grouped-Conv1d VSN)'}",
+          flush=True)
 
     best_val = float('inf'); best_state = None; patience = 0
     t0 = time.time()
@@ -285,7 +292,7 @@ def main():
             f_t = f_t.to(args.device, non_blocking=True)
             y_t = y_t.to(args.device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=(args.device == 'cuda')):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 pred = model(s_t if len(static_cols) > 0 else None,
                               p_t if len(past_obs_cols) > 0 else None,
                               k_t if len(past_kn_cols)  > 0 else None,
@@ -307,7 +314,7 @@ def main():
                 s_t = s_t.to(args.device); p_t = p_t.to(args.device)
                 k_t = k_t.to(args.device); f_t = f_t.to(args.device)
                 y_t = y_t.to(args.device)
-                with torch.amp.autocast('cuda', enabled=(args.device == 'cuda')):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     pr = model(s_t if len(static_cols) > 0 else None,
                                 p_t if len(past_obs_cols) > 0 else None,
                                 k_t if len(past_kn_cols)  > 0 else None,
@@ -349,7 +356,7 @@ def main():
             p_t = torch.from_numpy(np.stack(p_l)).to(args.device) if len(past_obs_cols) > 0 else None
             k_t = torch.from_numpy(np.stack(k_l)).to(args.device) if len(past_kn_cols)  > 0 else None
             f_t = torch.from_numpy(np.stack(f_l)).to(args.device) if len(past_kn_cols)  > 0 else None
-            with torch.amp.autocast('cuda', enabled=(args.device == 'cuda')):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 pr = model(s_t, p_t, k_t, f_t)
             t_p.append(pr.float().cpu().numpy())
             t_t.append(np.stack(y_l).astype('float32'))

@@ -116,14 +116,30 @@ class VariableSelectionNetwork(nn.Module):
         # Each "group" has 1 input channel → d_model output channels.
         # n_vars groups → total out_channels = n_vars * d_model.
         # kernel_size=1 means we treat the time axis as the conv "length".
-        self.fc1   = nn.Conv1d(n_vars, n_vars * d_model, 1, groups=n_vars)
-        self.fc2   = nn.Conv1d(n_vars * d_model, n_vars * d_model, 1, groups=n_vars)
-        self.glu_a = nn.Conv1d(n_vars * d_model, n_vars * d_model, 1, groups=n_vars)
-        self.glu_b = nn.Conv1d(n_vars * d_model, n_vars * d_model, 1, groups=n_vars)
-        self.skip  = nn.Conv1d(n_vars, n_vars * d_model, 1, groups=n_vars)
-        # Per-feature LayerNorm — single tensor of (n_vars, d_model) γ/β
-        self.ln_g  = nn.Parameter(torch.ones(n_vars, d_model))
-        self.ln_b  = nn.Parameter(torch.zeros(n_vars, d_model))
+        # Default PyTorch init uses uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)).
+        # For grouped Conv1d with in/group=1, fan_in=1 → std≈0.58 per weight,
+        # which combined with the fc2/GLU stack gives huge magnitudes that
+        # saturate the GLU sigmoid in fp16 → NaN gradients. We re-init all
+        # Conv1d weights with a stable Xavier-style scale based on d_model.
+        def _make(in_ch_per_group, out_ch_per_group):
+            conv = nn.Conv1d(n_vars * in_ch_per_group,
+                              n_vars * out_ch_per_group, 1, groups=n_vars)
+            nn.init.xavier_uniform_(conv.weight,
+                                      gain=1.0 / math.sqrt(in_ch_per_group))
+            nn.init.zeros_(conv.bias)
+            return conv
+
+        self.fc1   = _make(1,        d_model)
+        self.fc2   = _make(d_model,  d_model)
+        self.glu_a = _make(d_model,  d_model)
+        self.glu_b = _make(d_model,  d_model)
+        self.skip  = _make(1,        d_model)
+        # Per-feature LayerNorm via GroupNorm: groups=n_vars,
+        # channels=n_vars*d_model normalises each feature's d_model channels
+        # independently. fp16-stable (uses fused CUDA kernel, eps=1e-5).
+        self.ln    = nn.GroupNorm(num_groups=n_vars,
+                                    num_channels=n_vars * d_model,
+                                    eps=1e-5, affine=True)
         self.dropout = nn.Dropout(dropout)
 
         # Weight GRN — operates on the concatenated raw inputs (n_vars long)
@@ -151,16 +167,12 @@ class VariableSelectionNetwork(nn.Module):
         skip_v = self.skip(x_t)                                   # (B, n_vars*d_model, T)
         z = skip_v + glu                                          # (B, n_vars*d_model, T)
 
-        # Reshape to (B, n_vars, d_model, T) for per-feature LayerNorm
+        # Per-feature LayerNorm via GroupNorm (fp16-stable, fused kernel)
+        z = self.ln(z)                                            # (B, n_vars*d_model, T)
+
+        # Reshape to (B, T, n_vars, d_model) for downstream weighted sum
         B, _, T = z.shape
-        z = z.view(B, n_vars, d_model, T)
-        # LayerNorm across d_model dim
-        mu = z.mean(dim=2, keepdim=True)
-        sd = z.std (dim=2, keepdim=True, unbiased=False).clamp_min(1e-5)
-        z = (z - mu) / sd * self.ln_g.unsqueeze(0).unsqueeze(-1) \
-                       + self.ln_b.unsqueeze(0).unsqueeze(-1)
-        # → emb shape (B, T, n_vars, d_model) for downstream weighted sum
-        emb = z.permute(0, 3, 1, 2)                               # (B, T, n_vars, d_model)
+        emb = z.view(B, n_vars, d_model, T).permute(0, 3, 1, 2)   # (B, T, n_vars, d_model)
         if x.dim() == 2:
             emb = emb.squeeze(1)                                  # (B, n_vars, d_model)
 

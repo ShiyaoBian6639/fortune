@@ -121,8 +121,13 @@ MULTIMODAL_CONFIG = {
     # 30k samples → 938 steps → ~2h/epoch (practical for 20-epoch training).
     # Increase once you know the full-dataset step time from the progress bar.
     'phase2_max_samples':  30_000,
-    'loss_type':     'focal',
-    'use_amp':       True,
+    # CE + label_smoothing matches the dl/ pipeline's hard-won lesson — focal
+    # loss with class weights amplified imbalance enough to cause temperature
+    # explosion on the full dataset (T=127) and very volatile val metrics.
+    'loss_type':         'ce',
+    'label_smoothing':   0.1,
+    'use_class_weights': True,
+    'use_amp':           True,
 
     # Phase 1 uses MultimodalChunkedLoader (background thread, no workers).
     # Val/test use DataLoader with num_workers=0 (sequential, no multiprocessing).
