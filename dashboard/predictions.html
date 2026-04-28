@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>XGB 预测看板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg:#0e1117;--panel:#161b22;--panel2:#1c232e;--border:#2a313c;
+    --text:#c9d1d9;--muted:#7d8590;--accent:#58a6ff;
+    --up:#da3633;--down:#2ea043;--good:#da3633;--bad:#2ea043;--warn:#d29922;
+  }
+  *{box-sizing:border-box;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+        background:var(--bg);color:var(--text);margin:0;padding:0;line-height:1.6;}
+  header{background:linear-gradient(180deg,#2a1a1c 0%,#0e1117 100%);
+          padding:28px 40px 18px;border-bottom:1px solid var(--border);}
+  header h1{margin:0 0 4px;font-size:24px;font-weight:700;letter-spacing:1px;}
+  header p{margin:0;color:var(--muted);font-size:13px;}
+  .badge{display:inline-block;padding:2px 8px;margin-left:6px;
+          background:rgba(218,54,51,.15);color:var(--up);
+          border:1px solid rgba(218,54,51,.4);border-radius:4px;
+          font-size:11px;font-weight:500;}
+  nav{position:sticky;top:0;z-index:10;background:var(--panel);
+       border-bottom:1px solid var(--border);padding:8px 40px;
+       overflow-x:auto;white-space:nowrap;}
+  nav a{display:inline-block;padding:6px 12px;margin-right:2px;
+         color:var(--muted);text-decoration:none;font-size:12.5px;border-radius:4px;}
+  nav a:hover{background:var(--panel2);color:var(--text);}
+  nav .related{color:var(--accent);}
+  nav .sep{color:var(--border);margin:0 4px;user-select:none;}
+  section{padding:24px 40px;border-bottom:1px solid var(--border);}
+  section h2{font-size:18px;margin:0 0 4px;}
+  section h3{font-size:14px;margin:14px 0 8px;}
+  section .subtitle{color:var(--muted);font-size:12.5px;margin:0 0 16px;}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;}
+  .card .label{color:var(--muted);font-size:11.5px;letter-spacing:.3px;}
+  .card .value{font-size:22px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums;}
+  .card .hint{color:var(--muted);font-size:11px;margin-top:4px;}
+  .good{color:var(--good);}.bad{color:var(--bad);}.warn{color:var(--warn);}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  @media (max-width:1100px){.grid-2{grid-template-columns:1fr;}}
+  .plot{background:var(--panel);border:1px solid var(--border);border-radius:6px;
+         padding:12px;min-height:340px;}
+  table.ttbl{width:100%;border-collapse:collapse;font-size:12px;
+              background:var(--panel);border:1px solid var(--border);border-radius:6px;}
+  table.ttbl th,table.ttbl td{padding:6px 10px;border-bottom:1px solid var(--border);
+              text-align:left;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  table.ttbl th{background:var(--panel2);color:var(--muted);font-weight:500;
+                 position:sticky;top:0;cursor:pointer;}
+  table.ttbl tr:hover td{background:var(--panel2);}
+  .scroll-table{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:6px;}
+  .scroll-table table.ttbl{border:0;border-radius:0;}
+  code{color:var(--accent);background:var(--panel2);padding:1px 6px;border-radius:3px;font-size:11.5px;}
+
+  /* Stock card grid for top-30 with feature trends */
+  .stock-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;}
+  .scard{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;}
+  .scard.up{border-left:3px solid var(--up);}
+  .scard.down{border-left:3px solid var(--down);}
+  .scard h4{margin:0 0 4px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:baseline;}
+  .scard h4 .pred{font-size:18px;font-weight:700;}
+  .scard h4 .ts{color:var(--muted);font-size:11.5px;font-weight:400;}
+  .scard .meta{color:var(--muted);font-size:11px;margin-bottom:6px;}
+  .scard .mini-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;}
+  .scard .mini{background:var(--panel2);border-radius:3px;padding:4px 6px;font-size:10.5px;}
+  .scard .mini .name{color:var(--muted);}
+  .scard .mini .val{font-weight:600;font-variant-numeric:tabular-nums;}
+  .scard .pi{color:var(--muted);font-size:10.5px;margin-top:4px;}
+
+  .feature-detail{margin-top:10px;}
+  .feature-detail summary{color:var(--accent);cursor:pointer;font-size:12px;user-select:none;}
+  .feature-detail .trend-row{display:grid;grid-template-columns:130px 1fr 60px;gap:8px;align-items:center;
+                              padding:3px 0;border-top:1px solid var(--border);font-size:11px;}
+  .feature-detail .trend-row:first-child{border-top:0;}
+  .feature-detail .trend-name{color:var(--muted);}
+  .feature-detail .trend-spark{height:24px;}
+  .feature-detail .trend-last{font-variant-numeric:tabular-nums;font-weight:600;text-align:right;}
+
+  /* All-predictions section */
+  .trend-picker{display:flex;align-items:center;flex-wrap:wrap;gap:8px;}
+  .grid-trend{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;
+              background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;}
+  .grid-trend .plot{background:var(--panel2);border-radius:4px;padding:4px;}
+
+  .info-block{background:var(--panel);border:1px solid var(--border);border-radius:6px;
+              padding:14px 18px;line-height:1.55;font-size:12.5px;}
+  .info-block .formula{background:var(--panel2);border-radius:4px;padding:8px 12px;
+              margin:6px 0;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--accent);}
+</style>
+</head>
+<body>
+<header>
+  <h1>XGB 预测看板 <span class="badge">predictions</span></h1>
+  <p id="hdr-sub">加载中…</p>
+</header>
+<nav>
+  <a href="#summary">概览</a>
+  <a href="#live">下一交易日组合</a>
+  <a href="#top30">前30预测+特征趋势</a>
+  <a href="#bottom30">后30预测</a>
+  <a href="#all_predictions">全部预测</a>
+  <a href="#importance">特征重要性</a>
+  <a href="#accuracy">样本外精度</a>
+  <a href="#models">模型比较</a>
+  <a href="#per_engine">各模型今日推荐</a>
+  <a href="#multihorizon">5天预测</a>
+  <a href="#bt-compare">回测对比</a>
+  <span class="sep">|</span>
+  <a class="related" href="index_backtest.html">→ 回测看板</a>
+  <a class="related" href="index_sanity.html">→ 数据完整性看板</a>
+</nav>
+
+<section id="summary">
+  <h2>模型概览</h2>
+  <p class="subtitle" id="overview_sub">XGBoost 回归模型 — 预测每只股票次日相对沪深300的超额收益 (μ)。</p>
+  <div id="cards_overview" class="cards"></div>
+</section>
+
+<section id="live">
+  <h2>下一交易日组合 (top-K=10, 长多头 QP)</h2>
+  <p class="subtitle" id="live_subtitle">加载中…</p>
+  <div id="live_warning" class="info-block" style="display:none;margin-bottom:14px;"></div>
+  <details open>
+    <summary style="cursor:pointer;color:var(--accent);font-size:13px;">
+      <b>📖 μ 与 w_qp 是什么? 马科维茨的输入到底是什么?</b>
+    </summary>
+    <div class="info-block" style="margin-top:8px;">
+      <h4 style="margin-top:0;">μ — XGBoost 预测的次日<b>相对沪深300超额收益</b> (%)</h4>
+      <p>训练目标：<code>y_{i,t} = pct_chg_{i,t+1} − pct_chg_{CSI300,t+1}</code> (横截面去均值)。
+        预测输出：<code>μ̂_{i,t+1}</code> 单位是 %。μ &gt; 0 → 预测跑赢大盘。</p>
+      <h4>w_qp — 长多头马科维茨 QP 求出的组合权重</h4>
+      <div class="formula">minimize&nbsp;0.5·λ·wᵀΣw − μᵀw &nbsp;&nbsp;s.t.&nbsp;Σwᵢ = 1, wᵢ ≥ 0</div>
+      <p>输入：μ 向量 (10×1) 和 Σ 矩阵 (10×10, 用过去 60 日 pct_chg + Ledoit-Wolf 收缩)。</p>
+    </div>
+  </details>
+  <div class="cards" style="margin-top:10px;" id="cards_live"></div>
+  <div class="scroll-table" style="margin-top:10px;">
+    <table class="ttbl" id="tbl_live_portfolio"></table>
+  </div>
+</section>
+
+<section id="top30">
+  <h2>前 30 预测 + 30日特征趋势</h2>
+  <p class="subtitle">
+    每张卡片是一只预测最强的股票 (按 μ 倒序)。卡片下方"展开特征趋势"列出该股近 30 个交易日的关键模型特征曲线 ——
+    可视化检验模型为何看好该股 (是否换手率激增? RSI 触底? 突破均线?)。
+  </p>
+  <div id="grid_top30" class="stock-grid"></div>
+</section>
+
+<section id="bottom30">
+  <h2>后 30 预测 + 30日特征趋势</h2>
+  <p class="subtitle">
+    预测最弱的 30 只 (按 μ 升序), 同样附 30 日关键特征曲线。
+    长多头策略不交易这些, 但可用作模型方向性校验。
+  </p>
+  <div id="grid_bottom30" class="stock-grid"></div>
+</section>
+
+<section id="all_predictions">
+  <h2>全部预测 (<span id="all_n">…</span>)</h2>
+  <p class="subtitle">
+    所有在册股票的次日预测。可按代码/名称搜索, 按板块/交易所/省份过滤, 点击列头排序。
+    上方下拉框选择任一只股票即可在右侧查看其近 30 日特征趋势图 (与前 30 / 后 30 卡片中的曲线一致)。
+  </p>
+  <div class="trend-picker">
+    <label for="trend_picker_input" style="margin-right:8px;color:var(--muted);font-size:13px;">
+      选择股票查看特征趋势:
+    </label>
+    <input id="trend_picker_input" list="trend_picker_options" placeholder="代码或名称…"
+           style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;min-width:220px;">
+    <datalist id="trend_picker_options"></datalist>
+    <span id="trend_picker_status" style="margin-left:10px;color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div id="trend_chart_panel" style="margin-top:10px;display:none;">
+    <h3 id="trend_chart_title" style="margin:0 0 4px;color:var(--text);font-size:15px;"></h3>
+    <p id="trend_chart_sub" style="margin:0 0 8px;color:var(--muted);font-size:12px;"></p>
+    <div class="grid-trend">
+      <div class="plot" id="plot_trend_close" style="min-height:240px;"></div>
+      <div class="plot" id="plot_trend_pct" style="min-height:240px;"></div>
+      <div class="plot" id="plot_trend_turnover" style="min-height:240px;"></div>
+      <div class="plot" id="plot_trend_rsi" style="min-height:240px;"></div>
+      <div class="plot" id="plot_trend_volratio" style="min-height:240px;"></div>
+    </div>
+  </div>
+
+  <div class="all-pred-controls" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+    <label style="color:var(--muted);font-size:13px;">预测来源:
+      <select id="all_engine" style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;margin-left:4px;">
+        <option value="ensemble" selected>集成 (6引擎均值, 默认)</option>
+      </select>
+    </label>
+    <input id="all_search" placeholder="代码或名称搜索…"
+           style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;min-width:200px;">
+    <select id="all_filter_board" style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;">
+      <option value="all">全部板块</option>
+    </select>
+    <select id="all_filter_exch" style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;">
+      <option value="all">全部交易所</option>
+    </select>
+    <select id="all_filter_dir" style="background:#1c232e;color:#c9d1d9;border:1px solid #2a313c;border-radius:4px;padding:5px 8px;font-size:13px;">
+      <option value="all">全部方向</option>
+      <option value="up">仅上涨预测 (μ &gt; 0)</option>
+      <option value="strong_up">强上涨 (μ &gt; +1%)</option>
+      <option value="down">仅下跌预测 (μ &lt; 0)</option>
+    </select>
+    <span id="all_count" style="color:var(--muted);font-size:12px;margin-left:auto;"></span>
+  </div>
+  <div class="scroll-table" style="margin-top:8px;max-height:680px;">
+    <table class="ttbl" id="tbl_all_predictions"></table>
+  </div>
+</section>
+
+<section id="importance">
+  <h2>特征重要性 (前 30)</h2>
+  <p class="subtitle">
+    XGBoost 在 212 折 walk-forward 中累计的总分裂增益 (total_gain)。悬停查看中文含义。
+  </p>
+  <div class="plot" id="plot_importance" style="min-height:680px;"></div>
+</section>
+
+<section id="accuracy">
+  <h2>样本外预测精度</h2>
+  <p class="subtitle">
+    所有指标基于 walk-forward 212 折的样本外测试集 (2017-07 至今, 6.25M 个 (pred, target) 配对)。
+  </p>
+  <div id="cards_accuracy" class="cards"></div>
+  <div class="grid-2">
+    <div class="plot" id="plot_daily_ic"></div>
+    <div class="plot" id="plot_decile"></div>
+  </div>
+</section>
+
+<section id="models">
+  <h2>模型比较 (model selection)</h2>
+  <p class="subtitle">
+    在<b>同一个特征面板</b> + <b>同一组 walk-forward 折</b>上训练多种回归模型, 输出统一格式的 OOF 预测后比较。
+    包括: XGBoost (基线 + 3 个超参变体)、LightGBM、CatBoost、Pure Transformer、TFT (Lim 2019 原版)、以及简单平均与排名平均集成。
+    指标基于所有模型都有预测的共同行 (inner join)。
+  </p>
+  <div id="cmp_warning" class="info-block" style="display:none;background:rgba(218,153,34,.10);border-color:rgba(218,153,34,.45);"></div>
+  <h3>OOF 指标对比</h3>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_model_compare"></table>
+  </div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_model_correlation" style="min-height:380px;"></div>
+    <div class="plot" id="plot_model_ic_bars" style="min-height:380px;"></div>
+  </div>
+</section>
+
+<section id="per_engine">
+  <h2>各模型今日单日推荐 (T+1) + 跨模型共识</h2>
+  <p class="subtitle">
+    每个引擎独立训练并独立打分。"每模型 Top 5" 显示各引擎对次日预测最强的 5 只股票;
+    "跨引擎共识" 统计每只股票被几个引擎放进 Top 30 — 共识越高, 信号越稳健。
+    集成模型 (默认) 使用 6 个引擎的平均预测排名 (xgb_default / xgb_shallow / xgb_strong_reg / xgb_deep / lightgbm / catboost)。
+  </p>
+  <div id="pe_warning" class="info-block" style="display:none;background:rgba(218,153,34,.1);border-color:rgba(218,153,34,.45);"></div>
+  <div class="grid-2" style="gap:14px;">
+    <div>
+      <h3 style="margin:0 0 8px;">各引擎 Top 5 推荐</h3>
+      <div class="scroll-table" style="max-height:520px;">
+        <table class="ttbl" id="tbl_per_engine"></table>
+      </div>
+    </div>
+    <div>
+      <h3 style="margin:0 0 8px;">跨引擎共识 (出现在 ≥ N/6 个 Top 30 的股票)</h3>
+      <div class="scroll-table" style="max-height:520px;">
+        <table class="ttbl" id="tbl_consensus"></table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="multihorizon">
+  <h2>未来 5 个交易日预测 (T+1 → T+5)</h2>
+  <p class="subtitle">
+    每只股票预测未来 5 个交易日的超额收益轨迹 (相对沪深300, 每日横截面去均值)。
+    用于"D2 平淡 → D3 起量 → 提前在 D2 买入"等周内择时, 也可作为随机 QP 组合优化的输入。
+    训练: 2017-2023 训练 / 2024-2025.6 验证 / 2025.7+ 测试 (单次时间切分, 非滚动 walk-forward)。
+  </p>
+  <div id="mh_warning" class="info-block" style="display:none;background:rgba(218,153,34,.1);border-color:rgba(218,153,34,.45);"></div>
+  <div class="controls" style="margin-bottom:10px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;">
+    <label>引擎:
+      <select id="mh_engine"></select>
+    </label>
+    <label>排序:
+      <select id="mh_sort">
+        <option value="mean5">5日均值 (mean5)</option>
+        <option value="max5">5日最大 (max5, 单日峰值)</option>
+        <option value="slope">5日斜率 (slope, 走势)</option>
+        <option value="pred_d1">D1 (次日)</option>
+        <option value="pred_d2">D2</option>
+        <option value="pred_d3">D3</option>
+        <option value="pred_d4">D4</option>
+        <option value="pred_d5">D5</option>
+      </select>
+    </label>
+    <label>方向:
+      <select id="mh_direction">
+        <option value="top">前 30 (做多候选)</option>
+        <option value="bottom">后 30 (做空/回避候选)</option>
+      </select>
+    </label>
+    <span id="mh_meta" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_mh"></table>
+  </div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_mh_top10" style="min-height:380px;"></div>
+    <div class="plot" id="plot_mh_engine_compare" style="min-height:380px;"></div>
+  </div>
+</section>
+
+<section id="bt-compare">
+  <h2>各模型回测对比 (相同 Markowitz QP 策略, 不同预测源)</h2>
+  <p class="subtitle">
+    保持 <b>Markowitz mean-variance + 长多头 QP + ST 限额 4 只/日</b> 选股策略不变,
+    仅替换预测来源。基线参数: 止盈 +3%, 止损 -2%, 最大持仓 5 日。
+    Tuned 列展示每个模型经过 27 组 (tp×sl×max_hold) 网格寻优后的最优参数及对应回测结果。
+  </p>
+  <div id="bt_warning" class="info-block" style="display:none;background:rgba(218,153,34,.1);border-color:rgba(218,153,34,.45);"></div>
+  <div class="controls" style="margin-bottom:10px;">
+    <label>视图:
+      <select id="bt_view">
+        <option value="baseline">基线 (默认参数)</option>
+        <option value="tuned">Tuned (每模型最优参数)</option>
+      </select>
+    </label>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_bt_compare"></table>
+  </div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_bt_sharpe" style="min-height:340px;"></div>
+    <div class="plot" id="plot_bt_cagr_mdd" style="min-height:340px;"></div>
+  </div>
+</section>
+
+<script>
+const PLOT_LAYOUT={
+  paper_bgcolor:'#161b22',plot_bgcolor:'#161b22',
+  font:{color:'#c9d1d9',size:11,family:'"PingFang SC","Microsoft YaHei",sans-serif'},
+  xaxis:{gridcolor:'#2a313c'},yaxis:{gridcolor:'#2a313c'},
+  margin:{l:56,r:24,t:36,b:40},hovermode:'closest',
+};
+const PLOT_CONFIG={displaylogo:false,responsive:true};
+
+function fmtPct(x,dp=2){return (x*100).toFixed(dp)+'%';}
+function fmtMoney(x){return Math.round(x).toLocaleString('en-US');}
+function signClass(x){return x>=0?'good':'bad';}
+function card(label,value,hint,cls=''){return `<div class="card"><div class="label">${label}</div>`+
+  `<div class="value ${cls}">${value}</div>`+(hint?`<div class="hint">${hint}</div>`:'')+`</div>`;}
+
+function getData(){
+  if(typeof window!=='undefined'&&window.PREDICTIONS_DATA)
+    return Promise.resolve(window.PREDICTIONS_DATA);
+  return fetch('predictions_data.json').then(r=>r.json());
+}
+
+// Tiny SVG sparkline renderer
+function sparkline(values,width=160,height=22,color='#58a6ff'){
+  const v=values.filter(x=>x!=null&&isFinite(x));
+  if(v.length<2)return '<span style="color:var(--muted);font-size:10px;">no data</span>';
+  const min=Math.min(...v),max=Math.max(...v),rng=max-min||1;
+  const xs=values.map((_,i)=>i*(width/(values.length-1)));
+  const ys=values.map(x=>x==null?null:height-((x-min)/rng)*(height-2)-1);
+  let path='';let drawing=false;
+  for(let i=0;i<values.length;i++){
+    if(ys[i]==null){drawing=false;continue;}
+    path += (drawing?'L':'M')+xs[i].toFixed(1)+','+ys[i].toFixed(1)+' ';
+    drawing=true;
+  }
+  // zero line if applicable
+  let zeroLine='';
+  if(min<0&&max>0){
+    const zy=height-((-min)/rng)*(height-2)-1;
+    zeroLine=`<line x1="0" y1="${zy.toFixed(1)}" x2="${width}" y2="${zy.toFixed(1)}" stroke="#7d8590" stroke-dasharray="2 2" stroke-width="0.5"/>`;
+  }
+  return `<svg width="${width}" height="${height}" style="vertical-align:middle;">`+
+         zeroLine+
+         `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.3"/>`+
+         `</svg>`;
+}
+
+const FEATURE_KEY = [
+  ['pct_chg', '当日 pct_chg %'],
+  ['turnover_rate_f', '换手率(自由) %'],
+  ['rsi_14', 'RSI(14)'],
+  ['vol_ratio_20', '量比 vs 20日均'],
+  ['amt_ratio_5', '额比 vs 5日均'],
+  ['hl_ratio', '振幅 (high-low)/pre'],
+  ['lowershadow', '下影线/pre'],
+  ['overnight_gap', '隔夜跳空 %'],
+  ['close_ma_20_ratio', 'close / MA20'],
+  ['close_ma_60_ratio', 'close / MA60'],
+  ['momentum_5', '5日累计log收益'],
+  ['momentum_20', '20日累计log收益'],
+  ['vol_pct_20', '20日波动率'],
+  ['up_limit_ratio', '距涨停距离'],
+];
+
+function renderStockCard(s, side, names, predLookup) {
+  const ts = s.ts_code;
+  const pred = predLookup[ts];
+  // live_topn from dashboard.build uses key `pred_pct_chg`; the live module
+  // (live_prediction) uses `pred_pct_chg_next`. Accept either.
+  const muVal = pred ? (pred.pred_pct_chg_next != null ? pred.pred_pct_chg_next : pred.pred_pct_chg) : null;
+  const cls = (muVal != null && muVal >= 0) ? 'up' : 'down';
+  const muTxt = (muVal != null) ? ((muVal >= 0 ? '+' : '') + muVal.toFixed(2) + '%') : '—';
+  const muCls = (muVal != null && muVal >= 0) ? 'good' : 'bad';
+  const piTxt = (pred && pred.pi_lo_80 != null) ? `80% PI: [${pred.pi_lo_80.toFixed(2)}, ${pred.pi_hi_80.toFixed(2)}]` : '';
+  const probUp = pred && pred.prob_up != null ? (pred.prob_up*100).toFixed(0)+'%' : '—';
+
+  const F = s.features;
+  const lastIdx = s.dates.length - 1;
+
+  // Mini-stat blocks: take latest value of 6 key features
+  const miniKeys = [
+    ['pct_chg', '当日%', v => (v>=0?'+':'')+v.toFixed(2)+'%'],
+    ['turnover_rate_f', '换手%', v => v.toFixed(2)],
+    ['rsi_14', 'RSI', v => v.toFixed(0)],
+    ['vol_ratio_20', '量比', v => v.toFixed(2)+'×'],
+    ['close_ma_20_ratio', 'vs MA20', v => ((v-1)*100).toFixed(1)+'%'],
+    ['momentum_20', '动量20', v => (v*100).toFixed(1)+'%'],
+  ];
+  let mini = '';
+  for (const [k, lbl, fmt] of miniKeys) {
+    const arr = F[k];
+    const v = arr ? arr[lastIdx] : null;
+    mini += `<div class="mini"><span class="name">${lbl}</span> <span class="val">${v!=null?fmt(v):'—'}</span></div>`;
+  }
+
+  // Trend table
+  let trendRows = '';
+  for (const [k, lbl] of FEATURE_KEY) {
+    const arr = F[k];
+    if (!arr || arr.length === 0) continue;
+    const last = arr[arr.length - 1];
+    const lastTxt = (last==null||!isFinite(last)) ? '—'
+                    : (k === 'pct_chg' || k === 'overnight_gap' ? (last>=0?'+':'') + last.toFixed(2) + '%'
+                    : (k === 'rsi_14' ? last.toFixed(0)
+                    : last.toFixed(3)));
+    const sparkColor = (last == null) ? '#7d8590'
+                       : (k === 'pct_chg' || k === 'overnight_gap' || k === 'momentum_5' || k === 'momentum_20')
+                         ? (last >= 0 ? '#da3633' : '#2ea043')
+                         : '#58a6ff';
+    trendRows += `<div class="trend-row">
+      <span class="trend-name">${lbl}</span>
+      <span class="trend-spark">${sparkline(arr, 180, 22, sparkColor)}</span>
+      <span class="trend-last ${lastTxt.startsWith('+')?'good':lastTxt.startsWith('-')?'bad':''}">${lastTxt}</span>
+    </div>`;
+  }
+
+  return `<div class="scard ${cls}">
+    <h4>
+      <span><span class="ts">${ts}</span> ${names[ts] || ''}</span>
+      <span class="pred ${muCls}">${muTxt}</span>
+    </h4>
+    <div class="meta">${piTxt} · P(↑) ${probUp} · 30日特征截止 ${s.dates[lastIdx]}</div>
+    <div class="mini-grid">${mini}</div>
+    <details class="feature-detail">
+      <summary>展开 30 日特征趋势 (${FEATURE_KEY.length} 个特征)</summary>
+      ${trendRows}
+    </details>
+  </div>`;
+}
+
+getData().then(D => {
+  const P = D.predictions, M = D.model_meta, FI = D.feature_importance_top50 || [];
+
+  document.getElementById('hdr-sub').textContent =
+    `特征截止日 ${P.feature_date} → 预测目标日 ${P.prediction_date}  ·  ` +
+    `${P.n_live_stocks.toLocaleString()} 只股票评分  ·  模型: ${M.n_features} 特征 / ${M.n_folds} 折`;
+
+  document.getElementById('cards_overview').innerHTML = [
+    card('特征数', M.n_features, '174 个'),
+    card('walk-forward 折数', M.n_folds, ''),
+    card('训练耗时', (M.total_train_seconds/60).toFixed(1)+'分钟'),
+    card('每折树数', M.canonical_n_estimators),
+    card('OOS 期间', P.overall_metrics.date_start.slice(0,7) + ' → ' + P.overall_metrics.date_end.slice(0,7)),
+    card('OOS 配对样本', (P.overall_metrics.rows/1e6).toFixed(2)+'M', `${P.overall_metrics.stocks} 只`),
+    card('μ Pearson IC', P.overall_metrics.pearson_ic.toFixed(4), '全期'),
+    card('日均 Rank IC', P.daily_rank_ic.mean.toFixed(4), `ICIR=${P.daily_rank_ic.icir.toFixed(2)}`),
+  ].join('');
+
+  // ─── Live next-day block ─────────────────────────────────────────────
+  const LIVE = D.live;
+  if (LIVE) {
+    const cap = LIVE.execution_params && LIVE.execution_params.max_st_per_day;
+    const capLabel = cap < 0 ? '不限 ST' : cap === 0 ? '完全排除 ST' : `ST 限额 ${cap} 只/日`;
+    document.getElementById('live_subtitle').innerHTML =
+      `特征截止 <code>${LIVE.feature_date}</code> → 目标日 <code>${LIVE.forecast_date}</code> · 视图: <b>${capLabel}</b> · 候选池=${LIVE.execution_params.candidate_pool}`;
+
+    document.getElementById('cards_live').innerHTML = [
+      card('选股数', LIVE.portfolio.length+' / 10', LIVE.cash_recommendation ? '建议持币观望' : '已满'),
+      card('μ 范围', LIVE.pred_stats.q05.toFixed(2)+'% / +'+LIVE.pred_stats.q95.toFixed(2)+'%', '5/95 分位'),
+      card('μ 极值', LIVE.pred_stats.min.toFixed(2)+'% / +'+LIVE.pred_stats.max.toFixed(2)+'%', '最弱/最强'),
+      card('Σ 离对角', LIVE.cov_offdiag_max_abs.toFixed(3), '最大相关'),
+    ].join('');
+
+    if (LIVE.cash_recommendation) {
+      const w = document.getElementById('live_warning');
+      w.style.display = 'block';
+      w.style.background = 'rgba(46,160,67,.10)';
+      w.style.borderColor = 'rgba(46,160,67,.45)';
+      w.innerHTML = '<b>💰 建议本日持币观望</b><br>' +
+        '当前过滤条件下没有任何候选 — 模型最高 μ 的股票均已涨停被锁定 (low ≥ up_limit_price)。' +
+        '回测在历史上有 ~19% 的交易日同样选择持币观望。';
+    }
+
+    let tHtml = `<thead><tr>
+      <th>排名</th><th>代码</th><th>名称</th><th>状态</th>
+      <th>μ 全市场排名</th><th>μ 预测%</th><th>80% 预测区间</th>
+      <th>P(↑)</th><th>σ_60</th>
+      <th>权重 QP</th><th>建议买价</th><th>分配资金</th><th>股数</th>
+    </tr></thead><tbody>`;
+    LIVE.portfolio.forEach((p,i) => {
+      const stTag = p.is_st
+        ? '<span style="color:var(--up);font-weight:600;background:rgba(218,54,51,.15);padding:1px 6px;border-radius:3px;font-size:10px;">⚠️ ST</span>'
+        : (p.band_pct && p.band_pct >= 19
+            ? '<span style="color:var(--accent);font-size:10px;">创/科</span>'
+            : '<span style="color:var(--muted);font-size:10px;">主板</span>');
+      const piTxt = p.pi_lo_80 != null ? `[${p.pi_lo_80.toFixed(2)}, ${p.pi_hi_80.toFixed(2)}]` : '—';
+      const rankTxt = p.mu_rank != null ? `#${p.mu_rank} / ${LIVE.n_candidates.toLocaleString()}` : '—';
+      const rowOpa = p.is_zero_weight ? ' style="opacity:0.55;"' : '';
+      tHtml += `<tr${rowOpa}>
+        <td>${i+1}</td><td>${p.ts_code}</td><td>${p.name||''}</td><td>${stTag}</td>
+        <td><span style="color:var(--muted);font-size:11px;">${rankTxt}</span></td>
+        <td class="${p.pred>=0?'good':'bad'}">${p.pred>=0?'+':''}${p.pred.toFixed(2)}%</td>
+        <td>${piTxt}</td>
+        <td>${p.prob_up!=null?(p.prob_up*100).toFixed(0)+'%':'—'}</td>
+        <td>${p.sigma.toFixed(2)}</td>
+        <td><b>${(p.weight_qp*100).toFixed(1)}%</b></td>
+        <td>${p.close.toFixed(2)}</td>
+        <td>${fmtMoney(p.cny_alloc||0)}</td>
+        <td>${p.shares.toLocaleString()}</td>
+      </tr>`;
+    });
+    tHtml += '</tbody>';
+    document.getElementById('tbl_live_portfolio').innerHTML = tHtml;
+  } else {
+    document.getElementById('live_subtitle').innerHTML =
+      '<span class="bad">未生成实时预测</span>';
+  }
+
+  // ─── Top-30 + Bottom-30 with feature trends ──────────────────────────
+  const liveTopn = P.live_topn;
+  const names = {};
+  (liveTopn.top || []).forEach(r => names[r.ts_code] = r.name);
+  (liveTopn.bottom || []).forEach(r => names[r.ts_code] = r.name);
+
+  const topPredLookup = {};
+  (liveTopn.top || []).forEach(r => topPredLookup[r.ts_code] = r);
+  const botPredLookup = {};
+  (liveTopn.bottom || []).forEach(r => botPredLookup[r.ts_code] = r);
+
+  document.getElementById('grid_top30').innerHTML =
+    (D.trends_top || []).map(s => renderStockCard(s, 'top', names, topPredLookup)).join('');
+  document.getElementById('grid_bottom30').innerHTML =
+    (D.trends_bottom || []).map(s => renderStockCard(s, 'bottom', names, botPredLookup)).join('');
+
+  // ─── Feature importance (top 30) ──────────────────────────────────────
+  const top30FI = [...FI].slice(0, 30).sort((a,b) => a.total_gain - b.total_gain);
+  const fcMap = {};
+  (D.feature_catalog && D.feature_catalog.features || []).forEach(f => fcMap[f.name] = f);
+  const groupNameMap = {};
+  (D.feature_catalog && D.feature_catalog.groups || []).forEach(g => groupNameMap[g.key] = g.name_zh);
+
+  Plotly.newPlot('plot_importance', [{
+    type: 'bar', orientation: 'h',
+    x: top30FI.map(r => r.total_gain),
+    y: top30FI.map(r => r.feature),
+    marker: { color: top30FI.map(r => {
+      const g = (fcMap[r.feature] || {}).group;
+      const palette = {
+        price_action:'#58a6ff',volume:'#79c0ff',technical:'#a371f7',
+        limit_move:'#da3633',pattern:'#ff7b72',moneyflow:'#d29922',
+        block_trade:'#bc8cff',valuation:'#2ea043',macro:'#7d8590',
+        csi300_ta:'#56d364',cross_section:'#f0883e',sector:'#e3b341',
+        calendar:'#6e7681',unknown:'#3d444d',
+      };
+      return palette[g] || '#58a6ff';
+    })},
+    text: top30FI.map(r => {
+      const m = fcMap[r.feature] || {};
+      return `${groupNameMap[m.group] || m.group}<br>${m.meaning || ''}`;
+    }),
+    hovertemplate: '<b>%{y}</b><br>%{text}<br>total_gain: %{x:,.0f}<extra></extra>',
+  }], {
+    ...PLOT_LAYOUT, height: 660,
+    title: { text: 'Top-30 特征重要性 (按 total_gain)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, title: 'total_gain' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, automargin: true, tickfont: { size: 10 } },
+    margin: { l: 200, r: 24, t: 40, b: 44 },
+  }, PLOT_CONFIG);
+
+  // ─── Accuracy section ─────────────────────────────────────────────────
+  const om = P.overall_metrics, ic = P.daily_rank_ic, dec = P.decile;
+  document.getElementById('cards_accuracy').innerHTML = [
+    card('Pearson IC', om.pearson_ic.toFixed(4)),
+    card('Spearman IC', om.spearman_ic.toFixed(4)),
+    card('日均 Rank IC', ic.mean.toFixed(4), `ICIR=${ic.icir.toFixed(2)}`),
+    card('IC > 0 占比', fmtPct(ic.pct_positive, 1)),
+    card('方向命中率', fmtPct(om.hit_rate, 2)),
+    card('Top-10% 命中', fmtPct(om.hit_rate_top10pct, 2)),
+    card('多空 Sharpe', dec.long_short_sharpe.toFixed(2)),
+    card('MAE', om.mae.toFixed(3)+'%'),
+  ].join('');
+
+  Plotly.newPlot('plot_daily_ic', [
+    { x: ic.dates, y: ic.ic_daily, name: '日 Rank IC',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 0.6 } },
+    { x: ic.dates, y: ic.ic_roll20, name: '20日均值',
+      type: 'scatter', mode: 'lines', line: { color: '#58a6ff', width: 1.5 } },
+  ], {
+    ...PLOT_LAYOUT, height: 340,
+    title: { text: '每日 Rank IC 时序', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, zeroline: true, zerolinecolor: '#7d8590' },
+    legend: { x: 0.01, y: 0.99 }, hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  Plotly.newPlot('plot_decile', [{
+    x: dec.decile, y: dec.mean_target, type: 'bar',
+    marker: { color: dec.mean_target.map(v => v >= 0 ? '#da3633' : '#2ea043') },
+  }], {
+    ...PLOT_LAYOUT, height: 340,
+    title: { text: '十分位平均目标值 (单位 %)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, title: '预测分位 (1=最弱)', dtick: 1 },
+    yaxis: { ...PLOT_LAYOUT.yaxis, title: '平均目标 %' },
+  }, PLOT_CONFIG);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  Model comparison
+  // ════════════════════════════════════════════════════════════════════════
+  const MC = D.model_comparison;
+  if (!MC) {
+    const w = document.getElementById('cmp_warning');
+    w.style.display = 'block';
+    w.innerHTML = '<b>模型比较数据尚未生成</b> — 请运行训练后调用 ' +
+      '<code>./venv/Scripts/python -m model_compare.ensemble --models xgb_default lightgbm catboost transformer_reg tft</code>';
+    document.getElementById('tbl_model_compare').innerHTML = '';
+    document.getElementById('plot_model_correlation').innerHTML = '';
+    document.getElementById('plot_model_ic_bars').innerHTML = '';
+  } else {
+    const allMetrics = { ...MC.metrics, ...(MC.ensembles || {}) };
+    const order = [...MC.models, ...Object.keys(MC.ensembles || {})];
+
+    // Sort by rank IC mean descending for default presentation
+    const sorted = [...order].sort((a, b) =>
+      (allMetrics[b].rank_ic_mean || -Infinity) - (allMetrics[a].rank_ic_mean || -Infinity));
+
+    let h = `<thead><tr>
+      <th>模型</th><th>样本数</th><th>日均 Rank IC</th><th>IC std</th>
+      <th>ICIR</th><th>IC>0 占比</th><th>方向命中</th><th>Pearson IC</th><th>RMSE</th>
+    </tr></thead><tbody>`;
+    sorted.forEach((n, i) => {
+      const m = allMetrics[n];
+      const isEns = n.startsWith('ensemble_');
+      const cls = i === 0 ? 'good' : (isEns ? 'warn' : '');
+      h += `<tr style="${isEns ? 'background:rgba(218,153,34,.06);' : ''}">
+        <td><b>${n}</b>${i === 0 ? ' 🏆' : ''}</td>
+        <td>${m.n_obs ? m.n_obs.toLocaleString() : '—'}</td>
+        <td class="${cls}">${m.rank_ic_mean.toFixed(4)}</td>
+        <td>${m.rank_ic_std.toFixed(4)}</td>
+        <td>${m.icir.toFixed(2)}</td>
+        <td>${(m.ic_pos_ratio*100).toFixed(1)}%</td>
+        <td>${(m.hit_rate*100).toFixed(2)}%</td>
+        <td>${m.pearson_ic.toFixed(4)}</td>
+        <td>${m.rmse.toFixed(4)}</td>
+      </tr>`;
+    });
+    h += '</tbody>';
+    document.getElementById('tbl_model_compare').innerHTML = h;
+
+    // Bar chart of rank IC mean
+    Plotly.newPlot('plot_model_ic_bars', [{
+      type: 'bar',
+      x: order.map(n => allMetrics[n].rank_ic_mean),
+      y: order,
+      orientation: 'h',
+      marker: { color: order.map(n => n.startsWith('ensemble_') ? '#d29922' : '#58a6ff') },
+      text: order.map(n => allMetrics[n].rank_ic_mean.toFixed(4)),
+      textposition: 'outside',
+    }], {
+      ...PLOT_LAYOUT, height: 360,
+      title: { text: '日均 Rank IC (越高越好)', font: { size: 13 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, title: 'rank IC mean', zeroline: true, zerolinecolor: '#7d8590' },
+      yaxis: { ...PLOT_LAYOUT.yaxis, automargin: true, tickfont: { size: 11 } },
+      margin: { l: 140, r: 20, t: 36, b: 40 },
+    }, PLOT_CONFIG);
+
+    // (correlation heatmap below)
+    void 0;
+    if (MC.correlation && MC.corr_index) {
+      Plotly.newPlot('plot_model_correlation', [{
+        type: 'heatmap',
+        z: MC.correlation,
+        x: MC.corr_index, y: MC.corr_index,
+        colorscale: [[0, '#0e1117'], [0.5, '#7d8590'], [1, '#da3633']],
+        zmid: 0.5,
+        text: MC.correlation.map(row => row.map(v => v.toFixed(2))),
+        texttemplate: '%{text}',
+        textfont: { size: 10 },
+        showscale: true,
+      }], {
+        ...PLOT_LAYOUT, height: 380,
+        title: { text: '模型预测相关性 (高相关 = 集成增益小)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, side: 'bottom' },
+        yaxis: { ...PLOT_LAYOUT.yaxis, autorange: 'reversed' },
+        margin: { l: 140, r: 24, t: 36, b: 80 },
+      }, PLOT_CONFIG);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  Backtest comparison (per model + tuned)
+  // ════════════════════════════════════════════════════════════════════════
+  const BC = D.backtest_comparison;
+  if (!BC || (!BC.baselines && !BC.tuned)) {
+    const w = document.getElementById('bt_warning');
+    w.style.display = 'block';
+    w.innerHTML = '<b>回测对比数据尚未生成</b> — 请运行 ' +
+      '<code>./venv/Scripts/python -m model_compare.run_backtests --tune</code>';
+    document.getElementById('tbl_bt_compare').innerHTML = '';
+    document.getElementById('plot_bt_sharpe').innerHTML = '';
+    document.getElementById('plot_bt_cagr_mdd').innerHTML = '';
+  } else {
+    function renderBT(view) {
+      const rows = (view === 'tuned') ? (BC.tuned || []) : (BC.baselines || []);
+      if (!rows.length) {
+        document.getElementById('tbl_bt_compare').innerHTML =
+          '<tr><td style="color:var(--muted);padding:10px;">该视图无数据 (tuned 阶段尚未完成或未运行)</td></tr>';
+        return;
+      }
+      // sort by sharpe desc
+      const sorted = [...rows].sort((a,b) => (b.sharpe||0) - (a.sharpe||0));
+      const showTune = view === 'tuned';
+      let h = `<thead><tr>
+        <th>模型</th>
+        ${showTune ? '<th>tp</th><th>sl</th><th>max_hold</th>' : ''}
+        <th>CAGR%</th><th>Sharpe</th><th>MDD%</th>
+        <th>Vol%</th><th>α 年化%</th><th>β</th><th>IR</th>
+        <th>胜率%</th><th>交易笔数</th><th>最终净值</th>
+      </tr></thead><tbody>`;
+      sorted.forEach((r, i) => {
+        const cls = i === 0 ? 'good' : (r.name && r.name.startsWith('ensemble') ? 'warn' : '');
+        const bg = r.name && r.name.startsWith('ensemble') ? 'background:rgba(218,153,34,.08);' : '';
+        h += `<tr style="${bg}">
+          <td><b>${r.name}</b>${i === 0 ? ' 🏆' : ''}</td>
+          ${showTune ? `<td>${(r.tp||0).toFixed(3)}</td><td>${(r.sl||0).toFixed(3)}</td><td>${r.max_hold||0}</td>` : ''}
+          <td class="${cls}">${r.cagr != null ? r.cagr.toFixed(2) : '—'}</td>
+          <td class="${cls}">${r.sharpe != null ? r.sharpe.toFixed(2) : '—'}</td>
+          <td class="bad">${r.mdd != null ? r.mdd.toFixed(2) : '—'}</td>
+          <td>${r.vol_ann != null ? r.vol_ann.toFixed(2) : '—'}</td>
+          <td>${r.alpha_ann != null ? r.alpha_ann.toFixed(2) : '—'}</td>
+          <td>${r.beta != null ? r.beta.toFixed(2) : '—'}</td>
+          <td>${r.info_ratio != null ? r.info_ratio.toFixed(2) : '—'}</td>
+          <td>${r.hit_rate != null ? r.hit_rate.toFixed(1) : '—'}</td>
+          <td>${r.n_trades != null ? r.n_trades.toLocaleString() : '—'}</td>
+          <td>${r.final_nav != null ? Math.round(r.final_nav).toLocaleString() : '—'}</td>
+        </tr>`;
+      });
+      h += '</tbody>';
+      document.getElementById('tbl_bt_compare').innerHTML = h;
+
+      // Sharpe bar
+      Plotly.newPlot('plot_bt_sharpe', [{
+        type: 'bar', orientation: 'h',
+        x: sorted.map(r => r.sharpe || 0),
+        y: sorted.map(r => r.name),
+        marker: { color: sorted.map(r =>
+          r.name && r.name.startsWith('ensemble') ? '#d29922' : '#58a6ff') },
+        text: sorted.map(r => (r.sharpe || 0).toFixed(2)),
+        textposition: 'outside',
+      }], {
+        ...PLOT_LAYOUT, height: 320,
+        title: { text: 'Sharpe (越高越好)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, title: 'Sharpe' },
+        yaxis: { ...PLOT_LAYOUT.yaxis, automargin: true, tickfont: { size: 11 } },
+        margin: { l: 140, r: 20, t: 36, b: 40 },
+      }, PLOT_CONFIG);
+
+      // CAGR vs MDD scatter
+      Plotly.newPlot('plot_bt_cagr_mdd', [{
+        x: sorted.map(r => Math.abs(r.mdd || 0)),
+        y: sorted.map(r => r.cagr || 0),
+        mode: 'markers+text',
+        type: 'scatter',
+        text: sorted.map(r => r.name.replace('ensemble_', 'ens_').replace('xgb_', '')),
+        textposition: 'top center',
+        marker: {
+          color: sorted.map(r => r.name && r.name.startsWith('ensemble') ? '#d29922' : '#58a6ff'),
+          size: sorted.map(r => Math.min(28, 10 + (r.sharpe || 0) * 2)),
+        },
+      }], {
+        ...PLOT_LAYOUT, height: 320,
+        title: { text: 'CAGR vs MDD (越往左上越好, 点大小=Sharpe)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, title: '|MDD| %' },
+        yaxis: { ...PLOT_LAYOUT.yaxis, title: 'CAGR %' },
+      }, PLOT_CONFIG);
+    }
+    renderBT('baseline');
+    document.getElementById('bt_view').addEventListener('change', e => renderBT(e.target.value));
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  Multi-horizon (T+1 → T+5) per-stock forecast trajectory
+  // ════════════════════════════════════════════════════════════════════════
+  const MH = D.multihorizon;
+  if (!MH || Object.keys(MH).length === 0) {
+    const w = document.getElementById('mh_warning');
+    w.style.display = 'block';
+    w.innerHTML = '<b>5天预测数据尚未生成</b> — 请运行 ' +
+      '<code>./venv/Scripts/python -m xgbmodel.train_multihorizon</code> 然后 ' +
+      '<code>./venv/Scripts/python -m xgbmodel.predict_multihorizon</code>';
+    document.getElementById('tbl_mh').innerHTML = '';
+    document.getElementById('plot_mh_top10').innerHTML = '';
+    document.getElementById('plot_mh_engine_compare').innerHTML = '';
+  } else {
+    const mhEngineSel = document.getElementById('mh_engine');
+    const mhSortSel   = document.getElementById('mh_sort');
+    const mhDirSel    = document.getElementById('mh_direction');
+    const mhMeta      = document.getElementById('mh_meta');
+
+    // Populate engine selector
+    Object.values(MH).forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.engine; opt.textContent = m.engine_label || m.engine;
+      mhEngineSel.appendChild(opt);
+    });
+
+    function fmtSign(x, dp=2) {
+      if (x === null || x === undefined || Number.isNaN(x)) return '—';
+      const s = (x >= 0 ? '+' : '') + x.toFixed(dp);
+      return `<span class="${x >= 0 ? 'good' : 'bad'}">${s}</span>`;
+    }
+
+    function trajectorySpark(preds, h=20, w=80) {
+      // Mini SVG sparkline with bars (one per horizon).
+      const max = Math.max(...preds.map(Math.abs), 0.1);
+      const barW = w / preds.length;
+      let bars = '';
+      preds.forEach((v, i) => {
+        const bh = Math.max(1, Math.abs(v) / max * (h * 0.45));
+        const y0 = h * 0.5;
+        const y  = v >= 0 ? y0 - bh : y0;
+        const fill = v >= 0 ? '#da3633' : '#2ea043';
+        bars += `<rect x="${i*barW+1}" y="${y}" width="${barW-2}" height="${bh}" fill="${fill}"/>`;
+      });
+      // Zero line
+      bars += `<line x1="0" y1="${h*0.5}" x2="${w}" y2="${h*0.5}" stroke="#2a313c" stroke-width="0.5"/>`;
+      return `<svg width="${w}" height="${h}" style="vertical-align:middle">${bars}</svg>`;
+    }
+
+    function renderMH() {
+      const eng = mhEngineSel.value;
+      const sort = mhSortSel.value;
+      const dir  = mhDirSel.value;
+      const data = MH[eng];
+      if (!data) return;
+      mhMeta.textContent = `特征日 ${data.feature_date} · 共 ${data.n_stocks.toLocaleString()} 只股票`;
+
+      let rows = data.rows.slice().sort((a,b) => (b[sort] ?? -1e9) - (a[sort] ?? -1e9));
+      if (dir === 'bottom') rows = rows.reverse();
+      const top = rows.slice(0, 30);
+
+      // Table
+      let h = `<thead><tr>
+        <th>排名</th><th>代码</th><th>名称</th>
+        <th>D1</th><th>D2</th><th>D3</th><th>D4</th><th>D5</th>
+        <th>5日均值</th><th>5日峰值</th><th>斜率</th><th>轨迹</th>
+      </tr></thead><tbody>`;
+      top.forEach((r, i) => {
+        const trajPreds = [r.pred_d1, r.pred_d2, r.pred_d3, r.pred_d4, r.pred_d5];
+        h += `<tr>
+          <td>${i+1}</td>
+          <td><b>${r.ts_code}</b></td>
+          <td>${r.name || ''}</td>
+          <td>${fmtSign(r.pred_d1)}</td>
+          <td>${fmtSign(r.pred_d2)}</td>
+          <td>${fmtSign(r.pred_d3)}</td>
+          <td>${fmtSign(r.pred_d4)}</td>
+          <td>${fmtSign(r.pred_d5)}</td>
+          <td>${fmtSign(r.mean5)}</td>
+          <td>${fmtSign(r.max5)}</td>
+          <td>${fmtSign(r.slope, 3)}</td>
+          <td>${trajectorySpark(trajPreds)}</td>
+        </tr>`;
+      });
+      h += '</tbody>';
+      document.getElementById('tbl_mh').innerHTML = h;
+
+      // Plot 1: top-10 trajectories (line per stock)
+      const top10 = top.slice(0, 10);
+      const traces = top10.map((r, i) => ({
+        x: ['D1','D2','D3','D4','D5'],
+        y: [r.pred_d1, r.pred_d2, r.pred_d3, r.pred_d4, r.pred_d5],
+        type: 'scatter', mode: 'lines+markers',
+        name: `${r.ts_code} ${r.name || ''}`,
+        hovertemplate: '%{x}: %{y:+.2f}%<extra>%{fullData.name}</extra>',
+      }));
+      Plotly.newPlot('plot_mh_top10', traces, {
+        ...PLOT_LAYOUT, height: 360,
+        title: { text: `${data.engine_label} 排名前10的5日预测轨迹 (按 ${sort} 排序)`, font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, title: '未来交易日' },
+        yaxis: { ...PLOT_LAYOUT.yaxis, title: '预测超额收益 (%)', zeroline: true, zerolinecolor: '#7d8590' },
+        legend: { font: { size: 9 }, x: 1.02, y: 1 },
+        margin: { l: 56, r: 220, t: 36, b: 40 },
+      }, PLOT_CONFIG);
+
+      // Plot 2: engine consensus on top-10 (mean across engines per horizon)
+      // For each top-10 stock, plot mean prediction across the 3 engines side-by-side
+      const allEngines = Object.values(MH);
+      const consensusTraces = ['D1','D2','D3','D4','D5'].map((dh, hi) => {
+        const meanPerEng = allEngines.map(eMd => {
+          const allRows = eMd.rows;
+          // average prediction at this horizon across all stocks (top 100 by mean5)
+          const top100 = allRows.slice().sort((a,b) => (b.mean5||-1e9) - (a.mean5||-1e9)).slice(0, 100);
+          const avg = top100.reduce((s, r) => s + (r[`pred_d${hi+1}`] || 0), 0) / Math.max(top100.length, 1);
+          return avg;
+        });
+        return {
+          x: allEngines.map(eMd => eMd.engine_label),
+          y: meanPerEng,
+          name: dh, type: 'bar',
+        };
+      });
+      Plotly.newPlot('plot_mh_engine_compare', consensusTraces, {
+        ...PLOT_LAYOUT, height: 360,
+        title: { text: '前100只股票的5日预测均值 (各引擎对比)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis },
+        yaxis: { ...PLOT_LAYOUT.yaxis, title: '预测超额收益 (%)' },
+        barmode: 'group',
+      }, PLOT_CONFIG);
+    }
+    mhEngineSel.addEventListener('change', renderMH);
+    mhSortSel.addEventListener('change', renderMH);
+    mhDirSel.addEventListener('change', renderMH);
+    renderMH();
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  Per-engine top picks + cross-engine consensus (single-horizon, T+1)
+  // ════════════════════════════════════════════════════════════════════════
+  const PE  = D.per_engine_singlehorizon || {};
+  const ENS = D.ensemble_singlehorizon;
+  const CON = D.consensus_singlehorizon;
+  if (Object.keys(PE).length === 0) {
+    const w = document.getElementById('pe_warning');
+    w.style.display = 'block';
+    w.innerHTML = '<b>各引擎预测尚未生成</b> — 请先运行 ' +
+      '<code>./venv/Scripts/python -m model_compare.refit_canonical</code>';
+    document.getElementById('tbl_per_engine').innerHTML = '';
+    document.getElementById('tbl_consensus').innerHTML  = '';
+  } else {
+    // Per-engine Top 5 table
+    function fmtSign(x, dp=2) {
+      if (x === null || x === undefined || Number.isNaN(x)) return '—';
+      const s = (x >= 0 ? '+' : '') + x.toFixed(dp);
+      return `<span class="${x >= 0 ? 'good' : 'bad'}">${s}</span>`;
+    }
+    const engineKeys = ['xgb','xgb_default','xgb_shallow','xgb_strong_reg','xgb_deep','lightgbm','catboost']
+      .filter(k => PE[k]);
+    let h = `<thead><tr>
+      <th>引擎</th>
+      <th>排名 #1</th><th>#2</th><th>#3</th><th>#4</th><th>#5</th>
+    </tr></thead><tbody>`;
+    engineKeys.forEach(k => {
+      const e = PE[k];
+      const top5 = e.top30.slice(0, 5);
+      h += `<tr><td><b>${e.engine_label}</b></td>`;
+      top5.forEach(r => {
+        h += `<td><b>${r.ts_code}</b> ${r.name ? '('+r.name+')' : ''}<br>
+              <span style="font-size:11px">${fmtSign(r.pred_pct_chg_next)}</span></td>`;
+      });
+      while (h.split('<td>').length - 1 < 6) h += '<td>—</td>';
+      h += '</tr>';
+    });
+    h += '</tbody>';
+    document.getElementById('tbl_per_engine').innerHTML = h;
+
+    // Cross-engine consensus table
+    if (CON && CON.rows && CON.rows.length) {
+      let c = `<thead><tr>
+        <th>排名</th><th>代码</th><th>名称</th>
+        <th>票数</th><th>均值 μ</th><th>平均排名</th>
+      </tr></thead><tbody>`;
+      const total = CON.n_engines;
+      CON.rows.slice(0, 40).forEach((r, i) => {
+        const voteRatio = r.votes / total;
+        const cls = voteRatio >= 0.83 ? 'good' : (voteRatio >= 0.5 ? 'warn' : '');
+        c += `<tr>
+          <td>${i+1}</td>
+          <td><b>${r.ts_code}</b></td>
+          <td>${r.name||''}</td>
+          <td><span class="${cls}">${r.votes}/${total}</span></td>
+          <td>${fmtSign(r.mean_pred)}</td>
+          <td>${(r.avg_rank||0).toFixed(1)}</td>
+        </tr>`;
+      });
+      c += '</tbody>';
+      document.getElementById('tbl_consensus').innerHTML = c;
+    }
+  }
+
+  // ─── 全部预测 + dropdown trend chart ──────────────────────────────────
+  (function initAllPredictions() {
+    const baseLiveTable = (P.live_table || []).slice();
+    const slim = D.slim_trends || {};
+    const labels = D.slim_feature_labels || {};
+    if (baseLiveTable.length === 0) return;
+
+    // Build engine selector options. Default = ensemble.
+    const engineSel = document.getElementById('all_engine');
+    if (engineSel) {
+      const engineOptions = [];
+      if (ENS) {
+        engineOptions.push({value: 'ensemble', label: ENS.engine_label || '集成 (6引擎均值, 默认)'});
+      }
+      const order = ['xgb','xgb_default','xgb_shallow','xgb_strong_reg','xgb_deep','lightgbm','catboost'];
+      order.forEach(k => {
+        if (PE[k]) engineOptions.push({value: k, label: PE[k].engine_label || k});
+      });
+      engineSel.innerHTML = engineOptions
+        .map(o => `<option value="${o.value}"${o.value==='ensemble' ? ' selected' : ''}>${o.label}</option>`)
+        .join('');
+    }
+
+    // Current engine's prediction table — overlays predictions onto baseLiveTable
+    // (which already has board / exchange / province metadata from P.live_table).
+    let currentEngine = 'ensemble';
+    let liveTable = baseLiveTable.slice();
+
+    function buildLiveForEngine(engineKey) {
+      // Build a {ts_code: pred} map for the selected engine, then merge onto
+      // the base meta rows (preserving board/exchange/province).
+      let predMap = {};
+      let preStdMap = {};
+      let voteMap = {};
+      if (engineKey === 'ensemble' && ENS) {
+        ENS.rows.forEach(r => {
+          predMap[r.ts_code] = r.pred_pct_chg_next;
+          preStdMap[r.ts_code] = r.pred_std;
+          // ensemble_score is 0..1 percentile; we surface it via prob_up slot
+        });
+      } else if (PE[engineKey]) {
+        PE[engineKey].rows.forEach(r => {
+          predMap[r.ts_code] = r.pred_pct_chg_next;
+        });
+      }
+      // Vote map (consensus) — show as a small badge
+      if (CON && CON.rows) {
+        CON.rows.forEach(r => { voteMap[r.ts_code] = r.votes; });
+      }
+      return baseLiveTable.map(r => ({
+        ...r,
+        pred_pct_chg_next: predMap[r.ts_code] !== undefined ? predMap[r.ts_code] : r.pred_pct_chg_next,
+        pred_std: preStdMap[r.ts_code],
+        votes:    voteMap[r.ts_code] || 0,
+      })).filter(r => predMap[r.ts_code] !== undefined || engineKey === 'ensemble');
+    }
+    if (Object.keys(PE).length > 0 || ENS) {
+      liveTable = buildLiveForEngine('ensemble');
+    }
+
+    document.getElementById('all_n').textContent = `N=${liveTable.length}`;
+
+    // Datalist for the dropdown picker
+    const dl = document.getElementById('trend_picker_options');
+    dl.innerHTML = liveTable
+      .map(r => `<option value="${r.ts_code}">${r.ts_code} — ${r.name||''}</option>`)
+      .join('');
+
+    // Filter selects (board / exchange)
+    const boards = Array.from(new Set(liveTable.map(r => r.board_en).filter(Boolean))).sort();
+    const exchs  = Array.from(new Set(liveTable.map(r => r.exchange).filter(Boolean))).sort();
+    const fbBoard = document.getElementById('all_filter_board');
+    const fbExch = document.getElementById('all_filter_exch');
+    boards.forEach(b => fbBoard.insertAdjacentHTML('beforeend', `<option value="${b}">${b}</option>`));
+    exchs.forEach(b => fbExch.insertAdjacentHTML('beforeend', `<option value="${b}">${b}</option>`));
+
+    // Sortable / filterable table
+    let sortKey = 'pred_pct_chg_next';
+    let sortDir = -1;
+    let visibleRows = liveTable.slice();
+
+    function applyFilters() {
+      const q = document.getElementById('all_search').value.trim().toLowerCase();
+      const fb = fbBoard.value;
+      const fe = fbExch.value;
+      const fd = document.getElementById('all_filter_dir').value;
+      visibleRows = liveTable.filter(r => {
+        if (q && !(r.ts_code.toLowerCase().includes(q) || (r.name||'').toLowerCase().includes(q))) return false;
+        if (fb !== 'all' && r.board_en !== fb) return false;
+        if (fe !== 'all' && r.exchange !== fe) return false;
+        if (fd === 'up' && !(r.pred_pct_chg_next > 0)) return false;
+        if (fd === 'strong_up' && !(r.pred_pct_chg_next > 1)) return false;
+        if (fd === 'down' && !(r.pred_pct_chg_next < 0)) return false;
+        return true;
+      });
+      visibleRows.sort((a,b) => {
+        const av = a[sortKey], bv = b[sortKey];
+        if (typeof av === 'string') return (av||'').localeCompare(bv||'') * sortDir;
+        return ((av ?? -1e9) - (bv ?? -1e9)) * sortDir;
+      });
+      renderAllTable();
+    }
+
+    function renderAllTable() {
+      const cnt = document.getElementById('all_count');
+      cnt.textContent = `· 显示 ${Math.min(visibleRows.length, 500).toLocaleString()} / ${liveTable.length.toLocaleString()} 行`;
+      const display = visibleRows.slice(0, 500);
+      const usingEnsemble = (currentEngine === 'ensemble');
+      let h = `<thead><tr>
+        <th data-key="ts_code">代码</th>
+        <th data-key="name">名称</th>
+        <th data-key="board_en">板块</th>
+        <th data-key="exchange">所</th>
+        <th data-key="province">省</th>
+        <th data-key="pred_pct_chg_next">μ (%)</th>
+        ${usingEnsemble ? '<th data-key="pred_std">σ 引擎间</th>' : ''}
+        <th data-key="votes">共识 /6</th>
+      </tr></thead><tbody>`;
+      for (const r of display) {
+        const cls = r.pred_pct_chg_next >= 0 ? 'good' : 'bad';
+        const pred = r.pred_pct_chg_next != null ? r.pred_pct_chg_next.toFixed(2) : '—';
+        const std  = r.pred_std != null ? r.pred_std.toFixed(2) : '—';
+        const votes = r.votes ? r.votes : 0;
+        const voteCls = votes >= 5 ? 'good' : (votes >= 3 ? 'warn' : '');
+        h += `<tr>
+          <td><a href="#" data-pick="${r.ts_code}" style="color:var(--accent);text-decoration:none">${r.ts_code}</a></td>
+          <td>${r.name||''}</td>
+          <td>${r.board_en||''}</td>
+          <td>${r.exchange||''}</td>
+          <td>${r.province||''}</td>
+          <td class="${cls}">${pred}</td>
+          ${usingEnsemble ? `<td>${std}</td>` : ''}
+          <td><span class="${voteCls}">${votes ? votes + '/6' : '—'}</span></td>
+        </tr>`;
+      }
+      h += '</tbody>';
+      const tbl = document.getElementById('tbl_all_predictions');
+      tbl.innerHTML = h;
+      if (visibleRows.length > 500) {
+        const ncols = usingEnsemble ? 8 : 7;
+        tbl.querySelector('tbody').insertAdjacentHTML('beforeend',
+          `<tr><td colspan="${ncols}" style="text-align:center;color:var(--muted);padding:14px">
+            显示前 500 行 — 继续筛选可缩小范围</td></tr>`);
+      }
+      // Sort handlers
+      tbl.querySelectorAll('th[data-key]').forEach(th => {
+        th.onclick = () => {
+          const k = th.dataset.key;
+          if (sortKey === k) sortDir = -sortDir;
+          else { sortKey = k; sortDir = (k === 'ts_code' || k === 'name' || k === 'province' || k === 'board_en' || k === 'exchange') ? 1 : -1; }
+          applyFilters();
+        };
+      });
+      // ts_code click → pick stock for trend
+      tbl.querySelectorAll('a[data-pick]').forEach(a => {
+        a.onclick = (e) => {
+          e.preventDefault();
+          const tc = a.dataset.pick;
+          document.getElementById('trend_picker_input').value = tc;
+          renderTrendFor(tc);
+          document.getElementById('trend_chart_panel').scrollIntoView({behavior:'smooth', block:'start'});
+        };
+      });
+    }
+
+    document.getElementById('all_search').oninput = applyFilters;
+    fbBoard.onchange = applyFilters;
+    fbExch.onchange = applyFilters;
+    document.getElementById('all_filter_dir').onchange = applyFilters;
+    if (engineSel) {
+      engineSel.onchange = () => {
+        currentEngine = engineSel.value;
+        liveTable = buildLiveForEngine(currentEngine);
+        document.getElementById('all_n').textContent = `N=${liveTable.length}`;
+        applyFilters();
+      };
+    }
+
+    // ─── Trend chart rendering ──────────────────────────────────────────
+    function renderTrendFor(tsCode) {
+      const status = document.getElementById('trend_picker_status');
+      const panel = document.getElementById('trend_chart_panel');
+      const trend = slim[tsCode];
+      const liveRow = liveTable.find(r => r.ts_code === tsCode);
+      if (!trend) {
+        status.innerHTML = `<span style="color:var(--bad)">${tsCode}: 无趋势数据</span>`;
+        panel.style.display = 'none';
+        return;
+      }
+      const name = liveRow ? liveRow.name : '';
+      const pred = liveRow && liveRow.pred_pct_chg_next != null ? liveRow.pred_pct_chg_next.toFixed(2) : '—';
+      const probUp = liveRow && liveRow.prob_up != null ? (liveRow.prob_up*100).toFixed(0) : '—';
+      status.innerHTML = `<span style="color:var(--good)">已选: ${tsCode} ${name}</span>`;
+      document.getElementById('trend_chart_title').textContent = `${tsCode} ${name}`;
+      const cls = parseFloat(pred) >= 0 ? 'good' : 'bad';
+      document.getElementById('trend_chart_sub').innerHTML =
+        `次日预测 μ = <b class="${cls}">${pred}%</b> · P(up) = ${probUp}% · 30 日特征趋势`;
+      panel.style.display = 'block';
+
+      const layoutBase = {
+        paper_bgcolor:'#1c232e', plot_bgcolor:'#1c232e',
+        font:{color:'#c9d1d9', family:'PingFang SC, Microsoft YaHei, sans-serif', size:11},
+        margin:{l:50, r:20, t:32, b:36},
+        xaxis:{gridcolor:'#2a313c', tickfont:{size:10}},
+        yaxis:{gridcolor:'#2a313c', tickfont:{size:10}},
+        showlegend:false,
+      };
+      const cfg = { displayModeBar:false, responsive:true };
+
+      function plot(divId, label, key, color, opts) {
+        const y = trend[key];
+        if (!y || y.every(v => v === null)) {
+          document.getElementById(divId).innerHTML =
+            `<div style="color:var(--muted);text-align:center;padding:80px 0;font-size:11px">${label}: 无数据</div>`;
+          return;
+        }
+        Plotly.newPlot(divId, [{
+          x: trend.dates, y: y, type:'scatter', mode:'lines+markers',
+          line:{color:color, width:1.6}, marker:{size:3, color:color},
+          hovertemplate: '%{x}<br>'+label+': %{y}<extra></extra>',
+        }], {...layoutBase, title:{text:label, font:{size:12}}, ...(opts||{})}, cfg);
+      }
+      plot('plot_trend_close',    labels.close            || '收盘价',         'close',           '#58a6ff');
+      plot('plot_trend_pct',      labels.pct_chg          || '日涨跌幅 %',     'pct_chg',         '#da3633',
+        {yaxis:{...layoutBase.yaxis, ticksuffix:'%', zeroline:true, zerolinecolor:'#3d4654'}});
+      plot('plot_trend_turnover', labels.turnover_rate_f  || '换手率 %',       'turnover_rate_f', '#d29922',
+        {yaxis:{...layoutBase.yaxis, ticksuffix:'%'}});
+      plot('plot_trend_rsi',      labels.rsi_14           || 'RSI(14)',       'rsi_14',          '#7c3aed',
+        {yaxis:{...layoutBase.yaxis, range:[0,100]}});
+      plot('plot_trend_volratio', labels.vol_ratio_20     || '量比/20日均',    'vol_ratio_20',    '#16a34a');
+    }
+
+    // Wire input — react when user types/selects from datalist
+    const picker = document.getElementById('trend_picker_input');
+    picker.addEventListener('change', () => {
+      const v = picker.value.trim().toUpperCase();
+      // Allow either pure code or "code — name" formats
+      const m = v.match(/[0-9]{6}\.(?:SH|SZ|BJ)/);
+      if (m) renderTrendFor(m[0]);
+    });
+    picker.addEventListener('input', () => {
+      const v = picker.value.trim().toUpperCase();
+      const m = v.match(/[0-9]{6}\.(?:SH|SZ|BJ)/);
+      if (m && slim[m[0]]) renderTrendFor(m[0]);
+    });
+
+    // Default: select the top-1 prediction so the panel is populated on first load
+    if (liveTable.length) {
+      const top1 = liveTable.slice().sort((a,b)=>(b.pred_pct_chg_next||-1) - (a.pred_pct_chg_next||-1))[0];
+      if (top1 && slim[top1.ts_code]) {
+        document.getElementById('trend_picker_input').value = top1.ts_code;
+        renderTrendFor(top1.ts_code);
+      }
+    }
+    applyFilters();
+  })();
+
+}).catch(err => {
+  console.error(err);
+  document.getElementById('hdr-sub').innerHTML =
+    '<span style="color:var(--bad)">加载失败 — 请运行 <code>./venv/Scripts/python -m dashboard.build_predictions</code></span>';
+});
+</script>
+</body>
+</html>

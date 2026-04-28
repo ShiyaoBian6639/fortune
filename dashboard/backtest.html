@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>XGB 马科维茨纯多头组合回测</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg:        #0e1117;
+    --panel:     #161b22;
+    --panel2:    #1c232e;
+    --border:    #2a313c;
+    --text:      #c9d1d9;
+    --muted:     #7d8590;
+    --accent:    #58a6ff;
+    /* A股习惯：红涨绿跌 */
+    --up:        #da3633;
+    --down:      #2ea043;
+    --good:      #da3633;
+    --bad:       #2ea043;
+    --warn:      #d29922;
+    --tp:        #da3633;
+    --sl:        #2ea043;
+    --hz:        #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 0; line-height: 1.6;
+  }
+  header {
+    background: linear-gradient(180deg, #2a1a1c 0%, #0e1117 100%);
+    padding: 28px 40px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 26px; font-weight: 700; letter-spacing: 1px; }
+  header p  { margin: 0; color: var(--muted); font-size: 13px; }
+  header .badge {
+    display: inline-block; padding: 2px 8px; margin-left: 8px;
+    background: rgba(218,54,51,.15); color: var(--up);
+    border: 1px solid rgba(218,54,51,.4); border-radius: 4px;
+    font-size: 11px; font-weight: 500;
+  }
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 8px 40px; overflow-x: auto; white-space: nowrap;
+  }
+  nav a {
+    display: inline-block; padding: 6px 14px; margin-right: 4px;
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    border-radius: 4px;
+  }
+  nav a:hover { background: var(--panel2); color: var(--text); }
+  section { padding: 28px 40px; border-bottom: 1px solid var(--border); }
+  section h2 { font-size: 19px; margin: 0 0 4px; }
+  section .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+  .cards {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; letter-spacing: .3px; }
+  .card .value {
+    font-size: 24px; font-weight: 600; margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .good { color: var(--good); }
+  .bad  { color: var(--bad);  }
+  .warn { color: var(--warn); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 1100px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  .plot {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; min-height: 360px;
+  }
+  .plot-title { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+  .plot-note  { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+  pre {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px; overflow-x: auto;
+    font-size: 12px; color: var(--text);
+  }
+  table.ttbl {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  }
+  table.ttbl th, table.ttbl td {
+    padding: 6px 10px; border-bottom: 1px solid var(--border);
+    text-align: left; font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  table.ttbl th {
+    background: var(--panel2); color: var(--muted);
+    font-weight: 500; cursor: pointer; user-select: none;
+    position: sticky; top: 0;
+  }
+  table.ttbl th:hover { color: var(--text); }
+  table.ttbl tr:hover td { background: var(--panel2); }
+  .reason-tp { color: var(--tp); font-weight: 600; }
+  .reason-sl { color: var(--sl); font-weight: 600; }
+  .reason-hz { color: var(--hz); font-weight: 600; }
+  .controls {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+    margin-bottom: 12px;
+  }
+  .controls input, .controls select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 10px; font-size: 13px;
+  }
+  .controls input:focus, .controls select:focus {
+    outline: none; border-color: var(--accent);
+  }
+  .scroll-table {
+    max-height: 600px; overflow: auto;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .scroll-table table.ttbl { border: 0; border-radius: 0; }
+  .pager {
+    display: flex; gap: 8px; align-items: center; margin-top: 8px;
+    color: var(--muted); font-size: 12px;
+  }
+  .pager button {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  .pager button:hover { border-color: var(--accent); }
+  .pager button:disabled { opacity: .4; cursor: not-allowed; }
+  .legend {
+    display: inline-flex; gap: 14px; margin-left: 12px;
+    font-size: 12px; color: var(--muted);
+  }
+  .legend .dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 4px; vertical-align: middle;
+  }
+  code { color: var(--accent); background: var(--panel2); padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>XGB 马科维茨纯多头组合回测 <span class="badge">QP 求解 / Ledoit-Wolf 协方差</span></h1>
+  <p id="hdr-sub">加载中…</p>
+</header>
+<nav>
+  <a href="index.html">← 预测看板</a>
+  <a href="#summary">策略概览</a>
+  <a href="#equity">净值曲线</a>
+  <a href="#risk">风险特征</a>
+  <a href="#exits">卖出原因</a>
+  <a href="#pred">原因 × 信号强度</a>
+  <a href="#stocks">个股贡献</a>
+  <a href="#timeline">个股买卖时点</a>
+  <a href="#trades">完整交易明细</a>
+  <a href="#raw">原始指标</a>
+</nav>
+
+<section id="summary">
+  <h2>策略概览</h2>
+  <p class="subtitle">
+    选股数 K = 10。μ 取自 XGBoost 的 OOF 预测（次日相对收益）。Σ 由 60 日滚动的真实
+    <code>pct_chg</code> 面板，经 Ledoit-Wolf 收缩估计得到。多头 QP 由 SciPy SLSQP 求解：
+    最小化 <code>0.5·λ·wᵀΣw − μᵀw</code>，约束 <code>Σwᵢ = 1, wᵢ ≥ 0</code>。
+    买入价为收盘价；止盈 +3% / 止损 −2% / 强平 5 日。
+  </p>
+  <div id="cards" class="cards"></div>
+  <div class="grid-2">
+    <div>
+      <h3 style="font-size:14px;margin:6px 0 8px;">策略 vs 沪深300</h3>
+      <div id="cards_strat" class="cards" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));"></div>
+    </div>
+    <div>
+      <h3 style="font-size:14px;margin:6px 0 8px;">交易质量</h3>
+      <div id="cards_trades" class="cards" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));"></div>
+    </div>
+  </div>
+</section>
+
+<section id="equity">
+  <h2>净值曲线与回撤</h2>
+  <p class="subtitle">起始净值 1,000,000 元人民币。基准为沪深300买入持有。</p>
+  <div class="plot" id="plot_equity"></div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_dd"></div>
+    <div class="plot" id="plot_pos"></div>
+  </div>
+</section>
+
+<section id="risk">
+  <h2>风险特征 (按时间轴)</h2>
+  <p class="subtitle">
+    每个点为一笔已平仓交易。横轴为出场日期，纵轴上图为单笔实现收益（%），下图为持仓天数。
+    红色 = 止盈出场，绿色 = 止损出场，黄色 = 强平到期。
+  </p>
+  <div class="plot" id="plot_ret_ts"></div>
+  <div class="plot" id="plot_hold_ts" style="margin-top:14px;"></div>
+</section>
+
+<section id="exits">
+  <h2>卖出原因</h2>
+  <p class="subtitle">
+    每笔仓位均因以下三种原因之一而平仓。判定使用日内最高价/最低价（同日同时触发时止盈优先）。
+  </p>
+  <div class="grid-2">
+    <div class="plot" id="plot_reasons" style="min-height:300px;"></div>
+    <div>
+      <table class="ttbl" id="tbl_reasons"></table>
+    </div>
+  </div>
+</section>
+
+<section id="pred">
+  <h2>卖出原因 × 预测强度分组</h2>
+  <p class="subtitle">
+    将每笔交易按入场时模型给出的 μ 值分到 10 个等分桶。桶号越高表示模型预测的次日相对收益越强。
+    柱状条为各原因的笔数堆叠，蓝色折线为该桶的平均实现收益（%）。
+  </p>
+  <div class="plot" id="plot_pred_decile" style="min-height:380px;"></div>
+</section>
+
+<section id="stocks">
+  <h2>个股贡献</h2>
+  <p class="subtitle">按累计实现盈亏排序。</p>
+  <div class="controls">
+    <label>筛选代码/名称：<input id="stk_filter" type="text" placeholder="例如 600519 或 茅台"></label>
+    <span class="legend"><span class="dot" style="background:var(--good)"></span>净盈利</span>
+    <span class="legend"><span class="dot" style="background:var(--bad)"></span>净亏损</span>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_stocks"></table>
+  </div>
+</section>
+
+<section id="timeline">
+  <h2>个股买卖时点 (2017 → 至今)</h2>
+  <p class="subtitle">
+    回测累计盈亏前 20 名个股。下拉框选择（鼠标点击或键盘输入代码均可跳转）后，
+    图中蓝色折线为该股 2017-01-01 起的收盘价，三角形标记为本策略每一次买入与卖出。
+    <span class="reason-tp">▲ 红</span> = 止盈卖出 / <span class="reason-sl">▲ 绿</span> = 止损卖出 /
+    <span class="reason-hz">▲ 黄</span> = 强平卖出 / <span style="color:#58a6ff;font-weight:600;">▲ 蓝</span> = 买入。
+    悬停查看每笔的价格、收益、盈亏与配对日期。
+  </p>
+  <div class="controls">
+    <label>选择个股：
+      <select id="tl_select" style="min-width:340px;font-size:13px;"></select>
+    </label>
+    <span id="tl_meta" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="plot" id="plot_timeline" style="min-height:520px;"></div>
+</section>
+
+<section id="trades">
+  <h2>完整交易明细 — 买入 &amp; 卖出时点</h2>
+  <p class="subtitle">
+    回测期间所有买入与卖出。<b>原因</b>列即每笔卖出的触发条件；<b>μ</b> 为入场时 XGBoost 的预测值；
+    <b>σ</b> 为该股 60 日实现波动率（%）；<b>权重</b>为 QP 求解给出的当日组合权重。点击表头排序。
+  </p>
+  <div class="controls">
+    <label>搜索：<input id="tr_search" type="text"
+        placeholder="代码、名称、原因 (take_profit/stop_loss/horizon)、日期前缀..."></label>
+    <label>原因：
+      <select id="tr_reason">
+        <option value="">全部</option>
+        <option value="take_profit">止盈</option>
+        <option value="stop_loss">止损</option>
+        <option value="horizon">强平</option>
+      </select>
+    </label>
+    <label>最小 |收益| %：<input id="tr_minret" type="number" step="0.1" value="0" style="width:80px"></label>
+    <span id="tr_count" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_trades"></table>
+  </div>
+  <div class="pager">
+    <button id="tr_prev">‹ 上一页</button>
+    <span id="tr_pageinfo"></span>
+    <button id="tr_next">下一页 ›</button>
+  </div>
+</section>
+
+<section id="raw">
+  <h2>原始指标</h2>
+  <p class="subtitle"><code>backtest/xgb_markowitz.py</code> 输出的原始文本。</p>
+  <pre id="metrics_text"></pre>
+</section>
+
+<script>
+const PLOT_LAYOUT = {
+  paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+  font: { color: '#c9d1d9', size: 11, family: '"PingFang SC","Microsoft YaHei",-apple-system,sans-serif' },
+  xaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  yaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  margin: { l: 60, r: 24, t: 40, b: 44 },
+  hovermode: 'closest',
+};
+const PLOT_CONFIG = { displaylogo: false, responsive: true };
+
+const REASON_CN = {
+  take_profit: '止盈',
+  stop_loss:   '止损',
+  horizon:     '强平',
+};
+const REASON_COLOR = {
+  take_profit: '#da3633',
+  stop_loss:   '#2ea043',
+  horizon:     '#d29922',
+};
+
+function fmtPct(x, dp=2)   { return (x*100).toFixed(dp) + '%'; }
+function fmtNum(x, dp=2)   { return Number(x).toLocaleString('en-US', { maximumFractionDigits: dp, minimumFractionDigits: dp }); }
+function fmtMoney(x)       { return Math.round(x).toLocaleString('en-US'); }
+function signClass(x)      { return x >= 0 ? 'good' : 'bad'; }
+
+function card(label, value, hint, cls='') {
+  return `<div class="card"><div class="label">${label}</div>` +
+         `<div class="value ${cls}">${value}</div>` +
+         (hint ? `<div class="hint">${hint}</div>` : '') + `</div>`;
+}
+
+// Embedded data wins over fetch — so a single-file build can bundle the JSON
+// inline and the same HTML still works when served alongside backtest_data.json.
+function getData() {
+  if (typeof window !== 'undefined' && window.BACKTEST_DATA) {
+    return Promise.resolve(window.BACKTEST_DATA);
+  }
+  return fetch('backtest_data.json').then(r => r.json());
+}
+
+getData().then(data => {
+  const m = data.metrics, t = data.trade_summary, R = data.reasons;
+
+  document.getElementById('hdr-sub').textContent =
+    `回测窗口 ${m.date_start} → ${m.date_end} (${m.years.toFixed(2)} 年)   ·   ` +
+    `初始净值 ${fmtMoney(m.initial)} 元   ·   ` +
+    `${data.trades.length.toLocaleString()} 笔交易 · ${data.per_stock.length.toLocaleString()} 只个股`;
+
+  // ── Headline cards ──────────────────────────────────────────────────────
+  document.getElementById('cards').innerHTML = [
+    card('最终净值', fmtMoney(m.final_nav) + ' 元',
+         `起始 ${fmtMoney(m.initial)}`, 'good'),
+    card('累计收益',     fmtPct(m.total_return, 1), '', signClass(m.total_return)),
+    card('年化收益 (CAGR)', fmtPct(m.cagr, 2), '', signClass(m.cagr)),
+    card('夏普 (rf=0)',   m.sharpe.toFixed(2), '年化波动 ' + fmtPct(m.vol_ann, 1)),
+    card('最大回撤',      fmtPct(m.max_drawdown, 1),
+         `${m.mdd_peak} → ${m.mdd_trough}`, 'bad'),
+    card('卡玛比率',      m.calmar ? m.calmar.toFixed(2) : '—'),
+    card('信息比率',      m.info_ratio.toFixed(2), '相对沪深300'),
+    card('年化 Alpha',   fmtPct(m.alpha_ann, 2),
+         `β = ${m.beta.toFixed(2)}`, signClass(m.alpha_ann)),
+  ].join('');
+
+  document.getElementById('cards_strat').innerHTML = [
+    card('策略年化',      fmtPct(m.cagr, 2), '', signClass(m.cagr)),
+    card('沪深300年化',   fmtPct(m.bench_cagr, 2), '', signClass(m.bench_cagr)),
+    card('策略最大回撤',  fmtPct(m.max_drawdown, 1), '', 'bad'),
+    card('沪深300回撤',   fmtPct(m.bench_mdd, 1), '', 'bad'),
+    card('策略波动',      fmtPct(m.vol_ann, 1)),
+    card('沪深300波动',   fmtPct(m.bench_vol, 1)),
+  ].join('');
+
+  document.getElementById('cards_trades').innerHTML = [
+    card('交易笔数',     t.n_trades.toLocaleString()),
+    card('胜率',         fmtPct(t.hit_rate, 1)),
+    card('平均盈利',     '+' + t.avg_win_pct.toFixed(2) + '%', '', 'good'),
+    card('平均亏损',     t.avg_loss_pct.toFixed(2) + '%', '', 'bad'),
+    card('盈亏比',       isFinite(t.profit_factor) ? t.profit_factor.toFixed(2) : '∞'),
+    card('中位持仓',     t.median_hold_days.toFixed(0) + ' 日'),
+  ].join('');
+
+  // ── Equity curve ────────────────────────────────────────────────────────
+  const eq = data.equity;
+  Plotly.newPlot('plot_equity', [
+    { x: eq.dates, y: eq.nav, name: 'XGB 马科维茨 QP 前10',
+      type: 'scatter', mode: 'lines', line: { color: '#da3633', width: 1.6 } },
+    { x: eq.dates, y: eq.csi300, name: '沪深300买入持有',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 1.2 } },
+  ], {
+    ...PLOT_LAYOUT, height: 420,
+    title: { text: '净值（元，对数轴）', font: { size: 13 } },
+    yaxis: { ...PLOT_LAYOUT.yaxis, type: 'log', title: '净值（对数）' },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    legend: { x: 0.01, y: 0.99 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  // ── Drawdown ────────────────────────────────────────────────────────────
+  const navArr = eq.nav, n = navArr.length;
+  const ddArr = new Array(n);
+  let peak = navArr[0];
+  for (let i = 0; i < n; i++) {
+    if (navArr[i] > peak) peak = navArr[i];
+    ddArr[i] = (navArr[i] / peak - 1) * 100;
+  }
+  const cArr = eq.csi300;
+  const cDD = new Array(n);
+  let cPeak = cArr[0];
+  for (let i = 0; i < n; i++) {
+    if (cArr[i] > cPeak) cPeak = cArr[i];
+    cDD[i] = (cArr[i] / cPeak - 1) * 100;
+  }
+  Plotly.newPlot('plot_dd', [
+    { x: eq.dates, y: ddArr, name: '策略回撤', fill: 'tozeroy',
+      type: 'scatter', mode: 'lines', line: { color: '#da3633', width: 1 } },
+    { x: eq.dates, y: cDD, name: '沪深300回撤',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 1 } },
+  ], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: '回撤 (%)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, ticksuffix: '%' },
+    legend: { x: 0.01, y: 0.05 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  // ── Position count + cash ──────────────────────────────────────────────
+  Plotly.newPlot('plot_pos', [
+    { x: eq.dates, y: eq.n_pos, name: '持仓数量', yaxis: 'y',
+      type: 'scatter', mode: 'lines', line: { color: '#58a6ff', width: 1 } },
+    { x: eq.dates, y: eq.cash.map(v => v / 1e4), name: '现金 (万元)',
+      yaxis: 'y2',
+      type: 'scatter', mode: 'lines', line: { color: '#d29922', width: 1 } },
+  ], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: '持仓数量与现金', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis:  { ...PLOT_LAYOUT.yaxis, title: '持仓数量' },
+    yaxis2: { ...PLOT_LAYOUT.yaxis, title: '现金 (万元)',
+              overlaying: 'y', side: 'right', showgrid: false },
+    legend: { x: 0.01, y: 0.99 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  // ── Risk profile: per-trade scatters keyed on exit_date ────────────────
+  const trades = data.trades;
+  const reasons = ['take_profit', 'stop_loss', 'horizon'];
+  function tradesBy(reason) {
+    return trades.filter(t => t.reason === reason);
+  }
+  function scatterTrace(reason, xKey, yKey) {
+    const sub = tradesBy(reason);
+    return {
+      x: sub.map(t => t[xKey]),
+      y: sub.map(t => t[yKey]),
+      type: 'scatter', mode: 'markers',
+      name: REASON_CN[reason] + ` (${sub.length.toLocaleString()})`,
+      marker: { color: REASON_COLOR[reason], size: 4, opacity: 0.55 },
+      text: sub.map(t => `${t.ts_code}  ${t.name || ''}<br>` +
+                          `入场 ${t.entry_date}  →  出场 ${t.exit_date}<br>` +
+                          `${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}  ` +
+                          `(${t.held_days} 日)<br>μ=${t.pred.toFixed(3)}  σ=${t.sigma.toFixed(2)}`),
+      hovertemplate: '<b>%{text}</b><br>%{xaxis.title.text}: %{x}<br>%{yaxis.title.text}: %{y}<extra></extra>',
+    };
+  }
+
+  Plotly.newPlot('plot_ret_ts', reasons.map(r => scatterTrace(r, 'exit_date', 'ret_pct')), {
+    ...PLOT_LAYOUT, height: 360,
+    title: { text: '单笔实现收益 (按出场日期)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date', title: '出场日期' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, title: '实现收益 (%)', ticksuffix: '%',
+             zeroline: true, zerolinecolor: '#7d8590', zerolinewidth: 1 },
+    legend: { x: 0.01, y: 0.99 },
+  }, PLOT_CONFIG);
+
+  Plotly.newPlot('plot_hold_ts', reasons.map(r => scatterTrace(r, 'exit_date', 'held_days')), {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: '持仓天数 (按出场日期)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date', title: '出场日期' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, title: '持仓天数', dtick: 1 },
+    legend: { x: 0.01, y: 0.99 },
+  }, PLOT_CONFIG);
+
+  // ── Reasons donut + table ──────────────────────────────────────────────
+  const total = R.take_profit + R.stop_loss + R.horizon;
+  Plotly.newPlot('plot_reasons', [{
+    type: 'pie',
+    labels: ['止盈 (+3%)', '止损 (−2%)', '强平 (5日收盘)'],
+    values: [R.take_profit, R.stop_loss, R.horizon],
+    marker: { colors: ['#da3633', '#2ea043', '#d29922'] },
+    hole: 0.55,
+    textinfo: 'label+percent',
+    textfont: { color: '#fff' },
+  }], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: `卖出原因构成（共 ${total.toLocaleString()} 笔）`, font: { size: 13 } },
+    showlegend: false,
+  }, PLOT_CONFIG);
+
+  document.getElementById('tbl_reasons').innerHTML = `
+    <thead><tr>
+      <th>原因</th><th>笔数</th><th>占比</th><th>触发条件</th>
+    </tr></thead>
+    <tbody>
+      <tr><td class="reason-tp">止盈</td>
+          <td>${R.take_profit.toLocaleString()}</td>
+          <td>${fmtPct(R.take_profit/total, 1)}</td>
+          <td>当日最高价 ≥ 入场价 × 1.03 → 以 +3% 价格卖出</td></tr>
+      <tr><td class="reason-sl">止损</td>
+          <td>${R.stop_loss.toLocaleString()}</td>
+          <td>${fmtPct(R.stop_loss/total, 1)}</td>
+          <td>当日最低价 ≤ 入场价 × 0.98 → 以 −2% 价格卖出</td></tr>
+      <tr><td class="reason-hz">强平</td>
+          <td>${R.horizon.toLocaleString()}</td>
+          <td>${fmtPct(R.horizon/total, 1)}</td>
+          <td>持仓 5 日未触发止盈/止损 → 收盘价卖出</td></tr>
+    </tbody>`;
+
+  // ── Reason × pred-decile ───────────────────────────────────────────────
+  if (data.pred_deciles && data.pred_deciles.deciles) {
+    const pd = data.pred_deciles;
+    const ridx = (name) => pd.reasons.indexOf(name);
+    const get  = (name) => ridx(name) >= 0 ? pd.counts.map(row => row[ridx(name)]) : pd.deciles.map(_=>0);
+    const traces = [
+      { x: pd.deciles, y: get('take_profit'), name: '止盈',
+        type: 'bar', marker: { color: '#da3633' } },
+      { x: pd.deciles, y: get('stop_loss'),   name: '止损',
+        type: 'bar', marker: { color: '#2ea043' } },
+      { x: pd.deciles, y: get('horizon'),     name: '强平',
+        type: 'bar', marker: { color: '#d29922' } },
+      { x: pd.deciles, y: pd.avg_ret_pct, name: '平均实现收益 %',
+        type: 'scatter', mode: 'lines+markers',
+        yaxis: 'y2', line: { color: '#58a6ff', width: 2 } },
+    ];
+    Plotly.newPlot('plot_pred_decile', traces, {
+      ...PLOT_LAYOUT, height: 380, barmode: 'stack',
+      title: { text: '各预测分组的卖出原因构成', font: { size: 13 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, title: '预测分组 (1=最弱 μ, 10=最强 μ)', dtick: 1 },
+      yaxis: { ...PLOT_LAYOUT.yaxis, title: '交易笔数' },
+      yaxis2: { ...PLOT_LAYOUT.yaxis, title: '平均实现收益 %',
+                overlaying: 'y', side: 'right', showgrid: false, ticksuffix: '%' },
+      legend: { x: 0.01, y: 0.99 },
+    }, PLOT_CONFIG);
+  }
+
+  // ── Per-stock table ───────────────────────────────────────────────────
+  const stocks = data.per_stock;
+  function renderStocks(filter='') {
+    const f = filter.trim().toLowerCase();
+    const rows = stocks.filter(r =>
+      !f || r.ts_code.toLowerCase().includes(f) ||
+            (r.name && r.name.toLowerCase().includes(f))
+    );
+    let html = `<thead><tr>
+      <th>代码</th><th>名称</th><th>笔数</th><th>胜次</th><th>胜率</th>
+      <th>累计盈亏</th><th>平均收益</th><th>首次买入</th><th>最后卖出</th>
+    </tr></thead><tbody>`;
+    for (const r of rows.slice(0, 500)) {
+      const cls = r.total_pnl >= 0 ? 'good' : 'bad';
+      html += `<tr>
+        <td>${r.ts_code}</td>
+        <td>${r.name || ''}</td>
+        <td>${r.trades}</td>
+        <td>${r.wins}</td>
+        <td>${(r.hit_rate*100).toFixed(1)}%</td>
+        <td class="${cls}">${fmtMoney(r.total_pnl)}</td>
+        <td class="${r.avg_ret>=0?'good':'bad'}">${r.avg_ret>=0?'+':''}${r.avg_ret.toFixed(2)}%</td>
+        <td>${r.first}</td>
+        <td>${r.last}</td>
+      </tr>`;
+    }
+    if (rows.length > 500) {
+      html += `<tr><td colspan="9" style="text-align:center;color:var(--muted);">
+        显示前 500 条，共 ${rows.length.toLocaleString()} 条 — 请细化筛选条件查看更多</td></tr>`;
+    }
+    html += '</tbody>';
+    document.getElementById('tbl_stocks').innerHTML = html;
+  }
+  renderStocks();
+  document.getElementById('stk_filter').addEventListener('input', e => renderStocks(e.target.value));
+
+  // ── Top-20 buy/sell timeline ──────────────────────────────────────────
+  const TL = data.top_timelines || [];
+  const tlSel  = document.getElementById('tl_select');
+  const tlMeta = document.getElementById('tl_meta');
+
+  // Populate dropdown — sorted by total P&L; option text shows code · name · pnl
+  TL.forEach((s, i) => {
+    const opt = document.createElement('option');
+    opt.value = s.ts_code;
+    const pnlSign = s.total_pnl >= 0 ? '+' : '';
+    opt.textContent = `${s.ts_code}  ${s.name || ''}  · ${s.n_trades}笔 · ${pnlSign}${fmtMoney(s.total_pnl)}元`;
+    tlSel.appendChild(opt);
+  });
+
+  const REASON_MARKER_COLOR = {
+    open:        '#58a6ff',  // 买入
+    take_profit: '#da3633',
+    stop_loss:   '#2ea043',
+    horizon:     '#d29922',
+  };
+  const REASON_MARKER_LABEL = {
+    open:        '买入',
+    take_profit: '止盈卖出',
+    stop_loss:   '止损卖出',
+    horizon:     '强平卖出',
+  };
+
+  function renderTimeline(ts_code) {
+    const s = TL.find(x => x.ts_code === ts_code);
+    if (!s) return;
+    tlMeta.textContent =
+      `${s.n_trades} 笔交易 · 胜率 ${(s.hit_rate*100).toFixed(1)}% · ` +
+      `累计盈亏 ${s.total_pnl >= 0 ? '+' : ''}${fmtMoney(s.total_pnl)} 元 · ` +
+      `价格序列 ${s.dates[0]} → ${s.dates[s.dates.length-1]} (${s.dates.length} 个交易日)`;
+
+    // Group events by reason for clean legend toggling
+    const groups = {};
+    for (const ev of s.events) {
+      const k = ev.type === 'buy' ? 'open' : ev.reason;
+      if (!groups[k]) groups[k] = [];
+      groups[k].push(ev);
+    }
+
+    function evTrace(reasonKey) {
+      const evs = groups[reasonKey] || [];
+      if (!evs.length) return null;
+      const isBuy = (reasonKey === 'open');
+      return {
+        x: evs.map(e => e.date),
+        y: evs.map(e => e.price),
+        type: 'scatter', mode: 'markers',
+        name: REASON_MARKER_LABEL[reasonKey] + ` (${evs.length})`,
+        marker: {
+          color: REASON_MARKER_COLOR[reasonKey],
+          symbol: isBuy ? 'triangle-up' : 'triangle-down',
+          size: 11,
+          line: { color: '#0e1117', width: 1 },
+          opacity: 0.92,
+        },
+        text: evs.map(e => {
+          const verb = isBuy ? '买入' : '卖出';
+          const pair = isBuy ? `预计出场 ${e.paired}` : `对应买入 ${e.paired}`;
+          const reasonLabel = isBuy ? '' : `<br>原因: ${REASON_MARKER_LABEL[reasonKey]}`;
+          const retLine = isBuy ? '' :
+                `<br>本笔收益: ${e.ret_pct >= 0 ? '+' : ''}${e.ret_pct.toFixed(2)}%` +
+                `<br>本笔盈亏: ${e.pnl >= 0 ? '+' : ''}${fmtMoney(e.pnl)} 元` +
+                `<br>持仓: ${e.held_days} 日`;
+          return `<b>${verb} @ ${e.price.toFixed(2)}</b><br>${pair}${reasonLabel}${retLine}`;
+        }),
+        hovertemplate: '%{text}<br>日期: %{x}<extra></extra>',
+      };
+    }
+
+    const traces = [{
+      x: s.dates, y: s.close,
+      type: 'scatter', mode: 'lines',
+      name: '收盘价',
+      line: { color: '#58a6ff', width: 1.2 },
+      hovertemplate: '%{x}<br>收盘 %{y:.2f}<extra></extra>',
+    }];
+    for (const k of ['open', 'take_profit', 'stop_loss', 'horizon']) {
+      const tr = evTrace(k);
+      if (tr) traces.push(tr);
+    }
+
+    Plotly.newPlot('plot_timeline', traces, {
+      ...PLOT_LAYOUT, height: 520,
+      title: { text: `${s.ts_code} ${s.name || ''} — 收盘价 + 本策略买卖时点`,
+               font: { size: 14 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date', title: '日期',
+               rangeslider: { visible: true, thickness: 0.06,
+                              bgcolor: '#1c232e', bordercolor: '#2a313c' } },
+      yaxis: { ...PLOT_LAYOUT.yaxis, title: '价格 (元)' },
+      legend: { x: 0.01, y: 0.99, orientation: 'h' },
+      hovermode: 'closest',
+    }, PLOT_CONFIG);
+  }
+
+  if (TL.length) {
+    tlSel.value = TL[0].ts_code;
+    renderTimeline(TL[0].ts_code);
+    tlSel.addEventListener('change', e => renderTimeline(e.target.value));
+  } else {
+    tlMeta.textContent = '(未找到 top_timelines 数据)';
+  }
+
+  // ── Trades table ──────────────────────────────────────────────────────
+  const TRADES = data.trades;
+  const PAGE_SIZE = 80;
+  let curPage = 0, curRows = TRADES;
+  const trBody = document.getElementById('tbl_trades');
+  const trCount = document.getElementById('tr_count');
+  const trPi    = document.getElementById('tr_pageinfo');
+
+  function renderTrades() {
+    const start = curPage * PAGE_SIZE;
+    const slice = curRows.slice(start, start + PAGE_SIZE);
+    let html = `<thead><tr>
+      <th data-k="entry_date">买入日</th>
+      <th data-k="exit_date">卖出日</th>
+      <th data-k="ts_code">代码</th>
+      <th>名称</th>
+      <th data-k="entry_price">买入价</th>
+      <th data-k="exit_price">卖出价</th>
+      <th data-k="held_days">持仓日</th>
+      <th data-k="ret_pct">收益 %</th>
+      <th data-k="pnl">盈亏 (元)</th>
+      <th data-k="reason">原因</th>
+      <th data-k="pred">μ 预测</th>
+      <th data-k="sigma">σ</th>
+      <th data-k="weight">权重</th>
+    </tr></thead><tbody>`;
+    for (const r of slice) {
+      const reasonClass = {
+        take_profit: 'reason-tp',
+        stop_loss:   'reason-sl',
+        horizon:     'reason-hz',
+      }[r.reason] || '';
+      const retClass = r.ret_pct >= 0 ? 'good' : 'bad';
+      const pnlClass = r.pnl     >= 0 ? 'good' : 'bad';
+      html += `<tr>
+        <td>${r.entry_date}</td>
+        <td>${r.exit_date}</td>
+        <td>${r.ts_code}</td>
+        <td>${r.name || ''}</td>
+        <td>${r.entry_price.toFixed(2)}</td>
+        <td>${r.exit_price.toFixed(2)}</td>
+        <td>${r.held_days}</td>
+        <td class="${retClass}">${r.ret_pct>=0?'+':''}${r.ret_pct.toFixed(2)}%</td>
+        <td class="${pnlClass}">${fmtMoney(r.pnl)}</td>
+        <td class="${reasonClass}">${REASON_CN[r.reason] || r.reason}</td>
+        <td>${r.pred.toFixed(3)}</td>
+        <td>${r.sigma.toFixed(2)}</td>
+        <td>${(r.weight*100).toFixed(1)}%</td>
+      </tr>`;
+    }
+    html += '</tbody>';
+    trBody.innerHTML = html;
+    const totalPages = Math.max(1, Math.ceil(curRows.length / PAGE_SIZE));
+    trPi.textContent = `第 ${curPage+1} / ${totalPages} 页`;
+    document.getElementById('tr_prev').disabled = curPage <= 0;
+    document.getElementById('tr_next').disabled = curPage >= totalPages - 1;
+    trCount.textContent = `${curRows.length.toLocaleString()} 笔匹配`;
+
+    trBody.querySelectorAll('th[data-k]').forEach(th => {
+      th.addEventListener('click', () => sortBy(th.dataset.k));
+    });
+  }
+  let sortKey = '', sortAsc = true;
+  function sortBy(k) {
+    if (sortKey === k) sortAsc = !sortAsc;
+    else { sortKey = k; sortAsc = (k === 'entry_date' || k === 'exit_date'); }
+    curRows.sort((a, b) => {
+      const av = a[k], bv = b[k];
+      if (av === bv) return 0;
+      return (av < bv ? -1 : 1) * (sortAsc ? 1 : -1);
+    });
+    curPage = 0; renderTrades();
+  }
+
+  function applyFilters() {
+    const q = document.getElementById('tr_search').value.trim().toLowerCase();
+    const r = document.getElementById('tr_reason').value;
+    const minR = Math.abs(parseFloat(document.getElementById('tr_minret').value) || 0);
+    curRows = TRADES.filter(t => {
+      if (r && t.reason !== r) return false;
+      if (Math.abs(t.ret_pct) < minR) return false;
+      if (q) {
+        const blob = `${t.ts_code} ${t.name || ''} ${t.reason} ${REASON_CN[t.reason] || ''} ${t.entry_date} ${t.exit_date}`.toLowerCase();
+        if (!blob.includes(q)) return false;
+      }
+      return true;
+    });
+    curPage = 0; renderTrades();
+  }
+  document.getElementById('tr_search').addEventListener('input', applyFilters);
+  document.getElementById('tr_reason').addEventListener('change', applyFilters);
+  document.getElementById('tr_minret').addEventListener('input', applyFilters);
+  document.getElementById('tr_prev').addEventListener('click', () => { if (curPage > 0) { curPage--; renderTrades(); } });
+  document.getElementById('tr_next').addEventListener('click', () => { curPage++; renderTrades(); });
+  renderTrades();
+
+  document.getElementById('metrics_text').textContent = data.metrics_text || '(未找到原始指标文本)';
+}).catch(err => {
+  console.error(err);
+  document.getElementById('hdr-sub').innerHTML =
+    '<span style="color:var(--bad)">加载 backtest_data.json 失败 — 请先运行 ' +
+    '<code>./venv/Scripts/python -m dashboard.build_backtest --tag qp</code></span>';
+});
+</script>
+</body>
+</html>

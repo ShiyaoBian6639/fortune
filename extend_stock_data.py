@@ -1,6 +1,7 @@
 """
 Extend Stock Data (Both Directions)
-- Downloads historical data from 2017-01-01 to the start of existing data
+- Downloads historical data from TARGET_START_DATE (1990-12-19, the earliest
+  A-share trading day) back-fill to the start of existing data
 - Downloads new data from the end of existing data to the most recent trading date
 - Combines with existing stock data
 - Preserves checkpoint for resume capability
@@ -22,8 +23,10 @@ TUSHARE_TOKEN = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR = Path('./stock_data')
 EXTEND_CHECKPOINT = DATA_DIR / 'extend_checkpoint.json'
 
-# Target date range
-TARGET_START_DATE = '20170101'
+# Target date range — earliest A-share trading day on Tushare Pro.
+# SSE opened 1990-12-19, SZSE opened 1991-04-03. Per-stock pro.daily returns
+# empty for dates before the stock listed, so this floor is safe.
+TARGET_START_DATE = '19901219'
 
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
@@ -217,10 +220,15 @@ def _forward_update_worker(args):
 
 # ─── Backward extension (sequential, run once) ────────────────────────────────
 
-def extend_stock_data(pro, stock_info, extend_backward=True, extend_forward=True):
+def extend_stock_data(pro, stock_info, extend_backward=True, extend_forward=True,
+                       target_start: str = TARGET_START_DATE):
     """
-    Extend one stock backward to TARGET_START_DATE and/or forward to today.
+    Extend one stock backward to ``target_start`` and/or forward to today.
     Used for the one-time backward fill; daily updates use _forward_update_worker.
+
+    Args:
+        target_start: Earliest date to back-fill to (YYYYMMDD).
+                      Default = '19901219' = SSE first trading day.
 
     Returns: 'updated' | 'completed' | 'skipped' | 'failed'
     """
@@ -237,9 +245,9 @@ def extend_stock_data(pro, stock_info, extend_backward=True, extend_forward=True
     updated    = False
     data_frames = [pd.read_csv(filepath)]
 
-    if extend_backward and int(earliest_date) > int(TARGET_START_DATE):
+    if extend_backward and int(earliest_date) > int(target_start):
         end_date = str(int(earliest_date) - 1)
-        hist_df  = download_stock_data(pro, ts_code, TARGET_START_DATE, end_date)
+        hist_df  = download_stock_data(pro, ts_code, target_start, end_date)
         if hist_df is None:
             return 'failed'
         if not hist_df.empty:
@@ -256,7 +264,7 @@ def extend_stock_data(pro, stock_info, extend_backward=True, extend_forward=True
             updated = True
 
     if not updated:
-        has_old = int(earliest_date) <= int(TARGET_START_DATE)
+        has_old = int(earliest_date) <= int(target_start)
         has_new = int(latest_date)   >= int(today) - 3
         return 'skipped' if (has_old and has_new) else 'completed'
 
@@ -280,13 +288,14 @@ def extend_all_stocks(
     force_update=False,
     max_workers=8,
     calls_per_sec=8.0,
+    target_start: str = TARGET_START_DATE,
 ):
     """
-    Extend all existing stock files to 2017-01-01 and/or up to today.
+    Extend all existing stock files backward to ``target_start`` and/or up to today.
 
     Args:
         batch_size:    Optional limit on stocks processed this run.
-        backward:      Download historical data back to 2017.
+        backward:      Download historical data back to ``target_start``.
         forward:       Download new data up to today.
         force_update:  Ignore checkpoint — process every stock.
         max_workers:   Parallel threads (forward-only mode only).
@@ -294,6 +303,9 @@ def extend_all_stocks(
         calls_per_sec: API call rate limit (default 8.0 = 480 calls/min).
                        Raise to 10–12 if you have a higher-tier account and
                        want to go faster; lower if you see rate-limit errors.
+        target_start:  Earliest date to back-fill to (YYYYMMDD).
+                       Default = '19901219' = SSE first trading day. Override
+                       for faster incremental fills (e.g. '20170101').
     """
     # Ensure required directories exist on a fresh machine
     for subdir in ('sh', 'sz'):
@@ -336,8 +348,8 @@ def extend_all_stocks(
     print(f"\n{'='*60}")
     print("Extending Stock Data")
     print(f"{'='*60}")
-    print(f"Date range: {TARGET_START_DATE} → {today}")
-    print(f"Backward (to 2017): {'Yes' if backward else 'No'}")
+    print(f"Date range: {target_start} → {today}")
+    print(f"Backward (to {target_start}): {'Yes' if backward else 'No'}")
     print(f"Forward  (to today): {'Yes' if forward else 'No'}")
     print(f"Stocks to check: {total:,}  (total on disk: {len(stocks):,})")
     if not backward:
@@ -406,7 +418,8 @@ def extend_all_stocks(
 
                 result = extend_stock_data(pro, stock,
                                            extend_backward=backward,
-                                           extend_forward=forward)
+                                           extend_forward=forward,
+                                           target_start=target_start)
                 processed += 1
 
                 if result == 'updated':
@@ -529,7 +542,7 @@ def run(command='status', batch=None, backward=True, forward=True, force=False,
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Extend stock data (2017 to today)')
+    parser = argparse.ArgumentParser(description='Extend stock data backward (to earliest possible) and/or forward (to today)')
     parser.add_argument('--extend',      action='store_true', help='Extend backward + forward')
     parser.add_argument('--update',      action='store_true', help='Update to latest (forward only, parallel)')
     parser.add_argument('--status',      action='store_true', help='Show status')
@@ -540,6 +553,8 @@ if __name__ == '__main__':
     parser.add_argument('--rate',        type=float, default=8.0,  help='API calls/sec (default 8.0)')
     parser.add_argument('--no-backward', action='store_true',       help='Skip backward extension')
     parser.add_argument('--no-forward',  action='store_true',       help='Skip forward extension')
+    parser.add_argument('--start-date',  type=str, default=TARGET_START_DATE,
+                        help=f'Earliest date to back-fill to (YYYYMMDD, default {TARGET_START_DATE} = SSE first trading day)')
 
     args, _ = parser.parse_known_args()
 
@@ -550,7 +565,7 @@ if __name__ == '__main__':
     elif args.update:
         extend_all_stocks(batch_size=args.batch, backward=False, forward=True,
                           force_update=args.force, max_workers=args.workers,
-                          calls_per_sec=args.rate)
+                          calls_per_sec=args.rate, target_start=args.start_date)
     elif args.extend:
         extend_all_stocks(
             batch_size=args.batch,
@@ -559,6 +574,7 @@ if __name__ == '__main__':
             force_update=args.force,
             max_workers=args.workers,
             calls_per_sec=args.rate,
+            target_start=args.start_date,
         )
     else:
         parser.print_help()
@@ -566,5 +582,10 @@ if __name__ == '__main__':
         print("  python extend_stock_data.py --update                  # fast parallel daily update")
         print("  python extend_stock_data.py --update --workers 12     # more threads")
         print("  python extend_stock_data.py --update --rate 10        # higher rate cap")
-        print("  python extend_stock_data.py --extend                  # one-time backward fill")
+        print("  python extend_stock_data.py --extend                  # back-fill to 1990-12-19 + forward to today")
         print("  python extend_stock_data.py --extend --batch 500      # batch backward fill")
+        print("")
+        print("Note: --extend uses a checkpoint of already-completed stocks. If you")
+        print("      previously back-filled to 2017-01-01 and now want to go further")
+        print("      (the new default 1990-12-19), pass --force to re-evaluate every")
+        print("      stock against the new floor. Or run --reset first.")

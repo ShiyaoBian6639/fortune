@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>数据完整性看板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{--bg:#0e1117;--panel:#161b22;--panel2:#1c232e;--border:#2a313c;
+        --text:#c9d1d9;--muted:#7d8590;--accent:#58a6ff;
+        --good:#2ea043;--bad:#da3633;--warn:#d29922;}
+  *{box-sizing:border-box;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+        background:var(--bg);color:var(--text);margin:0;padding:0;line-height:1.55;}
+  header{background:linear-gradient(180deg,#1a2a1c 0%,#0e1117 100%);
+          padding:28px 40px 18px;border-bottom:1px solid var(--border);}
+  header h1{margin:0 0 4px;font-size:24px;font-weight:700;letter-spacing:1px;}
+  header p{margin:0;color:var(--muted);font-size:13px;}
+  .badge{display:inline-block;padding:2px 8px;margin-left:6px;
+          background:rgba(46,160,67,.15);color:var(--good);
+          border:1px solid rgba(46,160,67,.4);border-radius:4px;
+          font-size:11px;font-weight:500;}
+  nav{position:sticky;top:0;z-index:10;background:var(--panel);
+       border-bottom:1px solid var(--border);padding:8px 40px;
+       overflow-x:auto;white-space:nowrap;}
+  nav a{display:inline-block;padding:6px 12px;margin-right:2px;
+         color:var(--muted);text-decoration:none;font-size:12.5px;border-radius:4px;}
+  nav a:hover{background:var(--panel2);color:var(--text);}
+  nav .related{color:var(--accent);}
+  nav .sep{color:var(--border);margin:0 4px;}
+  section{padding:24px 40px;border-bottom:1px solid var(--border);}
+  section h2{font-size:18px;margin:0 0 4px;}
+  section .subtitle{color:var(--muted);font-size:12.5px;margin:0 0 16px;}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;}
+  .card .label{color:var(--muted);font-size:11.5px;}
+  .card .value{font-size:20px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums;}
+  .card .hint{color:var(--muted);font-size:11px;margin-top:4px;}
+  .good{color:var(--good);}.bad{color:var(--bad);}.warn{color:var(--warn);}
+  table.ttbl{width:100%;border-collapse:collapse;font-size:12px;
+              background:var(--panel);border:1px solid var(--border);border-radius:6px;}
+  table.ttbl th,table.ttbl td{padding:6px 10px;border-bottom:1px solid var(--border);
+              text-align:left;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  table.ttbl th{background:var(--panel2);color:var(--muted);font-weight:500;
+                 position:sticky;top:0;}
+  .scroll-table{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:6px;}
+  .scroll-table table.ttbl{border:0;border-radius:0;}
+  code{color:var(--accent);background:var(--panel2);padding:1px 6px;border-radius:3px;font-size:11.5px;}
+  .info-block{background:var(--panel);border:1px solid var(--border);border-radius:6px;
+               padding:12px 16px;font-size:12.5px;line-height:1.55;margin-bottom:14px;}
+  .check-row{padding:6px 8px;border-radius:4px;display:flex;justify-content:space-between;
+              align-items:center;background:var(--panel);border:1px solid var(--border);
+              margin-bottom:6px;font-size:12.5px;}
+  .check-pass{border-left:3px solid var(--good);}
+  .check-warn{border-left:3px solid var(--warn);}
+  .check-fail{border-left:3px solid var(--bad);}
+  .pill{padding:2px 8px;border-radius:11px;font-size:11px;font-weight:600;}
+  .pill-pass{background:rgba(46,160,67,.15);color:var(--good);}
+  .pill-warn{background:rgba(218,153,34,.15);color:var(--warn);}
+  .pill-fail{background:rgba(218,54,51,.15);color:var(--bad);}
+</style>
+</head>
+<body>
+<header>
+  <h1>数据完整性看板 <span class="badge">data sanity</span></h1>
+  <p id="hdr-sub">加载中…</p>
+</header>
+<nav>
+  <a href="#freshness">数据新鲜度</a>
+  <a href="#predictions">预测时效性</a>
+  <a href="#archives">预测档案对比</a>
+  <a href="#leakage">无前视保证</a>
+  <a href="#features">特征目录覆盖</a>
+  <a href="#st">ST 名单</a>
+  <a href="#backtest">回测不变量</a>
+  <span class="sep">|</span>
+  <a class="related" href="index_predictions.html">→ 预测看板</a>
+  <a class="related" href="index_backtest.html">→ 回测看板</a>
+</nav>
+
+<section id="freshness">
+  <h2>数据源新鲜度</h2>
+  <p class="subtitle">每个数据源的最新可用日期, 颜色基于与最新预测特征日的差距标识。</p>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_freshness"></table>
+  </div>
+</section>
+
+<section id="predictions">
+  <h2>预测时效性</h2>
+  <div id="cards_pred_fresh" class="cards"></div>
+  <div id="pred_warning" class="info-block" style="display:none;"></div>
+</section>
+
+<section id="archives">
+  <h2>预测档案对比 (consecutive-day diff)</h2>
+  <p class="subtitle">
+    每个 <code>stock_predictions_xgb_features_YYYYMMDD.csv</code> 都是不可变档案。
+    相邻档案之间的预测差分用于检测"模型卡住"或"数据未刷新"。
+    若 differ ≈ 0 而 mean|Δ| ≈ 0 → 模型预测与昨日完全一致, 触发 ⚠️ 警告。
+  </p>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_archives"></table>
+  </div>
+</section>
+
+<section id="leakage">
+  <h2>无前视数据保证 (Leakage Audit)</h2>
+  <p class="subtitle">每条数据流的具体保证及证据位置 (源代码引用)。</p>
+  <div class="info-block" id="audit_guarantees"></div>
+</section>
+
+<section id="features">
+  <h2>特征目录覆盖</h2>
+  <p class="subtitle">XGBoost 模型的 174 个特征是否在 <code>dashboard/feature_catalog.py</code> 中都有中文描述。</p>
+  <div id="cards_feature_cov" class="cards"></div>
+</section>
+
+<section id="st">
+  <h2>ST 名单 (来自 tushare namechange 权威)</h2>
+  <div id="cards_st" class="cards"></div>
+</section>
+
+<section id="backtest">
+  <h2>回测不变量检查</h2>
+  <p class="subtitle">"回测的内部一致性是否完好?"</p>
+  <div id="cards_bt_inv" class="cards"></div>
+  <div id="bt_inv_checks"></div>
+</section>
+
+<script>
+function getData(){
+  if(typeof window!=='undefined'&&window.SANITY_DATA)
+    return Promise.resolve(window.SANITY_DATA);
+  return fetch('sanity_data.json').then(r=>r.json());
+}
+function card(label,value,hint,cls=''){
+  return `<div class="card"><div class="label">${label}</div>`+
+         `<div class="value ${cls}">${value}</div>`+
+         (hint?`<div class="hint">${hint}</div>`:'')+`</div>`;
+}
+function pill(text,kind){return `<span class="pill pill-${kind}">${text}</span>`;}
+function fmt(x){return Number(x).toLocaleString('en-US');}
+
+getData().then(D => {
+  const PF = D.prediction_freshness, AU = D.leakage_audit,
+        AR = D.archive_diffs, ST = D.st_roster,
+        FC = D.feature_coverage, BT = D.backtest_invariants;
+
+  document.getElementById('hdr-sub').textContent =
+    `预测特征日 ${PF.pred_feature_date || '?'}  ·  磁盘最新 ${PF.disk_latest_date || '?'}  ·  ` +
+    `数据源 ${AU.data_freshness.sources.length} · 杠杆保证 ${AU.guarantees.length} · ` +
+    `ST 股票 ${ST.unique_stocks || 0}`;
+
+  // ─── Freshness inventory ──────────────────────────────────────────────
+  const ref = (PF.pred_feature_date || '').replaceAll('-', '');
+  let fh = `<thead><tr>
+    <th>数据源</th><th>说明</th><th>最新日期</th><th>样本/文件数</th><th>状态</th>
+  </tr></thead><tbody>`;
+  AU.data_freshness.sources.forEach(s => {
+    const ld = s.latest_date || '';
+    let stat, kind;
+    if (!ld) { stat='unknown'; kind='warn'; }
+    else if (ref && ld === ref) { stat='current'; kind='pass'; }
+    else if (ref && ld < ref) { stat='stale'; kind='warn'; }
+    else { stat='ok'; kind='pass'; }
+    fh += `<tr>
+      <td><code>${s.name}</code></td>
+      <td>${s.desc || ''}</td>
+      <td>${ld || '—'}</td>
+      <td>${s.samples != null ? fmt(s.samples) : '—'}</td>
+      <td>${pill(stat, kind)}</td>
+    </tr>`;
+  });
+  fh += '</tbody>';
+  document.getElementById('tbl_freshness').innerHTML = fh;
+
+  // ─── Prediction freshness cards ───────────────────────────────────────
+  document.getElementById('cards_pred_fresh').innerHTML = [
+    card('实时预测特征日', PF.pred_feature_date || '—'),
+    card('磁盘最新交易日', PF.disk_latest_date || '—'),
+    card('滞后天数', PF.staleness_days, PF.is_stale ? '⚠️ 数据更新但预测未刷新' : '同步', PF.is_stale ? 'bad' : 'good'),
+    card('打分股票数', fmt(PF.pred_n_stocks)),
+  ].join('');
+  if (PF.is_stale) {
+    const w = document.getElementById('pred_warning');
+    w.style.display = 'block';
+    w.style.background = 'rgba(218,54,51,.10)';
+    w.style.borderColor = 'rgba(218,54,51,.45)';
+    w.innerHTML = '<b>⚠️ 警告:预测数据陈旧</b><br>' +
+      `磁盘上的 OHLCV 已更新到 ${PF.disk_latest_date}, 但预测仍使用 ${PF.pred_feature_date} 的特征。` +
+      ' 请运行 <code>./venv/Scripts/python -m xgbmodel.main --mode predict</code> 后重建看板。';
+  }
+
+  // ─── Archives diff ────────────────────────────────────────────────────
+  let ah = `<thead><tr>
+    <th>前一档案</th><th>后一档案</th><th>共同股</th><th>差异股</th>
+    <th>mean|Δμ|</th><th>max|Δμ|</th><th>状态</th>
+  </tr></thead><tbody>`;
+  (AR.pairs || []).forEach(p => {
+    const kind = p.identical ? 'fail' : (p.differ < p.common * 0.5 ? 'warn' : 'pass');
+    const stat = p.identical ? '⚠️ 完全相同' : (p.differ < p.common*0.5 ? '相似' : '正常更新');
+    ah += `<tr>
+      <td><code style="font-size:11px;">${p.prev_file}</code></td>
+      <td><code style="font-size:11px;">${p.next_file}</code></td>
+      <td>${fmt(p.common)}</td>
+      <td>${fmt(p.differ)}</td>
+      <td>${p.mean_abs.toFixed(4)}</td>
+      <td>${p.max_abs.toFixed(4)}</td>
+      <td>${pill(stat, kind)}</td>
+    </tr>`;
+  });
+  if (!(AR.pairs || []).length) {
+    ah += '<tr><td colspan="7" style="color:var(--muted);">仅有 ' +
+          ((AR.archives || []).length) + ' 个档案, 无法对比 — 多次运行 `xgbmodel.main --mode predict` 后档案累积</td></tr>';
+  }
+  ah += '</tbody>';
+  document.getElementById('tbl_archives').innerHTML = ah;
+
+  // ─── Leakage guarantees ───────────────────────────────────────────────
+  let g = '<h3 style="margin-top:0;">' + AU.guarantees.length + ' 项数据保证</h3><ol>';
+  AU.guarantees.forEach(item => {
+    g += `<li style="margin-bottom:10px;">
+      <b>${item.topic}</b><br>${item.guarantee}<br>
+      <span style="color:var(--muted);font-size:11.5px;">证据: <code>${item.evidence}</code></span>
+    </li>`;
+  });
+  g += '</ol>';
+  document.getElementById('audit_guarantees').innerHTML = g;
+
+  // ─── Feature catalog coverage ─────────────────────────────────────────
+  document.getElementById('cards_feature_cov').innerHTML = FC.present ? [
+    card('模型特征数', FC.model_n),
+    card('目录覆盖数', FC.covered, FC.covered === FC.model_n ? '完全覆盖' : `${FC.model_n - FC.covered} 个缺失`,
+         FC.covered === FC.model_n ? 'good' : 'bad'),
+    card('未覆盖特征', FC.missing.length, FC.missing.slice(0, 3).join(', ') || '—', FC.missing.length === 0 ? 'good' : 'warn'),
+    card('特征类别数', FC.group_count),
+  ].join('') : '<div class="card" style="color:var(--muted);">模型特征文件缺失</div>';
+
+  // ─── ST roster ────────────────────────────────────────────────────────
+  document.getElementById('cards_st').innerHTML = ST.present ? [
+    card('总条目数', fmt(ST.rows), '每条 = 一次 ST/非ST 切换'),
+    card('涉及股票', fmt(ST.unique_stocks)),
+    card('曾被 *ST', fmt(ST.ever_starST)),
+    card('曾被 ST', fmt(ST.ever_ST)),
+    card('当前在册', fmt(ST.currently_active), '当前仍 ST/*ST 的股票数'),
+    card('最早事件', ST.oldest_event || '—'),
+    card('最新事件', ST.newest_event || '—'),
+  ].join('') : '<div class="card" style="color:var(--muted);">' +
+       'ST 名单未生成 — 请运行 <code>./venv/Scripts/python -m api.st_history --download</code></div>';
+
+  // ─── Backtest invariants ──────────────────────────────────────────────
+  if (BT.present) {
+    document.getElementById('cards_bt_inv').innerHTML = [
+      card('回测期', `${BT.date_start} → ${BT.date_end}`),
+      card('交易日数', fmt(BT.n_trading_days)),
+      card('交易笔数', fmt(BT.n_trades)),
+      card('涉及股票', fmt(BT.unique_stocks)),
+      card('起始净值', fmt(BT.initial_nav) + ' 元'),
+      card('最终净值', fmt(BT.final_nav) + ' 元', '', 'good'),
+    ].join('');
+
+    const checks = [
+      {pass: BT.n_invalid_dates === 0, label: '所有交易的 entry_date ≤ exit_date',
+        detail: `异常交易: ${BT.n_invalid_dates} 笔`},
+      {pass: BT.cash_negative_days === 0, label: '现金从未为负 (无杠杆)',
+        detail: `现金为负的天数: ${BT.cash_negative_days} / ${BT.n_trading_days}`},
+      {pass: Math.abs(BT.realised_pct_of_nav_change - 1.0) < 0.5,
+        label: 'NAV 变化由实现 P&L 解释',
+        detail: `realised_pnl 占 nav 变化 ${(BT.realised_pct_of_nav_change*100).toFixed(1)}% (期望 ~100%)`,
+        warn: Math.abs(BT.realised_pct_of_nav_change - 1.0) >= 0.1},
+      {pass: BT.min_cash >= 0, label: '现金底线非负',
+        detail: `min cash = ${fmt(BT.min_cash)} 元`},
+      {pass: BT.final_nav > BT.initial_nav, label: '回测期内总盈利',
+        detail: `+${fmt(BT.final_nav - BT.initial_nav)} 元`},
+    ];
+    let html = '';
+    checks.forEach(c => {
+      const klass = c.pass ? (c.warn ? 'check-warn' : 'check-pass') : 'check-fail';
+      const tag = c.pass ? (c.warn ? pill('warn','warn') : pill('pass','pass')) : pill('fail','fail');
+      html += `<div class="check-row ${klass}">
+        <span><b>${c.label}</b><br><span style="color:var(--muted);font-size:11.5px;">${c.detail}</span></span>
+        ${tag}
+      </div>`;
+    });
+    document.getElementById('bt_inv_checks').innerHTML = html;
+  } else {
+    document.getElementById('cards_bt_inv').innerHTML =
+      '<div class="card" style="color:var(--muted);">回测产物缺失 — 请先运行 ' +
+      '<code>./venv/Scripts/python -m backtest.xgb_markowitz --solver qp --tag qp</code></div>';
+  }
+}).catch(err => {
+  console.error(err);
+  document.getElementById('hdr-sub').innerHTML =
+    '<span style="color:var(--bad)">加载失败 — 请运行 ' +
+    '<code>./venv/Scripts/python -m dashboard.build_sanity</code></span>';
+});
+</script>
+</body>
+</html>

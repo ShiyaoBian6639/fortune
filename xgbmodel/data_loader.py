@@ -183,16 +183,22 @@ def load_index_panel(data_dir: str) -> pd.DataFrame:
                         f'{alias}_pb']
         per_idx.append(kept)
 
-        # Join in pct_chg from the raw price CSV (sh/ or sz/)
+        # Join in pct_chg + open + close from the raw price CSV (sh/ or sz/).
+        # open + close are needed to compute the index's open-to-close intra-day
+        # return — the realistic target for trades executed at next-day open.
         for sub in ('sh', 'sz'):
             price_path = os.path.join(data_dir, sub, f"{bare.split('_')[0]}.csv")
             if os.path.exists(price_path):
                 try:
-                    p = pd.read_csv(price_path, usecols=['trade_date', 'pct_chg'])
+                    p = pd.read_csv(price_path, usecols=['trade_date', 'pct_chg',
+                                                          'open', 'close'])
                     p['trade_date'] = pd.to_datetime(p['trade_date'].astype(str), errors='coerce')
                     p = p.dropna(subset=['trade_date']).sort_values('trade_date')
                     p = p.drop_duplicates(subset=['trade_date'], keep='last')
-                    p.columns = ['trade_date', f'{alias}_pct_chg']
+                    p.columns = ['trade_date',
+                                 f'{alias}_pct_chg',
+                                 f'{alias}_open',
+                                 f'{alias}_close']
                     per_idx.append(p)
                     break
                 except Exception:
@@ -213,6 +219,19 @@ def load_index_panel(data_dir: str) -> pd.DataFrame:
     for c in out.columns:
         if c != 'trade_date':
             out[c] = pd.to_numeric(out[c], errors='coerce').astype('float32')
+
+    # Derive each index's open-to-close intra-day return (in %) — needed as
+    # the BENCHMARK component when the per-stock target is configured as the
+    # tradeable open-to-close excess return. Stored alongside the existing
+    # close-to-close pct_chg so callers can pick.
+    for alias in INDEX_CODES.keys():
+        oc_col = f'{alias}_oc'
+        op_col = f'{alias}_open'
+        cl_col = f'{alias}_close'
+        if op_col in out.columns and cl_col in out.columns:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ret = (out[cl_col] - out[op_col]) / out[op_col] * 100.0
+            out[oc_col] = ret.astype('float32')
     return out
 
 
@@ -450,6 +469,11 @@ def _assemble_one_stock(
     target_mode: str,
     forward_window: int,
     clip_target_pct: float,
+    keep_no_target_rows: bool = False,
+    target_basis: str = 'cc',          # 'cc' = close-to-close pct_chg (legacy);
+                                       # 'oc' = open-to-close intra-day return —
+                                       # the realistically tradeable target when
+                                       # entering at open(X+1) using pred(X).
 ) -> Optional[pd.DataFrame]:
     """Build a single-stock feature frame. Returns None if too short after NaN drop."""
     if len(stock_df) < 80:
@@ -526,21 +550,43 @@ def _assemble_one_stock(
     # all macro merges since the frame now has ~150 columns.
     df = merge_fina_point_in_time(df, fina_df).copy()
 
-    # 7) Target: next-day pct_chg (or excess vs csi300)
-    if target_mode == 'excess' and 'csi300_pct_chg' in df.columns:
-        tgt = df['pct_chg'] - df['csi300_pct_chg']
+    # 7) Targets: 1-day-ahead through 5-day-ahead returns.
+    #    Two bases:
+    #      cc (default) — close-to-close pct_chg, the legacy target.
+    #      oc           — open-to-close intra-day return (close - open) / open.
+    #                     This is what's actually tradeable when entering at
+    #                     open(X+h) on a prediction made overnight at close(X+h-1).
+    #    Excess = stock target - CSI300 target on the SAME basis.
+    if target_basis == 'oc':
+        # Per-stock open-to-close return (in %)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            stock_oc = (df['close'] - df['open']) / df['open'] * 100.0
+        if target_mode == 'excess' and 'csi300_oc' in df.columns:
+            tgt = stock_oc - df['csi300_oc']
+        else:
+            tgt = stock_oc
     else:
-        # Raw pct_chg (or excess fallback when csi300 missing)
-        tgt = df['pct_chg']
-    target = tgt.shift(-forward_window).astype('float32')
-    if clip_target_pct and clip_target_pct > 0:
-        target = target.clip(-clip_target_pct, clip_target_pct).astype('float32')
+        if target_mode == 'excess' and 'csi300_pct_chg' in df.columns:
+            tgt = df['pct_chg'] - df['csi300_pct_chg']
+        else:
+            tgt = df['pct_chg']
+    horizon_cols = {}
+    for h in (1, 2, 3, 4, 5):
+        t_h = tgt.shift(-h).astype('float32')
+        if clip_target_pct and clip_target_pct > 0:
+            t_h = t_h.clip(-clip_target_pct, clip_target_pct).astype('float32')
+        horizon_cols[f'target_d{h}'] = t_h
+    # The canonical 'target' column = target at the configured forward_window
+    # (default 1) — preserves the existing xgbmodel pipeline behaviour.
+    horizon_cols['target'] = horizon_cols[f'target_d{forward_window}']
 
-    # Add sector_id + target in one assign so we don't re-fragment after the defrag above.
-    df = df.assign(sector_id=np.int16(sector_id), target=target)
+    df = df.assign(sector_id=np.int16(sector_id), **horizon_cols)
 
-    # 8) Drop rows with no target (last `forward_window` rows)
-    df = df.dropna(subset=['target'])
+    # 8) Drop rows with no target (last `forward_window` rows) — unless we are
+    # in inference mode, in which case we must keep the most recent feature
+    # row so predict_latest can forecast one step past the end of the data.
+    if not keep_no_target_rows:
+        df = df.dropna(subset=['target'])
 
     # 9) Drop the warm-up rows whose critical long-window TA features are NaN
     # (rather than using a fixed offset — lets the loader recover if windows change).
@@ -550,14 +596,186 @@ def _assemble_one_stock(
     if df.empty:
         return None
 
-    # Final NaN→0 fill for any remaining feature cells (e.g. missing daily_basic)
-    feat_cols = [c for c in df.columns if c not in ('ts_code', 'trade_date', 'target')]
+    # Final NaN→0 fill for any remaining feature cells (e.g. missing daily_basic).
+    # Targets are intentionally excluded — multi-horizon trainers need to drop
+    # NaN-target rows per horizon, and a 0 there would silently corrupt the
+    # training signal for d2..d5.
+    target_keep_nan = {'target', 'target_d1', 'target_d2', 'target_d3', 'target_d4', 'target_d5'}
+    feat_cols = [c for c in df.columns
+                 if c not in ('ts_code', 'trade_date') and c not in target_keep_nan]
     for c in feat_cols:
         if df[c].dtype.kind == 'f':
             df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype('float32')
     # Defragment: many per-column assignments above fragment the block manager;
     # one copy consolidates the internal blocks and silences PerformanceWarning.
     return df.reset_index(drop=True).copy()
+
+
+# ─── Identity-breakpoint application ───────────────────────────────────────
+def _apply_identity_breakpoints(panel: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows whose trade_date precedes a `confirmed` breakpoint for that
+    ts_code. Skeleton at stock_data/identity_breakpoints.csv with status column;
+    only `confirmed` triggers row removal. Missing file = no-op."""
+    bp_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'stock_data', 'identity_breakpoints.csv')
+    if not os.path.exists(bp_path):
+        return panel
+    try:
+        bp = pd.read_csv(bp_path, encoding='utf-8-sig', dtype={'breakpoint_date': str})
+    except Exception:
+        return panel
+    confirmed = bp[bp['status'].astype(str).str.lower() == 'confirmed']
+    if confirmed.empty:
+        return panel
+    earliest = confirmed.groupby('ts_code')['breakpoint_date'].min().to_dict()
+    if not earliest:
+        return panel
+    pre = len(panel)
+    mask = pd.Series(True, index=panel.index)
+    for ts_code, bp_str in earliest.items():
+        bp_dt = pd.Timestamp(bp_str)
+        mask &= ~((panel['ts_code'] == ts_code) & (panel['trade_date'] < bp_dt))
+    panel = panel[mask].reset_index(drop=True)
+    print(f"  identity_breakpoints: {len(earliest)} confirmed → "
+          f"dropped {pre - len(panel):,} rows")
+    return panel
+
+
+# ─── Static-feature merge ──────────────────────────────────────────────────
+def _merge_static_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """Merge static + slow-changing features from stock_data/static_features/.
+
+    - stock_company / stk_managers_summary / index_member_flags: static per ts_code
+    - stk_holdernumber / top10_holders_summary: quarterly point-in-time merge
+      via merge_asof on ann_date (avoids end_date leakage).
+
+    Missing files are skipped (no-op). Numeric features get NaN→0 fill.
+    """
+    base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         'stock_data', 'static_features')
+    if not os.path.isdir(base):
+        return panel
+
+    n0 = panel.shape[1]
+
+    # 1. stock_company → province (categorical encoded), [industry if available],
+    #    years_listed, log_reg_capital. Defensive against missing columns.
+    fp = os.path.join(base, 'stock_company.csv')
+    if os.path.exists(fp):
+        sc = pd.read_csv(fp, encoding='utf-8-sig')
+        keep = ['ts_code']
+        if 'province' in sc.columns:
+            sc['province_id'] = sc['province'].astype('category').cat.codes.astype('int16')
+            keep.append('province_id')
+        if 'industry' in sc.columns:
+            sc['industry_id'] = sc['industry'].astype('category').cat.codes.astype('int16')
+            keep.append('industry_id')
+        if 'reg_capital' in sc.columns:
+            sc['log_reg_capital'] = np.log1p(pd.to_numeric(sc['reg_capital'], errors='coerce').fillna(0.0)).astype('float32')
+            keep.append('log_reg_capital')
+        if 'setup_date' in sc.columns:
+            sd = pd.to_numeric(sc['setup_date'].astype(str).str[:4], errors='coerce')
+            sc['years_listed'] = (pd.Timestamp.now().year - sd).fillna(0).astype('float32')
+            keep.append('years_listed')
+        if len(keep) > 1:
+            panel = panel.merge(sc[keep], on='ts_code', how='left')
+
+    # 2. stk_managers_summary
+    fp = os.path.join(base, 'stk_managers_summary.csv')
+    if os.path.exists(fp):
+        mg = pd.read_csv(fp, encoding='utf-8-sig')
+        for c in ('n_managers', 'avg_manager_age', 'avg_education_rank',
+                  'chairman_tenure_days'):
+            if c not in mg.columns:
+                mg[c] = 0
+        mg = mg[['ts_code','n_managers','avg_manager_age',
+                 'avg_education_rank','chairman_tenure_days']]
+        panel = panel.merge(mg, on='ts_code', how='left')
+
+    # 3. index_member_pit — point-in-time merge so each row only sees
+    # membership snapshots that existed AS OF its trade_date. Replaces the
+    # legacy `index_member_flags.csv` which was a today-snapshot and leaked
+    # current index composition into 2017 training data.
+    fp = os.path.join(base, 'index_member_pit.csv')
+    if os.path.exists(fp):
+        im = pd.read_csv(fp, encoding='utf-8-sig')
+        if not im.empty:
+            im['snapshot_date'] = pd.to_datetime(im['snapshot_date'], errors='coerce')
+            im = im.dropna(subset=['snapshot_date']).sort_values(['snapshot_date', 'ts_code'])
+            flag_cols = [c for c in im.columns if c.startswith('in_')]
+            im = im[['ts_code', 'snapshot_date'] + flag_cols]
+            panel = panel.sort_values('trade_date').reset_index(drop=True)
+            panel = pd.merge_asof(
+                panel, im,
+                left_on='trade_date', right_on='snapshot_date', by='ts_code',
+                direction='backward', allow_exact_matches=True,
+            )
+            panel = panel.drop(columns=['snapshot_date'])
+            for c in flag_cols:
+                panel[c] = panel[c].fillna(0.0).astype('float32')
+    else:
+        # Backwards-compat fallback: if PIT file missing, use legacy snapshot
+        # (only useful during transition; emit a warning so we notice).
+        legacy_fp = os.path.join(base, 'index_member_flags.csv')
+        if os.path.exists(legacy_fp):
+            print("  [warn] index_member_pit.csv missing — falling back to "
+                  "today-snapshot index_member_flags.csv (LEAK)")
+            im = pd.read_csv(legacy_fp, encoding='utf-8-sig')
+            keep_cols = ['ts_code'] + [c for c in im.columns if c.startswith('in_')]
+            im = im[keep_cols]
+            panel = panel.merge(im, on='ts_code', how='left')
+
+    # 4. stk_holdernumber: PIT merge by ann_date
+    fp = os.path.join(base, 'stk_holdernumber.csv')
+    if os.path.exists(fp):
+        hn = pd.read_csv(fp, encoding='utf-8-sig',
+                          dtype={'ann_date': str, 'end_date': str})
+        if not hn.empty:
+            hn['ann_date'] = pd.to_datetime(hn['ann_date'], errors='coerce')
+            hn = hn.dropna(subset=['ann_date']).sort_values(['ann_date', 'ts_code'])
+            hn = hn.rename(columns={'holder_num': 'holdernum'})
+            # merge_asof needs left sorted globally by left_on (trade_date)
+            panel = panel.sort_values('trade_date').reset_index(drop=True)
+            panel = pd.merge_asof(
+                panel, hn[['ts_code', 'ann_date', 'holdernum']],
+                left_on='trade_date', right_on='ann_date', by='ts_code',
+                direction='backward', allow_exact_matches=True,
+            )
+            panel = panel.drop(columns=['ann_date'])
+            panel['holdernum'] = panel['holdernum'].fillna(0).astype('float32')
+
+    # 5. top10_holders_summary: PIT merge by ann_date
+    fp = os.path.join(base, 'top10_holders_summary.csv')
+    if os.path.exists(fp):
+        t10 = pd.read_csv(fp, encoding='utf-8-sig',
+                           dtype={'ann_date': str, 'end_date': str})
+        if not t10.empty:
+            t10['ann_date'] = pd.to_datetime(t10['ann_date'], errors='coerce')
+            t10 = t10.dropna(subset=['ann_date']).sort_values(['ann_date','ts_code'])
+            t10 = t10[['ts_code','ann_date','top10_pct','top10_hhi',
+                       'top10_pct_top1','n_funds_in_top10']]
+            panel = panel.sort_values('trade_date').reset_index(drop=True)
+            panel = pd.merge_asof(
+                panel, t10,
+                left_on='trade_date', right_on='ann_date', by='ts_code',
+                direction='backward', allow_exact_matches=True,
+            )
+            panel = panel.drop(columns=['ann_date'])
+            for c in ('top10_pct','top10_hhi','top10_pct_top1','n_funds_in_top10'):
+                if c in panel.columns:
+                    panel[c] = panel[c].fillna(0).astype('float32')
+
+    # Final: ensure all numeric NaN→0 (except targets, which must keep NaN
+    # so per-horizon trainers can drop the right rows).
+    skip = {'ts_code', 'trade_date', 'target',
+            'target_d1', 'target_d2', 'target_d3', 'target_d4', 'target_d5'}
+    for c in panel.columns:
+        if c in skip or panel[c].dtype.kind not in 'fiu':
+            continue
+        panel[c] = panel[c].replace([np.inf,-np.inf], np.nan).fillna(0.0)
+
+    print(f"  static_features merge: {panel.shape[1] - n0} columns added")
+    return panel
 
 
 # ─── Public entry point ─────────────────────────────────────────────────────
@@ -580,10 +798,17 @@ def build_panel(cfg: dict) -> pd.DataFrame:
     max_stocks       = cfg.get('max_stocks', 0)
     target_mode      = cfg.get('target_mode', 'raw')
     forward_window   = cfg.get('forward_window', 1)
+    target_basis     = cfg.get('target_basis', 'cc')   # 'cc' or 'oc'
     clip_target_pct  = cfg.get('clip_target_pct', 11.0)
+    # Inference mode: preserve the final `forward_window` rows per stock (whose
+    # target is unknown because it would lie beyond the latest price bar) so
+    # predict_latest can use the most recent feature row to forecast t+1.
+    keep_no_target   = bool(cfg.get('for_inference', False))
 
     print(f"[xgbmodel] Building panel from {data_dir}")
-    print(f"  target_mode={target_mode}  forward_window={forward_window}  max_stocks={max_stocks or 'all'}")
+    print(f"  target_mode={target_mode}  target_basis={target_basis}  "
+          f"forward_window={forward_window}  "
+          f"max_stocks={max_stocks or 'all'}  for_inference={keep_no_target}")
 
     # Listing + filter
     files = _list_stock_files(data_dir, max_stocks=max_stocks)
@@ -671,6 +896,8 @@ def build_panel(cfg: dict) -> pd.DataFrame:
             target_mode       = target_mode,
             forward_window    = forward_window,
             clip_target_pct   = clip_target_pct,
+            keep_no_target_rows = keep_no_target,
+            target_basis      = target_basis,
         )
         if out is None or out.empty:
             skipped += 1
@@ -682,6 +909,12 @@ def build_panel(cfg: dict) -> pd.DataFrame:
         raise RuntimeError("No stocks assembled — check data_dir / min_rows_per_stock")
 
     panel = pd.concat(assembled, ignore_index=True, sort=False)
+
+    # ── New: apply identity breakpoints (drop pre-event rows for confirmed cases) ──
+    panel = _apply_identity_breakpoints(panel)
+
+    # ── New: merge in static features from stock_data/static_features/ ──
+    panel = _merge_static_features(panel)
 
     # Compute cross-sectional daily rank / de-meaned features on the merged
     # panel — must happen after assembly so ranks cover the full cross-section.
@@ -700,22 +933,32 @@ def build_panel(cfg: dict) -> pd.DataFrame:
     # is still nonzero.
     cs_norm = cfg.get('cs_target_norm', 'demean')
     if cs_norm in ('demean', 'zscore'):
-        before_std = float(panel['target'].std())
-        mean_by_date = panel.groupby('trade_date')['target'].transform('mean')
-        demeaned = panel['target'] - mean_by_date
-        if cs_norm == 'zscore':
-            std_by_date = panel.groupby('trade_date')['target'].transform('std')
-            demeaned = demeaned / std_by_date.replace(0, np.nan)
-            demeaned = demeaned.fillna(0.0)
-        panel['target'] = demeaned.astype('float32')
-        after_std = float(panel['target'].std())
-        print(f"  applied cs_target_norm={cs_norm}  "
-              f"target std {before_std:.4f} → {after_std:.4f}")
+        # Apply per-day cross-sectional normalisation to EVERY horizon target.
+        # Each horizon has its own per-day mean / std so a horizon-1 outlier
+        # day doesn't bias horizon-5's normalisation.
+        target_cols = ['target'] + [f'target_d{h}' for h in (1,2,3,4,5)
+                                    if f'target_d{h}' in panel.columns]
+        before_std = {c: float(panel[c].std()) for c in target_cols}
+        for tc in target_cols:
+            mean_by_date = panel.groupby('trade_date')[tc].transform('mean')
+            demeaned = panel[tc] - mean_by_date
+            if cs_norm == 'zscore':
+                std_by_date = panel.groupby('trade_date')[tc].transform('std')
+                demeaned = demeaned / std_by_date.replace(0, np.nan)
+                demeaned = demeaned.fillna(0.0)
+            panel[tc] = demeaned.astype('float32')
+        after_std = {c: float(panel[c].std()) for c in target_cols}
+        std_summary = ', '.join(
+            f'{c}: {before_std[c]:.3f}→{after_std[c]:.3f}'
+            for c in ('target','target_d1','target_d3','target_d5') if c in target_cols)
+        print(f"  applied cs_target_norm={cs_norm}  ({std_summary})")
 
-    # Canonical column order: ts_code, trade_date, ..., target
-    cols = ['ts_code', 'trade_date'] + \
-           [c for c in panel.columns if c not in ('ts_code', 'trade_date', 'target')] + \
-           ['target']
+    # Canonical column order: ts_code, trade_date, <features...>, target_d1..d5, target
+    target_tail = [c for c in [f'target_d{h}' for h in (1,2,3,4,5)] + ['target']
+                   if c in panel.columns]
+    feat_cols   = [c for c in panel.columns
+                   if c not in ('ts_code', 'trade_date') and c not in target_tail]
+    cols = ['ts_code', 'trade_date'] + feat_cols + target_tail
     panel = panel[cols]
 
     print(f"  panel shape: {panel.shape}  "
@@ -730,7 +973,8 @@ def list_feature_columns(panel: pd.DataFrame) -> List[str]:
     Drops any accidental object-dtype columns so we never hand xgboost a
     string column.
     """
-    drop = {'ts_code', 'trade_date', 'target'}
+    drop = {'ts_code', 'trade_date', 'target',
+            'target_d1', 'target_d2', 'target_d3', 'target_d4', 'target_d5'}
     out = []
     for c in panel.columns:
         if c in drop:

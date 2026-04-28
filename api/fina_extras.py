@@ -251,9 +251,19 @@ def _download_one(data_type: str, ts_code: str) -> tuple:
     if fp.exists() and last is not None:
         existing = pd.read_csv(fp)
         df = pd.concat([existing, df], ignore_index=True)
+        # Normalise dedup/sort columns to str — pandas infers date columns
+        # (e.g. ann_date) from existing CSVs as int64, while tushare returns
+        # them as str. After concat the column is `object` dtype with MIXED
+        # int + str values, which breaks sort_values's `<` comparison. Cast
+        # unconditionally — `object` dtype alone is not a safety signal.
+        for col in set(list(cfg['dedup_cols']) + [cfg['date_col']]):
+            if col in df.columns:
+                df[col] = df[col].astype(str)
         df = df.drop_duplicates(subset=cfg['dedup_cols'], keep='last')
 
-    df = df.sort_values(cfg['date_col'] if cfg['date_col'] in df.columns else df.columns[0])
+    sort_col = cfg['date_col'] if cfg['date_col'] in df.columns else df.columns[0]
+    df[sort_col] = df[sort_col].astype(str)
+    df = df.sort_values(sort_col)
     df.to_csv(fp, index=False, encoding='utf-8-sig')
     return ts_code, f'+{len(df)} rows'
 

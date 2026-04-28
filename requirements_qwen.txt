@@ -1,0 +1,15 @@
+# Minimal deps to run xgbmodel.qwen_sentiment on a remote 5090/A100.
+# Tested with Python 3.10–3.12.
+
+# Core
+torch>=2.4.0
+transformers>=4.45.0
+accelerate>=0.34.0
+sentencepiece>=0.1.99
+
+# Optional 4-bit / 8-bit quant (only needed if --quant 4bit/8bit)
+bitsandbytes>=0.43.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.26.0

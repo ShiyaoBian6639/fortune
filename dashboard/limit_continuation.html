@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>A股连板概率分析 — XGB 预测验证</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg:#0e1117; --panel:#161b22; --panel2:#1c232e; --border:#2a313c;
+    --text:#c9d1d9; --muted:#7d8590; --accent:#58a6ff;
+    --up:#da3633; --down:#2ea043;  /* A-share convention: red=up, green=down */
+    --warn:#d29922;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+         background:var(--bg); color:var(--text); margin:0; line-height:1.5; }
+  header { background:linear-gradient(180deg,#2a1a1c 0%,#0e1117 100%);
+           padding:28px 40px; border-bottom:1px solid var(--border); }
+  header h1 { margin:0 0 6px; font-size:24px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  nav { position:sticky; top:0; background:var(--panel); padding:8px 40px;
+         border-bottom:1px solid var(--border); z-index:10; }
+  nav a { color:var(--muted); padding:6px 12px; margin-right:4px;
+          text-decoration:none; font-size:13px; border-radius:4px; }
+  nav a:hover { background:var(--panel2); color:var(--text); }
+  section { padding:24px 40px; border-bottom:1px solid var(--border); }
+  section h2 { margin:0 0 4px; font-size:18px; font-weight:600; }
+  section .subtitle { color:var(--muted); font-size:12px; margin:0 0 14px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+           gap:10px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--border);
+           border-radius:6px; padding:14px;
+           border-left:3px solid var(--accent); }
+  .card.kind-up { border-left-color:var(--up); }
+  .card.kind-down { border-left-color:var(--down); }
+  .m-label { color:var(--muted); font-size:11px; text-transform:uppercase;
+             letter-spacing:0.5px; }
+  .m-value { font-size:22px; font-weight:600; margin:4px 0; }
+  .m-sub { color:var(--muted); font-size:11px; }
+  table { width:100%; border-collapse:collapse; font-size:13px;
+          background:var(--panel); }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--border); text-align:right; }
+  th { background:var(--panel2); color:var(--muted); font-weight:500;
+        font-size:11px; text-transform:uppercase; letter-spacing:0.5px;
+        text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  tr:hover { background:var(--panel2); }
+  .pos { color:var(--up); }
+  .neg { color:var(--down); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:3px;
+          font-size:11px; font-weight:500; }
+  .pill.yes { background:rgba(218,54,51,0.18); color:#f87171; }
+  .pill.no { background:rgba(125,133,144,0.18); color:var(--muted); }
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:900px) { .grid-2 { grid-template-columns:1fr; } }
+  .table-wrap { max-height:480px; overflow-y:auto;
+                border:1px solid var(--border); border-radius:6px; }
+  .callout { background:var(--panel2); border-left:3px solid var(--warn);
+             padding:12px 16px; margin:12px 0; border-radius:4px;
+             font-size:13px; color:var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>A股连板概率分析</h1>
+  <p>历史涨停后次日继续涨停（连板）的概率与预测特征</p>
+  <p style="margin-top:4px">
+    <b>样本期：</b> 20180102 → 20260424
+    &nbsp;·&nbsp; <b>股票数：</b> 5,190
+    &nbsp;·&nbsp; <b>涨停记录：</b> 94,306
+  </p>
+</header>
+
+<nav>
+  <a href="#overview">概览</a>
+  <a href="#streak">连板递进</a>
+  <a href="#segments">分组明细</a>
+  <a href="#features">关键特征</a>
+  <a href="#classifier">预测模型</a>
+  <a href="#today">今日预测核对</a>
+</nav>
+
+<section id="overview">
+  <h2>核心结论</h2>
+  <p class="subtitle">基础概率与"一字板 vs T字板"差异</p>
+  <div class="cards"><div class="card kind-neutral">
+      <div class="m-label">Base P(up-limit at t)</div>
+      <div class="m-value">1.46%</div>
+      <div class='m-sub'>94,306 of 6,478,280 rows</div>
+    </div><div class="card kind-up">
+      <div class="m-label">Overall continuation P(↑ₜ₊₁ | ↑ₜ)</div>
+      <div class="m-value">25.61%</div>
+      <div class='m-sub'>across 94,306 up-limit days</div>
+    </div><div class="card kind-up">
+      <div class="m-label">一字板 continuation</div>
+      <div class="m-value">66.94%</div>
+      <div class='m-sub'>n=9,428 · P(next 一字)=43.10%</div>
+    </div><div class="card kind-down">
+      <div class="m-label">T-shape continuation</div>
+      <div class="m-value">21.02%</div>
+      <div class='m-sub'>n=84,878 · 3.2× lower than 一字</div>
+    </div><div class="card kind-down">
+      <div class="m-label">Recent 90d continuation</div>
+      <div class="m-value">22.32%</div>
+      <div class='m-sub'>last 90 trading days</div>
+    </div><div class="card kind-up">
+      <div class="m-label">Classifier AUC (test 2024+)</div>
+      <div class="m-value">0.683</div>
+      <div class='m-sub'>AP 0.450 · base 0.229</div>
+    </div></div>
+  <div class="callout">
+    <b>关键洞察：</b> 一字板（开盘即一字封死、当天没破板）次日继续涨停的概率约为
+    <b>66.9%</b>，而开过板/T字板只有
+    <b>21.0%</b>。封单强度（封板形态）是预测连板的最重要单一信号之一。
+  </div>
+</section>
+
+<section id="streak">
+  <h2>连板阶梯：N板 → N+1板 概率</h2>
+  <p class="subtitle">已经N板的股票，次日再封板的条件概率（剔除样本数 &lt; 50 的streak）</p>
+  <div id="streak_chart" style="height:340px"></div>
+  <div class="grid-2" style="margin-top:18px">
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">连板阶梯表</h3>
+      <table>
+        <thead><tr><th>当前N板</th><th>样本数</th><th>P(继续封板)</th><th>P(下一日一字)</th></tr></thead>
+        <tbody><tr><td>1</td><td>70,160</td><td>18.9%</td><td>3.8%</td></tr><tr><td>2</td><td>13,269</td><td>37.0%</td><td>11.9%</td></tr><tr><td>3</td><td>4,903</td><td>49.2%</td><td>19.1%</td></tr><tr><td>4</td><td>2,412</td><td>53.9%</td><td>23.2%</td></tr><tr><td>5</td><td>1,300</td><td>58.7%</td><td>27.4%</td></tr><tr><td>6</td><td>762</td><td>61.2%</td><td>32.3%</td></tr><tr><td>7</td><td>466</td><td>64.8%</td><td>37.6%</td></tr><tr><td>8</td><td>302</td><td>67.5%</td><td>41.7%</td></tr><tr><td>9</td><td>204</td><td>70.6%</td><td>47.5%</td></tr><tr><td>10</td><td>144</td><td>77.8%</td><td>49.3%</td></tr><tr><td>11</td><td>112</td><td>71.4%</td><td>55.4%</td></tr><tr><td>12</td><td>80</td><td>75.0%</td><td>53.8%</td></tr></tbody>
+      </table>
+    </div>
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">板块差异 (given 涨停)</h3>
+      <table>
+        <thead><tr><th>板块</th><th>样本数</th><th>P(继续封板)</th></tr></thead>
+        <tbody><tr><td>Main</td><td>76,701</td><td class='pos'>26.1%</td></tr><tr><td>ChiNext</td><td>15,967</td><td class='neg'>24.6%</td></tr><tr><td>STAR</td><td>1,638</td><td class='neg'>11.0%</td></tr></tbody>
+      </table>
+      <div style="margin-top:6px;color:var(--muted);font-size:11px">
+        STAR/科创板涨幅限制20%，封单更难维持，故连板率显著较低。
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="segments">
+  <h2>分时段 / 市值分组</h2>
+  <p class="subtitle">不同年份与市值档位的连板概率差异</p>
+  <div class="grid-2">
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">逐年统计 (given 涨停)</h3>
+      <table>
+        <thead><tr><th>年份</th><th>样本数</th><th>P(继续封板)</th></tr></thead>
+        <tbody><tr><td>2018</td><td>2,941</td><td class='pos'>29.8%</td></tr><tr><td>2019</td><td>3,955</td><td class='pos'>30.9%</td></tr><tr><td>2020</td><td>4,004</td><td class='pos'>29.6%</td></tr><tr><td>2021</td><td>13,502</td><td class='neg'>24.0%</td></tr><tr><td>2022</td><td>16,644</td><td class='pos'>25.3%</td></tr><tr><td>2023</td><td>9,617</td><td class='neg'>22.8%</td></tr><tr><td>2024</td><td>19,852</td><td class='pos'>27.2%</td></tr><tr><td>2025</td><td>18,124</td><td class='pos'>25.3%</td></tr><tr><td>2026</td><td>5,667</td><td class='neg'>22.0%</td></tr></tbody>
+      </table>
+    </div>
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">流通市值分位 (given 涨停)</h3>
+      <table>
+        <thead><tr><th>档位</th><th>样本数</th><th>P(继续封板)</th></tr></thead>
+        <tbody><tr><td>XS</td><td>18,730</td><td class='pos'>33.1%</td></tr><tr><td>S</td><td>20,477</td><td class='pos'>27.3%</td></tr><tr><td>M</td><td>21,371</td><td class='pos'>25.3%</td></tr><tr><td>L</td><td>20,267</td><td class='neg'>22.8%</td></tr><tr><td>XL</td><td>13,461</td><td class='neg'>17.5%</td></tr></tbody>
+      </table>
+      <div style="margin-top:6px;color:var(--muted);font-size:11px">
+        XS = 流通市值最小的1/5，XL = 最大的1/5。小盘股连板率明显高于大盘股。
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <h2>关键预测特征 — 五分位提升表</h2>
+  <p class="subtitle">把每个特征分成5档，看 P(继续封板) 在最低档与最高档的差异 (lift)</p>
+  <div id="lift_chart" style="height:420px"></div>
+  <div class="callout" id="lift_callout">特征解释将根据数据自动填充。</div>
+</section>
+
+<section id="classifier">
+  <h2>LightGBM 二分类预测</h2>
+  <p class="subtitle">输入：今日处于涨停状态时的特征 · 输出：次日是否继续涨停 ·
+    样本：训练 &lt; 2024-01 / 测试 ≥ 2024-01</p>
+  <div class="grid-2">
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">模型表现</h3>
+      <table>
+        <tr><td>训练样本</td><td>34,470</td></tr>
+        <tr><td>测试样本</td><td>24,374</td></tr>
+        <tr><td>测试 AUC</td><td><b class="pos">0.6835</b></td></tr>
+        <tr><td>测试 AP</td><td>0.4499</td></tr>
+        <tr><td>测试 base rate</td><td>0.2286</td></tr>
+        <tr><td>训练 AUC</td><td>0.7516</td></tr>
+        <tr><td>best_iteration</td><td>54</td></tr>
+      </table>
+      <div style="margin-top:8px;color:var(--muted);font-size:12px">
+        测试期 AUC ≈ 0.68 表示模型对"是否连板"有显著区分力（base rate ≈ 23%）。
+      </div>
+    </div>
+    <div>
+      <h3 style="font-size:14px;margin:0 0 8px;color:var(--muted)">特征重要性 (Top 15, gain)</h3>
+      <table>
+        <thead><tr><th>特征</th><th>Gain</th></tr></thead>
+        <tbody><tr><td>log_circ_mv</td><td>195</td></tr><tr><td>turnover_rate_f</td><td>191</td></tr><tr><td>volume_ratio</td><td>152</td></tr><tr><td>vol_20</td><td>142</td></tr><tr><td>ret_3</td><td>134</td></tr><tr><td>pb</td><td>115</td></tr><tr><td>close_to_60high</td><td>102</td></tr><tr><td>vol_surge</td><td>97</td></tr><tr><td>ret_10</td><td>91</td></tr><tr><td>ret_20</td><td>83</td></tr><tr><td>ret_5</td><td>80</td></tr><tr><td>amount_surge</td><td>62</td></tr><tr><td>limit_count_20</td><td>59</td></tr><tr><td>pe_ttm</td><td>49</td></tr><tr><td>streak_up</td><td>34</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="today">
+  <h2>今日XGB预测 Top-30 与"是否已涨停"核对</h2>
+  <p class="subtitle">XGB Top-30 中已经处于涨停的，明日继续封板的先验概率可参考上方一字/T字差异</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>ts_code</th><th>预测涨幅</th><th>今日涨停</th><th>形态</th>
+        <th>当前N板</th><th>近5日封板数</th><th>量能放大</th>
+      </tr></thead>
+      <tbody><tr><td>603318.SH</td><td>8.17%</td><td><span class="pill yes">YES</span></td><td><span class="pill yes">one-line</span></td><td>3</td><td>4</td><td>0.68x</td></tr><tr><td>600736.SH</td><td>7.87%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>3</td><td>10.33x</td></tr><tr><td>300067.SZ</td><td>7.62%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>3</td><td>10.26x</td></tr><tr><td>603315.SH</td><td>5.16%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>2.23x</td></tr><tr><td>002606.SZ</td><td>4.39%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>5.50x</td></tr><tr><td>603390.SH</td><td>4.26%</td><td><span class="pill yes">YES</span></td><td></td><td>2</td><td>2</td><td>9.20x</td></tr><tr><td>603813.SH</td><td>4.01%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>4</td><td>3.07x</td></tr><tr><td>000609.SZ</td><td>3.85%</td><td><span class="pill yes">YES</span></td><td><span class="pill yes">one-line</span></td><td>4</td><td>4</td><td>0.11x</td></tr><tr><td>600696.SH</td><td>2.59%</td><td><span class="pill yes">YES</span></td><td></td><td>6</td><td>5</td><td>0.94x</td></tr><tr><td>603618.SH</td><td>1.09%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>2</td><td>1.82x</td></tr><tr><td>300061.SZ</td><td>1.09%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>6.68x</td></tr><tr><td>002787.SZ</td><td>0.98%</td><td><span class="pill yes">YES</span></td><td></td><td>2</td><td>2</td><td>0.97x</td></tr><tr><td>601512.SH</td><td>0.94%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>2</td><td>5.97x</td></tr><tr><td>603308.SH</td><td>0.91%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>1.71x</td></tr><tr><td>600599.SH</td><td>0.89%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>2</td><td>1.18x</td></tr><tr><td>000593.SZ</td><td>0.86%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>1.93x</td></tr><tr><td>002008.SZ</td><td>0.83%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>1.58x</td></tr><tr><td>002793.SZ</td><td>0.82%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>3.70x</td></tr><tr><td>600381.SH</td><td>0.80%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>3</td><td>1.78x</td></tr><tr><td>001267.SZ</td><td>0.77%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>1.90x</td></tr><tr><td>600770.SH</td><td>0.76%</td><td><span class="pill yes">YES</span></td><td></td><td>2</td><td>2</td><td>3.91x</td></tr><tr><td>002301.SZ</td><td>0.75%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>4.76x</td></tr><tr><td>603912.SH</td><td>0.68%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>2</td><td>1.67x</td></tr><tr><td>600186.SH</td><td>0.61%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>2.02x</td></tr><tr><td>603198.SH</td><td>0.59%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>4.38x</td></tr><tr><td>300590.SZ</td><td>0.52%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>9.03x</td></tr><tr><td>300721.SZ</td><td>0.45%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>8.11x</td></tr><tr><td>003022.SZ</td><td>0.44%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>3.15x</td></tr><tr><td>601101.SH</td><td>0.40%</td><td><span class="pill no">no</span></td><td></td><td>0</td><td>1</td><td>4.27x</td></tr><tr><td>603060.SH</td><td>0.39%</td><td><span class="pill yes">YES</span></td><td></td><td>2</td><td>2</td><td>7.43x</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+const DATA = {"data_since":"20180101","panel_dates":["20180102","20260424"],"n_stocks":5190,"probabilities_overall":{"n_total_rows":6478280,"n_up_limit_rows":94306,"p_uplimit_unconditional_t":0.014557259025543817,"p_uplimit_unconditional_t1":0.01451434640058781,"by_streak":[{"streak":1,"n":70160,"p_continue":0.1892103762827822,"p_continue_one_line":0.03774230330672748},{"streak":2,"n":13269,"p_continue":0.36965860275830886,"p_continue_one_line":0.11937598914763735},{"streak":3,"n":4903,"p_continue":0.49214766469508464,"p_continue_one_line":0.1911074852131348},{"streak":4,"n":2412,"p_continue":0.538971807628524,"p_continue_one_line":0.23175787728026534},{"streak":5,"n":1300,"p_continue":0.5869230769230769,"p_continue_one_line":0.27384615384615385},{"streak":6,"n":762,"p_continue":0.6115485564304461,"p_continue_one_line":0.3228346456692913},{"streak":7,"n":466,"p_continue":0.648068669527897,"p_continue_one_line":0.37553648068669526},{"streak":8,"n":302,"p_continue":0.6754966887417219,"p_continue_one_line":0.41721854304635764},{"streak":9,"n":204,"p_continue":0.7058823529411765,"p_continue_one_line":0.47549019607843135},{"streak":10,"n":144,"p_continue":0.7777777777777778,"p_continue_one_line":0.4930555555555556},{"streak":11,"n":112,"p_continue":0.7142857142857143,"p_continue_one_line":0.5535714285714286},{"streak":12,"n":80,"p_continue":0.75,"p_continue_one_line":0.5375},{"streak":13,"n":60,"p_continue":0.6833333333333333,"p_continue_one_line":0.5166666666666667}],"by_type_given_up_t":[{"type":"one_line","n":9428,"p_continue":0.6693890538820535,"p_continue_one_line":0.43095036062791686},{"type":"t_shape","n":84878,"p_continue":0.2102429369212281,"p_continue_one_line":0.03457904286151889}],"by_board_given_up_t":[{"board":"Main","n":76701,"p_continue":0.2613003741802584},{"board":"ChiNext","n":15967,"p_continue":0.24638316527838666},{"board":"STAR","n":1638,"p_continue":0.10989010989010989}],"by_year_given_up_t":[{"year":"2018","n":2941,"p_continue":0.2978578714722883},{"year":"2019","n":3955,"p_continue":0.3094816687737042},{"year":"2020","n":4004,"p_continue":0.29595404595404595},{"year":"2021","n":13502,"p_continue":0.23959413420234038},{"year":"2022","n":16644,"p_continue":0.25348473924537374},{"year":"2023","n":9617,"p_continue":0.22792970780908808},{"year":"2024","n":19852,"p_continue":0.27191214990932905},{"year":"2025","n":18124,"p_continue":0.25270359743985876},{"year":"2026","n":5667,"p_continue":0.220045879654138}],"by_cap_given_up_t":[{"cap_bucket":"XS","n":18730,"p_continue":0.33069941270688735},{"cap_bucket":"S","n":20477,"p_continue":0.27337988963227033},{"cap_bucket":"M","n":21371,"p_continue":0.2525852791165598},{"cap_bucket":"L","n":20267,"p_continue":0.22775941185177875},{"cap_bucket":"XL","n":13461,"p_continue":0.1745784117078969}]},"probabilities_recent_90d":{"n_total_rows":460403,"n_up_limit_rows":6882,"p_uplimit_unconditional_t":0.014947774015373488,"p_uplimit_unconditional_t1":0.01497166612728414,"by_streak":[{"streak":1,"n":5302,"p_continue":0.17804602036967182,"p_continue_one_line":0.030365899660505468},{"streak":2,"n":950,"p_continue":0.33789473684210525,"p_continue_one_line":0.10736842105263159},{"streak":3,"n":322,"p_continue":0.4658385093167702,"p_continue_one_line":0.14285714285714285},{"streak":4,"n":150,"p_continue":0.43333333333333335,"p_continue_one_line":0.14666666666666667},{"streak":5,"n":67,"p_continue":0.5373134328358209,"p_continue_one_line":0.208955223880597}],"by_type_given_up_t":[{"type":"one_line","n":550,"p_continue":0.66,"p_continue_one_line":0.39636363636363636},{"type":"t_shape","n":6332,"p_continue":0.19077700568540745,"p_continue_one_line":0.025268477574226154}],"by_board_given_up_t":[{"board":"Main","n":6383,"p_continue":0.2378192072693091},{"board":"ChiNext","n":332,"p_continue":0.12951807228915663},{"board":"STAR","n":167,"p_continue":0.059880239520958084}],"by_year_given_up_t":[{"year":"2025","n":1215,"p_continue":0.26666666666666666},{"year":"2026","n":5667,"p_continue":0.220045879654138}],"by_cap_given_up_t":[{"cap_bucket":"XS","n":386,"p_continue":0.3860103626943005},{"cap_bucket":"S","n":862,"p_continue":0.2819025522041763},{"cap_bucket":"M","n":1405,"p_continue":0.200711743772242},{"cap_bucket":"L","n":2185,"p_continue":0.22608695652173913},{"cap_bucket":"XL","n":2044,"p_continue":0.1971624266144814}]},"feature_lifts":[{"feature":"turnover_rate_f","lift":0.24461881030643623,"bins":[{"bin":0,"n":18862,"p_continue":0.43956102216095855,"feature_mean":2.186941167426572},{"bin":1,"n":18861,"p_continue":0.2133502995599385,"feature_mean":6.318369206298711},{"bin":2,"n":18862,"p_continue":0.19494221185452232,"feature_mean":10.792065920899162},{"bin":3,"n":18860,"p_continue":0.20349946977730646,"feature_mean":17.597006892895017},{"bin":4,"n":18861,"p_continue":0.22936217591856212,"feature_mean":36.03194248449181}],"p_top_bin":0.22936217591856212,"p_bot_bin":0.43956102216095855},{"feature":"volume_ratio","lift":0.21818267402188274,"bins":[{"bin":0,"n":18903,"p_continue":0.4113632756705285,"feature_mean":0.5625831878537798},{"bin":1,"n":18480,"p_continue":0.2275974025974026,"feature_mean":1.1550892857142856},{"bin":2,"n":18486,"p_continue":0.20128746078113166,"feature_mean":1.6577918424753868},{"bin":3,"n":18682,"p_continue":0.19318060164864576,"feature_mean":2.441398672519002},{"bin":4,"n":18509,"p_continue":0.20146955535145064,"feature_mean":5.549983251391215}],"p_top_bin":0.20146955535145064,"p_bot_bin":0.4113632756705285},{"feature":"limit_count_20","lift":0.21602460041910906,"bins":[{"bin":0,"n":61118,"p_continue":0.2012009555286495,"feature_mean":1.34223960208122},{"bin":1,"n":19023,"p_continue":0.312726699258792,"feature_mean":3.379067444672239},{"bin":2,"n":14165,"p_continue":0.41722555594775856,"feature_mean":7.145428873985175}],"p_top_bin":0.41722555594775856,"p_bot_bin":0.2012009555286495},{"feature":"vol_surge","lift":0.19271729776247845,"bins":[{"bin":0,"n":18592,"p_continue":0.3967835628227194,"feature_mean":0.6141999065696778},{"bin":1,"n":18592,"p_continue":0.21799698795180722,"feature_mean":1.261070742291943},{"bin":2,"n":18592,"p_continue":0.20406626506024098,"feature_mean":1.8021476584148723},{"bin":3,"n":18592,"p_continue":0.2064328743545611,"feature_mean":2.5640582366565665},{"bin":4,"n":18592,"p_continue":0.21848106712564544,"feature_mean":4.553844363946242}],"p_top_bin":0.21848106712564544,"p_bot_bin":0.3967835628227194},{"feature":"ret_5","lift":0.1910387398893146,"bins":[{"bin":0,"n":18792,"p_continue":0.19880800340570456,"feature_mean":1.0526461100468283},{"bin":1,"n":18792,"p_continue":0.19481694338016178,"feature_mean":9.402819040017027},{"bin":2,"n":18791,"p_continue":0.21824277579692405,"feature_mean":14.097252386780903},{"bin":3,"n":18792,"p_continue":0.2723499361430396,"feature_mean":20.751393853767564},{"bin":4,"n":18792,"p_continue":0.3858556832694764,"feature_mean":38.58454608343976}],"p_top_bin":0.3858556832694764,"p_bot_bin":0.19880800340570456},{"feature":"ret_10","lift":0.1909323116219668,"bins":[{"bin":0,"n":18792,"p_continue":0.19417837377607491,"feature_mean":-2.4043222062579828},{"bin":1,"n":18792,"p_continue":0.19614729672200937,"feature_mean":9.96982291400596},{"bin":2,"n":18791,"p_continue":0.22361768931935502,"feature_mean":16.442014336650523},{"bin":3,"n":18792,"p_continue":0.271019582801192,"feature_mean":25.084137585142614},{"bin":4,"n":18792,"p_continue":0.3851106853980417,"feature_mean":51.48268108769689}],"p_top_bin":0.3851106853980417,"p_bot_bin":0.19417837377607491},{"feature":"ret_3","lift":0.18177948063005533,"bins":[{"bin":0,"n":18792,"p_continue":0.2024797786292039,"feature_mean":3.257932545764155},{"bin":1,"n":18792,"p_continue":0.20051085568326948,"feature_mean":9.208887356321839},{"bin":2,"n":18791,"p_continue":0.20994092916821883,"feature_mean":12.75133590548667},{"bin":3,"n":18792,"p_continue":0.2748510004257131,"feature_mean":17.988880034057047},{"bin":4,"n":18792,"p_continue":0.3822903363133248,"feature_mean":30.202536313324817}],"p_top_bin":0.3822903363133248,"p_bot_bin":0.2024797786292039},{"feature":"amount_surge","lift":0.1734617039586919,"bins":[{"bin":0,"n":18592,"p_continue":0.3816695352839931,"feature_mean":0.6623272515430118},{"bin":1,"n":18592,"p_continue":0.21632960413080896,"feature_mean":1.362384803951534},{"bin":2,"n":18592,"p_continue":0.2082078313253012,"feature_mean":1.9763520686273603},{"bin":3,"n":18592,"p_continue":0.21272590361445784,"feature_mean":2.850046593891187},{"bin":4,"n":18592,"p_continue":0.2248278829604131,"feature_mean":5.123026189369852}],"p_top_bin":0.2248278829604131,"p_bot_bin":0.3816695352839931},{"feature":"ret_20","lift":0.17247763987012094,"bins":[{"bin":0,"n":18793,"p_continue":0.19980843931250997,"feature_mean":-6.455463411908689},{"bin":1,"n":18791,"p_continue":0.19993613964131765,"feature_mean":10.692224346761748},{"bin":2,"n":18791,"p_continue":0.2302165930498643,"feature_mean":19.563764552179233},{"bin":3,"n":18792,"p_continue":0.26782673478075775,"feature_mean":30.509731257982118},{"bin":4,"n":18792,"p_continue":0.3722860791826309,"feature_mean":63.92341541613451}],"p_top_bin":0.3722860791826309,"p_bot_bin":0.19980843931250997},{"feature":"log_circ_mv","lift":0.14928526526631095,"bins":[{"bin":0,"n":18862,"p_continue":0.3306118121090022,"feature_mean":11.72256616944766},{"bin":1,"n":18861,"p_continue":0.273951540215259,"feature_mean":12.44053926017874},{"bin":2,"n":18861,"p_continue":0.2525846985843805,"feature_mean":12.902165174616535},{"bin":3,"n":18861,"p_continue":0.2422459042468586,"feature_mean":13.420303539651911},{"bin":4,"n":18861,"p_continue":0.18132654684269126,"feature_mean":14.514686185463017}],"p_top_bin":0.18132654684269126,"p_bot_bin":0.3306118121090022},{"feature":"close_to_60high","lift":0.08833868435490616,"bins":[{"bin":0,"n":18367,"p_continue":0.21059508901834811,"feature_mean":0.7020427364221393},{"bin":1,"n":18367,"p_continue":0.18658463548755921,"feature_mean":0.8870380379930313},{"bin":2,"n":55099,"p_continue":0.2749233198424654,"feature_mean":0.9916708779752993}],"p_top_bin":0.2749233198424654,"p_bot_bin":0.21059508901834811},{"feature":"pe_ttm","lift":0.04934640522875819,"bins":[{"bin":0,"n":12240,"p_continue":0.21127450980392157,"feature_mean":17.979207009803922},{"bin":1,"n":12240,"p_continue":0.26062091503267976,"feature_mean":33.39161397058823},{"bin":2,"n":12240,"p_continue":0.2465686274509804,"feature_mean":51.51497022058823},{"bin":3,"n":12240,"p_continue":0.23937908496732027,"feature_mean":86.70747828431374},{"bin":4,"n":12240,"p_continue":0.2338235294117647,"feature_mean":612.4109825163399}],"p_top_bin":0.2338235294117647,"p_bot_bin":0.21127450980392157},{"feature":"vol_20","lift":0.02436531841652323,"bins":[{"bin":0,"n":18592,"p_continue":0.2342405335628227,"feature_mean":2.6732018795220456},{"bin":1,"n":18592,"p_continue":0.24806368330464715,"feature_mean":3.4192036100658134},{"bin":2,"n":18592,"p_continue":0.25645438898450945,"feature_mean":4.072432036951325},{"bin":3,"n":18592,"p_continue":0.24639629948364888,"feature_mean":4.84594486282588},{"bin":4,"n":18592,"p_continue":0.25860585197934594,"feature_mean":7.674423895310643}],"p_top_bin":0.25860585197934594,"p_bot_bin":0.2342405335628227},{"feature":"pb","lift":0.013557197912065555,"bins":[{"bin":0,"n":18332,"p_continue":0.2553458433340607,"feature_mean":1.3997745090552038},{"bin":1,"n":18331,"p_continue":0.24494026512465222,"feature_mean":2.365367197643337},{"bin":2,"n":18329,"p_continue":0.2584974630367178,"feature_mean":3.3886638550930224},{"bin":3,"n":18330,"p_continue":0.2512820512820513,"feature_mean":5.034576672122204},{"bin":4,"n":18331,"p_continue":0.2449948175222301,"feature_mean":21.15761444001964}],"p_top_bin":0.2449948175222301,"p_bot_bin":0.2553458433340607}],"classifier":{"n_train":34470,"n_test":24374,"test_since":"20240101","base_rate_test":0.22864527775498483,"auc_train":0.7515751689840324,"auc_test":0.6834516019889029,"average_precision_test":0.4499209419094478,"feature_importance":[{"feature":"log_circ_mv","importance":195.0},{"feature":"turnover_rate_f","importance":191.0},{"feature":"volume_ratio","importance":152.0},{"feature":"vol_20","importance":142.0},{"feature":"ret_3","importance":134.0},{"feature":"pb","importance":115.0},{"feature":"close_to_60high","importance":102.0},{"feature":"vol_surge","importance":97.0},{"feature":"ret_10","importance":91.0},{"feature":"ret_20","importance":83.0},{"feature":"ret_5","importance":80.0},{"feature":"amount_surge","importance":62.0},{"feature":"limit_count_20","importance":59.0},{"feature":"pe_ttm","importance":49.0},{"feature":"streak_up","importance":34.0},{"feature":"limits_5d","importance":34.0},{"feature":"days_since_limit","importance":0.0}],"best_iteration":54},"top_pred_overlap_today":[{"ts_code":"603318.SH","pred_pct_chg_next":8.171718,"is_up_limit_today":1,"one_line_today":1,"streak_up":3,"limits_5d":4.0,"amount_surge":0.6788884259577773},{"ts_code":"600736.SH","pred_pct_chg_next":7.8692474,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":3.0,"amount_surge":10.328660008111656},{"ts_code":"300067.SZ","pred_pct_chg_next":7.619282,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":3.0,"amount_surge":10.256438841828917},{"ts_code":"603315.SH","pred_pct_chg_next":5.157844,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":2.2341312029695852},{"ts_code":"002606.SZ","pred_pct_chg_next":4.3891983,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":5.501818451593748},{"ts_code":"603390.SH","pred_pct_chg_next":4.2579765,"is_up_limit_today":1,"one_line_today":0,"streak_up":2,"limits_5d":2.0,"amount_surge":9.202831831751809},{"ts_code":"603813.SH","pred_pct_chg_next":4.011364,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":4.0,"amount_surge":3.0724344951404854},{"ts_code":"000609.SZ","pred_pct_chg_next":3.8466213,"is_up_limit_today":1,"one_line_today":1,"streak_up":4,"limits_5d":4.0,"amount_surge":0.10987878934817479},{"ts_code":"600696.SH","pred_pct_chg_next":2.5904937,"is_up_limit_today":1,"one_line_today":0,"streak_up":6,"limits_5d":5.0,"amount_surge":0.9397931905400367},{"ts_code":"603618.SH","pred_pct_chg_next":1.0926684,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":2.0,"amount_surge":1.8241094662145838},{"ts_code":"300061.SZ","pred_pct_chg_next":1.0861225,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":6.679945231095431},{"ts_code":"002787.SZ","pred_pct_chg_next":0.9768656,"is_up_limit_today":1,"one_line_today":0,"streak_up":2,"limits_5d":2.0,"amount_surge":0.9718558458161054},{"ts_code":"601512.SH","pred_pct_chg_next":0.936919,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":2.0,"amount_surge":5.970044104030939},{"ts_code":"603308.SH","pred_pct_chg_next":0.9095298,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":1.7149161458724151},{"ts_code":"600599.SH","pred_pct_chg_next":0.89252424,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":2.0,"amount_surge":1.176321909490177},{"ts_code":"000593.SZ","pred_pct_chg_next":0.85797745,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":1.9325635056599009},{"ts_code":"002008.SZ","pred_pct_chg_next":0.8347155,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":1.5841359969091775},{"ts_code":"002793.SZ","pred_pct_chg_next":0.8163341,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":3.6973184270327644},{"ts_code":"600381.SH","pred_pct_chg_next":0.79761285,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":3.0,"amount_surge":1.783298841052608},{"ts_code":"001267.SZ","pred_pct_chg_next":0.7678016,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":1.896391709449128},{"ts_code":"600770.SH","pred_pct_chg_next":0.7610848,"is_up_limit_today":1,"one_line_today":0,"streak_up":2,"limits_5d":2.0,"amount_surge":3.913988505794554},{"ts_code":"002301.SZ","pred_pct_chg_next":0.7471255,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":4.7643268539823165},{"ts_code":"603912.SH","pred_pct_chg_next":0.6786254,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":2.0,"amount_surge":1.6680487737669145},{"ts_code":"600186.SH","pred_pct_chg_next":0.6122685,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":2.02296810527221},{"ts_code":"603198.SH","pred_pct_chg_next":0.58766913,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":4.380650717666017},{"ts_code":"300590.SZ","pred_pct_chg_next":0.5238395,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":9.030182264310486},{"ts_code":"300721.SZ","pred_pct_chg_next":0.45084402,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":8.107470883490487},{"ts_code":"003022.SZ","pred_pct_chg_next":0.4444398,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":3.149386038035475},{"ts_code":"601101.SH","pred_pct_chg_next":0.40007475,"is_up_limit_today":0,"one_line_today":0,"streak_up":0,"limits_5d":1.0,"amount_surge":4.267387390554529},{"ts_code":"603060.SH","pred_pct_chg_next":0.39198485,"is_up_limit_today":1,"one_line_today":0,"streak_up":2,"limits_5d":2.0,"amount_surge":7.4284131029808815}]};
+const LAYOUT_BASE = {
+  paper_bgcolor:'#161b22', plot_bgcolor:'#161b22',
+  font: { color:'#c9d1d9', family:'PingFang SC, Microsoft YaHei, sans-serif', size:12 },
+  xaxis: { gridcolor:'#2a313c', zerolinecolor:'#2a313c' },
+  yaxis: { gridcolor:'#2a313c', zerolinecolor:'#2a313c' },
+  margin: { l:60, r:30, t:20, b:50 },
+};
+const CONFIG = { displaylogo:false, responsive:true };
+
+function merge(a,b){
+  const o = JSON.parse(JSON.stringify(a));
+  for (const k in b){
+    if (b[k]&&typeof b[k]==='object'&&!Array.isArray(b[k]))
+      o[k] = merge(o[k]||{}, b[k]);
+    else o[k]=b[k];
+  }
+  return o;
+}
+
+// Streak chart
+(function() {
+  const arr = DATA.probabilities_overall.by_streak.filter(r=>r.streak>=1 && r.streak<=12);
+  const traces = [{
+    x: arr.map(r => `${r.streak}板`),
+    y: arr.map(r => r.p_continue * 100),
+    name: 'P(继续封板)', type: 'bar',
+    marker: { color:'#da3633' },
+    text: arr.map(r => `${(r.p_continue*100).toFixed(1)}%`),
+    textposition: 'outside',
+    hovertemplate: 'N=%{x}<br>n=%{customdata}<br>P=%{y:.1f}%<extra></extra>',
+    customdata: arr.map(r=>r.n.toLocaleString()),
+  }, {
+    x: arr.map(r => `${r.streak}板`),
+    y: arr.map(r => r.p_continue_one_line * 100),
+    name: 'P(下一日一字)', type: 'bar',
+    marker: { color:'#d29922' },
+    text: arr.map(r => `${(r.p_continue_one_line*100).toFixed(1)}%`),
+    textposition: 'outside',
+  }];
+  const layout = merge(LAYOUT_BASE, {
+    yaxis: { title:'概率 (%)', ticksuffix:'%', range:[0, 100] },
+    barmode: 'group',
+    legend: { orientation:'h', y:1.1 },
+  });
+  Plotly.newPlot('streak_chart', traces, layout, CONFIG);
+})();
+
+// Lift chart — top 12 features by lift
+(function() {
+  const lifts = (DATA.feature_lifts || []).slice(0, 12);
+  if (!lifts.length) return;
+  // For each feature, plot 5 bars (one per quintile) of P(continue)
+  const traces = lifts.map((r,i) => ({
+    x: r.bins.map(b => `Q${b.bin+1}`),
+    y: r.bins.map(b => b.p_continue * 100),
+    name: r.feature,
+    type: 'bar',
+    visible: i === 0,
+    text: r.bins.map(b => `${(b.p_continue*100).toFixed(1)}%`),
+    textposition: 'outside',
+    hovertemplate: '%{x}<br>n=%{customdata}<br>P=%{y:.1f}%<extra></extra>',
+    customdata: r.bins.map(b => b.n.toLocaleString()),
+  }));
+  const buttons = lifts.map((r,i) => ({
+    method: 'update', label: `${r.feature} (lift=${(r.lift*100).toFixed(1)}pp)`,
+    args: [{visible: lifts.map((_,j)=>j===i)}, {title: ''}]
+  }));
+  const layout = merge(LAYOUT_BASE, {
+    yaxis: { title:'P(继续封板) (%)', ticksuffix:'%', range:[0, 60] },
+    xaxis: { title: '特征五分位 (Q1=最低, Q5=最高)' },
+    updatemenus: [{
+      buttons: buttons,
+      direction:'down', showactive:true, x:0, xanchor:'left', y:1.18,
+      bgcolor:'#1c232e', bordercolor:'#2a313c',
+    }],
+    margin: { t:60 },
+  });
+  Plotly.newPlot('lift_chart', traces, layout, CONFIG);
+  // Update callout with first feature's interpretation
+  const top = lifts[0];
+  const dir = top.p_top_bin > top.p_bot_bin ? '高档位 → 高概率' : '低档位 → 高概率';
+  document.getElementById('lift_callout').innerHTML =
+    `<b>提升最大特征：</b> <code>${top.feature}</code> · ` +
+    `最低五分位 P=${(top.p_bot_bin*100).toFixed(1)}%，最高五分位 P=${(top.p_top_bin*100).toFixed(1)}%（${dir}）。 ` +
+    `下拉框可切换其他特征。`;
+})();
+</script>
+</body>
+</html>

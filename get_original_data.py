@@ -40,7 +40,11 @@ TUSHARE_TOKEN  = '54bad211769c2ef9c4a89798a9a3a804dd370db5873119ff2d005573'
 DATA_DIR       = Path('./stock_data')
 CHECKPOINT_FILE = DATA_DIR / 'checkpoint.json'
 STOCK_LIST_FILE = DATA_DIR / 'stock_list.csv'
-TARGET_START   = '20170101'
+# Earliest A-share trading day (SSE opened 1990-12-19; SZSE 1991-04-03).
+# Tushare Pro `pro.daily` returns empty for dates before a stock listed, so
+# this floor is safe for both exchanges. Override via run(start_date=...) for
+# faster incremental fills.
+TARGET_START   = '19901219'
 
 # Flush accumulated data to disk every FLUSH_EVERY dates to bound RAM usage.
 # 30 dates × 5000 stocks × ~200 bytes ≈ 30 MB peak — well within 16 GB.
@@ -505,21 +509,25 @@ def reset_progress():
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def run(command: str = 'status', batch: int = None,
-        workers: int = 1, rate: float = 8.0):
+        workers: int = 1, rate: float = 8.0,
+        start_date: str = TARGET_START):
     """
     Scripted entry point.
 
     Commands: 'init', 'download', 'status', 'retry', 'reset'
 
     Args:
-        batch:   Max dates per run (default: all).
-        workers: Parallel threads (default 1; use 4 on remote servers).
-        rate:    Total API calls/sec across all workers (default 8.0).
+        batch:      Max dates per run (default: all).
+        workers:    Parallel threads (default 1; use 4 on remote servers).
+        rate:       Total API calls/sec across all workers (default 8.0).
+        start_date: Earliest trading date to download (YYYYMMDD).
+                    Default = '19901219' = SSE first trading day. Use a more
+                    recent floor (e.g. '20170101') for faster incremental fills.
 
     Examples:
-        run('download')                     # single-threaded
-        run('download', workers=4)          # 4x faster on remote
-        run('download', batch=100, workers=4)
+        run('download')                                      # full history → today
+        run('download', workers=4)                           # 4x faster on remote
+        run('download', start_date='20170101', workers=4)    # 2017+ only
         run('status')
     """
     setup_directories()
@@ -530,7 +538,8 @@ def run(command: str = 'status', batch: int = None,
         print("Done. Run run('download') to start.")
     elif command == 'download':
         get_stock_list(pro=pro)
-        download_all(pro, batch=batch, workers=workers, rate=rate)
+        download_all(pro, start_date=start_date, batch=batch,
+                     workers=workers, rate=rate)
     elif command == 'status':
         show_status()
     elif command == 'retry':
@@ -553,6 +562,8 @@ def main():
                         help='Total API calls/sec across all workers (default 8.0 = 480/min)')
     parser.add_argument('--batch',         type=int, default=None,
                         help='Max dates per run (default: all)')
+    parser.add_argument('--start-date',    type=str, default=TARGET_START,
+                        help=f'Earliest trade date YYYYMMDD (default {TARGET_START} = SSE first trading day)')
     parser.add_argument('--initial',       action='store_true',
                         help='Force initial-download mode (skip read-merge, ~3x faster for first run)')
     parser.add_argument('--status',        action='store_true', help='Show progress')
@@ -574,8 +585,8 @@ def main():
         retry_failed(pro)
     elif args.download:
         get_stock_list(pro=pro)
-        download_all(pro, batch=args.batch, initial=args.initial,
-                     workers=args.workers, rate=args.rate)
+        download_all(pro, start_date=args.start_date, batch=args.batch,
+                     initial=args.initial, workers=args.workers, rate=args.rate)
     else:
         parser.print_help()
         print("\nQuick start (fresh server, 4 workers ≈ 4× faster):")

@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>能工智人 — XGB 选股看板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg:        #0e1117;
+    --panel:     #161b22;
+    --panel2:    #1c232e;
+    --border:    #2a313c;
+    --text:      #c9d1d9;
+    --muted:     #7d8590;
+    --accent:    #58a6ff;
+    /* A股习惯：红涨绿跌 */
+    --up:        #da3633;   /* 上涨 / 正向 */
+    --down:      #2ea043;   /* 下跌 / 负向 */
+    --good:      #da3633;   /* “好”=上涨 */
+    --bad:       #2ea043;   /* “坏”=下跌 */
+    --warn:      #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 0; line-height: 1.6;
+  }
+  header {
+    background: linear-gradient(180deg, #2a1a1c 0%, #0e1117 100%);
+    padding: 32px 48px 24px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 30px; font-weight: 700; letter-spacing: 2px; }
+  header p  { margin: 0; color: var(--muted); font-size: 14px; }
+  header .badge {
+    display: inline-block; padding: 2px 10px; margin-left: 10px;
+    background: rgba(218,54,51,.15); color: var(--up);
+    border: 1px solid rgba(218,54,51,.4); border-radius: 4px;
+    font-size: 12px; font-weight: 500;
+  }
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 8px 48px; overflow-x: auto; white-space: nowrap;
+  }
+  nav a {
+    display: inline-block; padding: 6px 14px; margin-right: 4px;
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    border-radius: 4px;
+  }
+  nav a:hover { background: var(--panel2); color: var(--text); }
+  section {
+    padding: 32px 48px; border-bottom: 1px solid var(--border);
+  }
+  section h2 { font-size: 20px; margin: 0 0 4px; }
+  section .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 16px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; letter-spacing: .4px; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .hint  { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .good { color: var(--good); }
+  .bad  { color: var(--bad); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 1100px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  .plot {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; min-height: 360px;
+  }
+  .plot-title { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+  .plot-note  { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+
+  /* Top-N stock cards */
+  .stocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+  .stock {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px; font-size: 13px;
+  }
+  .stock.outperform { border-left: 3px solid var(--up); }
+  .stock.underperform { border-left: 3px solid var(--down); }
+  .stock .s-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  .stock .s-name { font-size: 15px; font-weight: 600; }
+  .stock .s-ts   { color: var(--muted); font-size: 12px; }
+  .stock .s-pred { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stock .s-meta { color: var(--muted); font-size: 11px; }
+  .stock .probbar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin: 8px 0 4px; }
+  .stock .probbar div { height: 100%; background: var(--up); }
+  .stock.underperform .probbar div { background: var(--down); }
+  .stock .factors { display: grid; grid-template-columns: repeat(2,1fr); gap: 2px 12px; margin-top: 8px; font-size: 11px; }
+  .stock .factors span { color: var(--muted); }
+  .stock .factors b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .stock .reasons { margin-top: 8px; font-size: 12px; line-height: 1.45; }
+  .stock .reason-tag {
+    display: inline-block; padding: 1px 8px; margin: 2px 4px 2px 0;
+    background: rgba(218,54,51,.1); border: 1px solid rgba(218,54,51,.3);
+    border-radius: 10px; font-size: 11px;
+  }
+  .stock.underperform .reason-tag { background: rgba(46,160,67,.1); border-color: rgba(46,160,67,.3); }
+  .stock .spark { height: 40px; margin-top: 6px; }
+
+  /* Table */
+  .toolbar { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toolbar input, .toolbar select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px; font-size: 13px;
+  }
+  .toolbar span { color: var(--muted); font-size: 12px; }
+  table.live {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden;
+  }
+  table.live th, table.live td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: right; font-variant-numeric: tabular-nums; }
+  table.live th {
+    background: var(--panel2); text-align: left; cursor: pointer; user-select: none;
+    position: sticky; top: 0; z-index: 1;
+  }
+  table.live th:hover { color: var(--accent); }
+  table.live td:nth-child(1), table.live td:nth-child(2), table.live td:nth-child(3), table.live td:nth-child(4), table.live td:nth-child(5) { text-align: left; }
+  .table-wrap { max-height: 600px; overflow: auto; border-radius: 6px; }
+  footer {
+    padding: 24px 48px; color: var(--muted); font-size: 12px; text-align: center;
+  }
+  /* Feature importance */
+  .fi-row { display: flex; align-items: center; gap: 10px; margin: 2px 0; font-size: 12px; }
+  .fi-row .fi-name { flex: 0 0 260px; font-family: 'Menlo', 'Courier New', monospace; color: var(--text); }
+  .fi-row .fi-bar  { flex: 1; height: 14px; background: var(--panel2); border-radius: 2px; overflow: hidden; }
+  .fi-row .fi-bar div { height: 100%; background: var(--accent); }
+  .fi-row .fi-val  { color: var(--muted); flex: 0 0 80px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* Group table */
+  table.groups {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  }
+  table.groups th, table.groups td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  table.groups th { background: var(--panel2); text-align: left; }
+  table.groups td { text-align: right; font-variant-numeric: tabular-nums; }
+  table.groups td:first-child, table.groups th:first-child { text-align: left; }
+  .heat-bar { height: 6px; background: var(--panel2); border-radius: 2px; overflow: hidden; margin: 3px 0 0; }
+  .heat-bar div { height: 100%; }
+
+  /* Backtest scenario tabs */
+  .bt-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .bt-tab {
+    padding: 8px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--muted); cursor: pointer; font-size: 13px;
+  }
+  .bt-tab.active { background: var(--panel2); color: var(--up); border-color: var(--up); }
+  .bt-tab:hover { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>能工智人 <span class="badge" id="predDate">加载中...</span></h1>
+  <p id="subtitle">正在加载模型元信息…</p>
+</header>
+
+<nav>
+  <a href="#overview">模型概览</a>
+  <a href="#accuracy">精度评估</a>
+  <a href="#decile">十分位 / 多空</a>
+  <a href="#backtest">策略回测</a>
+  <a href="#groups">分组表现</a>
+  <a href="#importance">特征重要性</a>
+  <a href="#live">次日看多榜</a>
+  <a href="#underperform">次日看空榜</a>
+  <a href="#distribution">预测分布</a>
+  <a href="#table">全部股票</a>
+</nav>
+
+<section id="overview">
+  <h2>模型概览</h2>
+  <p class="subtitle" id="overviewSub"></p>
+  <div class="cards" id="overviewCards"></div>
+</section>
+
+<section id="accuracy">
+  <h2>预测精度(样本外滚动窗口)</h2>
+  <p class="subtitle">
+    下列指标基于 212 个互不重叠的滚动前推(walk-forward)测试折,对每个(股票, 日期)对进行打分的模型
+    仅使用严格更早的数据训练(含隔离期 + 禁运期)。"Target" = 次日 pct_chg 减去当日横截面均值
+    (即模型的回归目标,区分个股相对于市场的超额收益)。
+  </p>
+  <div class="cards" id="accuracyCards"></div>
+  <div class="grid-2" style="margin-top:16px;">
+    <div class="plot">
+      <div class="plot-title">每日排名信息系数 IC(横截面 Spearman:预测 vs 实际)</div>
+      <div id="icPlot" style="height:360px;"></div>
+      <p class="plot-note">每个点代表一个交易日,正值代表当日预测排序方向正确;蓝线为 20 日滚动均值。</p>
+    </div>
+    <div class="plot">
+      <div class="plot-title">预测值 vs 实际值(1.5 万随机样本)</div>
+      <div id="scatterPlot" style="height:360px;"></div>
+      <p class="plot-note">虚线为 y=x。模型是<b>排序模型</b>而非幅度模型,弱正斜率 + 正 IC 即为预期形态。</p>
+    </div>
+  </div>
+</section>
+
+<section id="decile">
+  <h2>十分位分析 / 多空价差</h2>
+  <p class="subtitle">
+    每日将所有股票按预测值划分为 10 个分组:第 10 组 = 预测最高,第 1 组 = 预测最低。
+    若模型具备真实信号,各组平均实际收益应随分组单调递增。每日 "顶-底" 价差即为
+    多空策略在 demeaned-pct_chg 单位下的日收益。
+  </p>
+  <div class="grid-2">
+    <div class="plot">
+      <div class="plot-title">各预测分位组的平均实际收益</div>
+      <div id="decilePlot" style="height:360px;"></div>
+    </div>
+    <div class="plot">
+      <div class="plot-title">多空累计收益(顶组 − 底组)</div>
+      <div id="lsCumPlot" style="height:360px;"></div>
+      <p class="plot-note" id="lsNote"></p>
+    </div>
+  </div>
+</section>
+
+<section id="backtest">
+  <h2>策略回测:XGBoost + Markowitz Top-10 多头组合</h2>
+  <p class="subtitle">
+    每日用 walk-forward 样本外预测对全市场打分,选预测最高的 10 只股票,按对角协方差 Markowitz
+    封闭解 (<code>w_i ∝ max(mu_i,0) / σ_i²</code>) 构建权重。持仓规则:止盈 +3%,止损 −2%,最大持有
+    5 日,日间按 high/low 触发成交。下方提供三种情境:理想组合(无流动性约束)与两种真实约束
+    (5% ADV 仓位上限 + 市场冲击成本)。基准为沪深 300 买入并持有。
+  </p>
+  <div class="bt-tabs" id="btTabs"></div>
+  <div class="cards" id="btCards"></div>
+  <div class="grid-2" style="margin-top:8px;">
+    <div class="plot">
+      <div class="plot-title">净值曲线(策略 vs 沪深 300)</div>
+      <div id="btEquity" style="height:360px;"></div>
+    </div>
+    <div class="plot">
+      <div class="plot-title">回撤(%)</div>
+      <div id="btDrawdown" style="height:360px;"></div>
+      <p class="plot-note" id="btNote"></p>
+    </div>
+  </div>
+  <div class="cards" id="btTradeCards" style="margin-top:16px;"></div>
+</section>
+
+<section id="groups">
+  <h2>分组表现</h2>
+  <p class="subtitle">
+    按子群体重新计算各指标。排名 IC 与命中率衡量排序质量,MAE/RMSE 衡量幅度误差。
+  </p>
+  <div class="grid-2">
+    <div>
+      <div class="plot-title" style="margin-bottom:8px;">按省份 / 地区(按样本量取前 15)</div>
+      <table class="groups" id="groupProvince"></table>
+    </div>
+    <div>
+      <div class="plot-title" style="margin-bottom:8px;">按板块</div>
+      <table class="groups" id="groupBoard"></table>
+      <div class="plot-title" style="margin:20px 0 8px;">按交易所</div>
+      <table class="groups" id="groupExchange"></table>
+    </div>
+  </div>
+</section>
+
+<section id="importance">
+  <h2>全局特征重要性(XGBoost 总增益)</h2>
+  <p class="subtitle">
+    跨 212 折汇总的 Top 30 特征。增益越高,说明该特征在决策树分裂中带来的损失下降越大——
+    也就是模型<b>实际依赖</b>的信号。下方个股卡片的因子快照,即是围绕这些特征构造的。
+  </p>
+  <div class="plot" style="min-height:560px;">
+    <div id="fiPlot"></div>
+  </div>
+</section>
+
+<section id="live">
+  <h2>次日看多榜:Top 20 预期跑赢 <span id="liveDateTag"></span></h2>
+  <p class="subtitle">
+    下列为模型预测次日超额收益最高的 20 只股票。每张卡片展示点估计、80% 预测区间
+    (基于验证集残差的学生 t 分布拟合)、概率分解,以及一个解释"模型为何看好"的因子快照。
+  </p>
+  <div class="stocks" id="liveTop"></div>
+</section>
+
+<section id="underperform">
+  <h2>次日看空榜:Bottom 20 预期跑输</h2>
+  <p class="subtitle">与上方格式相同,展示预测最为负面的 20 只股票。</p>
+  <div class="stocks" id="liveBot"></div>
+</section>
+
+<section id="distribution">
+  <h2>全市场预测分布</h2>
+  <p class="subtitle"><span id="distDate"></span> 全市场共 5,066 个预测的横截面分布。</p>
+  <div class="grid-2">
+    <div class="plot">
+      <div class="plot-title">预测值直方图</div>
+      <div id="histPlot" style="height:340px;"></div>
+    </div>
+    <div>
+      <div class="cards">
+        <div class="card"><div class="label">预测上涨(≥ 0%)</div><div class="value" id="distUp">—</div><div class="hint" id="distUpPct"></div></div>
+        <div class="card"><div class="label">预测下跌(&lt; 0%)</div><div class="value" id="distDown">—</div><div class="hint" id="distDownPct"></div></div>
+        <div class="card"><div class="label">强势上涨(&gt; 3%)</div><div class="value good" id="distSUp">—</div></div>
+        <div class="card"><div class="label">强势下跌(&lt; -3%)</div><div class="value bad"  id="distSDown">—</div></div>
+        <div class="card"><div class="label">中位数</div><div class="value" id="distMed">—</div></div>
+        <div class="card"><div class="label">标准差</div><div class="value" id="distStd">—</div></div>
+        <div class="card"><div class="label">P5 分位</div><div class="value bad" id="distP5">—</div></div>
+        <div class="card"><div class="label">P95 分位</div><div class="value good" id="distP95">—</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="table">
+  <h2>全部预测表</h2>
+  <p class="subtitle">共 <span id="tableN"></span> 只股票的当日预测。点击列头排序;使用下方输入框按名称/代码筛选。</p>
+  <div class="toolbar">
+    <input id="filter" type="text" placeholder="按代码 / 名称 / 省份 / 板块筛选…" style="width:320px;">
+    <select id="dirFilter">
+      <option value="all">方向:全部</option>
+      <option value="up">预测上涨</option>
+      <option value="down">预测下跌</option>
+      <option value="strongUp">强势上涨(≥3%)</option>
+      <option value="strongDown">强势下跌(≤-3%)</option>
+    </select>
+    <span id="rowCount"></span>
+  </div>
+  <div class="table-wrap">
+    <table class="live" id="liveTable"></table>
+  </div>
+</section>
+
+<footer>
+  数据来源:<code>stock_predictions_xgb.csv</code>(实时预测,自动跟随最新)+
+  <code>stock_data/models/xgb_preds/test.csv</code>(样本外 walk-forward 历史)+
+  <code>plots/backtest_xgb_markowitz/</code>(回测结果)。生成于 <span id="genAt"></span>。
+  模型:XGBoost 回归器,Pseudo-Huber 损失,174 个特征,212 个 walk-forward 折,横截面 demean 目标。
+</footer>
+
+<script>
+// A股色:红涨绿跌
+const UP_COLOR   = '#da3633';
+const DOWN_COLOR = '#2ea043';
+const BLUE       = '#58a6ff';
+
+const LAYOUT_DEFAULTS = {
+  paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+  font: { color: '#c9d1d9', family: 'system-ui, "Microsoft YaHei"', size: 12 },
+  margin: { t: 20, l: 50, r: 20, b: 45 },
+  xaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  yaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  showlegend: false,
+};
+const fmt = (x, d=2) => x == null || Number.isNaN(x) ? '—' :
+    (Number(x).toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d }));
+const fmtPct = (x, d=2) => x == null ? '—' : (x*100).toFixed(d) + '%';
+const sign = (x) => (x > 0 ? '+' : '') + fmt(x);
+const clsPos = (x) => x > 0 ? 'good' : (x < 0 ? 'bad' : '');
+const fmtMoney = (x) => {
+  if (x == null) return '—';
+  if (Math.abs(x) >= 1e8) return (x / 1e8).toFixed(2) + ' 亿';
+  if (Math.abs(x) >= 1e4) return (x / 1e4).toFixed(1) + ' 万';
+  return fmt(x, 0);
+};
+
+fetch('data.json').then(r => r.json()).then(data => {
+  window.D = data;
+
+  // Header
+  document.getElementById('predDate').innerText = `预测日期 ${data.prediction_date}`;
+  document.getElementById('subtitle').innerText =
+    `模型为 XGBoost 回归器,预测 "次日 pct_chg − 横截面均值" 的超额收益。` +
+    `特征基于 ${data.feature_date} 的行情;当日共打分 ${data.n_live_stocks.toLocaleString()} 只股票。` +
+    `模型配置:${data.model_meta.n_features} 个特征,${data.model_meta.n_folds} 个滚动折,` +
+    `${data.model_meta.canonical_n_estimators} 棵树,总训练耗时 ${Math.round(data.model_meta.total_train_seconds)} 秒。`;
+  document.getElementById('liveDateTag').innerText = `— 预测日 ${data.prediction_date}`;
+  document.getElementById('distDate').innerText = data.prediction_date;
+  document.getElementById('genAt').innerText = data.generated_at;
+
+  renderOverview(data);
+  renderAccuracy(data);
+  renderDecile(data);
+  renderBacktest(data);
+  renderGroups(data);
+  renderFeatureImportance(data);
+  renderLiveTopN(data);
+  renderDistribution(data);
+  renderLiveTable(data);
+});
+
+function renderOverview(d) {
+  const m = d.model_meta;
+  const o = d.overall_metrics;
+  document.getElementById('overviewSub').innerText =
+    `训练目标:${m.target_mode}(次日 pct_chg − 横截面均值)。` +
+    `评估区间:${o.date_start} → ${o.date_end}(${o.rows.toLocaleString()} 股-日,${o.stocks.toLocaleString()} 只股票)。` +
+    `下方所有验证指标均为 ${m.n_folds} 折滚动前推样本外平均。`;
+  const cards = [
+    ['训练目标', m.target_mode, `预测步长 = ${m.forward_window} 日`],
+    ['特征数',   m.n_features,   '输入特征数量'],
+    ['滚动折数', m.n_folds,      '12 周训练 / 2 周验证 / 2 周测试,5 日隔离'],
+    ['模型规模', `${m.canonical_n_estimators} 棵树`, `深度 = ${m.xgb_params.max_depth},学习率 = ${m.xgb_params.learning_rate}`],
+    ['损失函数', 'Pseudo-Huber', `slope = ${m.xgb_params.huber_slope}`],
+    ['总训练时长', `${(m.total_train_seconds/60).toFixed(1)} 分钟`, '累计所有折'],
+  ];
+  document.getElementById('overviewCards').innerHTML = cards.map(([l, v, h]) =>
+    `<div class="card"><div class="label">${l}</div><div class="value">${v}</div><div class="hint">${h}</div></div>`
+  ).join('');
+}
+
+function renderAccuracy(d) {
+  const o = d.overall_metrics;
+  const ic = d.daily_rank_ic;
+  const cards = [
+    ['MAE',           fmt(o.mae, 4),       '基于 demeaned pct_chg 的平均绝对误差'],
+    ['RMSE',          fmt(o.rmse, 4),      `MSE = ${fmt(o.mse, 2)}`],
+    ['Pearson IC',    fmt(o.pearson_ic, 4),'全量 625 万行'],
+    ['Spearman IC',   fmt(o.spearman_ic, 4),'50 万样本估计'],
+    ['每日排名 IC',   fmt(ic.mean, 4),     `标准差 ${fmt(ic.std, 4)},ICIR ${fmt(ic.icir, 2)}`],
+    ['方向命中率',    fmtPct(o.hit_rate),  '预测与实际同号'],
+    ['高置信命中率',  fmtPct(o.hit_rate_top10pct), '|预测| 前 10% 样本方向准确率'],
+    ['正 IC 天数占比',fmtPct(ic.pct_positive), `${Math.round(ic.pct_positive * ic.dates.length)} / ${ic.dates.length} 天`],
+  ];
+  document.getElementById('accuracyCards').innerHTML = cards.map(([l, v, h]) =>
+    `<div class="card"><div class="label">${l}</div><div class="value">${v}</div><div class="hint">${h}</div></div>`
+  ).join('');
+
+  const colors = ic.ic_daily.map(v => v >= 0 ? UP_COLOR : DOWN_COLOR);
+  Plotly.newPlot('icPlot', [
+    { x: ic.dates, y: ic.ic_daily, type: 'bar', marker: { color: colors, opacity: .5 }, name: '日度 IC' },
+    { x: ic.dates, y: ic.ic_roll20, type: 'scatter', mode: 'lines', line: { color: BLUE, width: 2 }, name: '20 日滚动' },
+  ], {
+    ...LAYOUT_DEFAULTS, showlegend: true, legend: { orientation: 'h', y: 1.08 },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '排名 IC', zeroline: true, zerolinecolor: '#6e7681' },
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, type: 'date' },
+  }, { responsive: true, displayModeBar: false });
+
+  const s = d.scatter_sample;
+  const lim = 15;
+  Plotly.newPlot('scatterPlot', [
+    { x: s.pred, y: s.target, type: 'scattergl', mode: 'markers',
+      marker: { size: 3, color: BLUE, opacity: .18 }, name: '样本外数据' },
+    { x: [-lim, lim], y: [-lim, lim], type: 'scatter', mode: 'lines',
+      line: { color: '#7d8590', dash: 'dash', width: 1 }, name: 'y = x' },
+  ], {
+    ...LAYOUT_DEFAULTS,
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, title: '预测值(demeaned pct_chg)', range: [-lim, lim] },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '实际值(demeaned pct_chg)', range: [-lim, lim] },
+  }, { responsive: true, displayModeBar: false });
+}
+
+function renderDecile(d) {
+  const dec = d.decile_analysis;
+  const colors = dec.mean_target.map(v => v >= 0 ? UP_COLOR : DOWN_COLOR);
+  Plotly.newPlot('decilePlot', [{
+    x: dec.decile, y: dec.mean_target, type: 'bar', marker: { color: colors },
+    text: dec.mean_target.map(v => fmt(v, 3) + '%'), textposition: 'outside',
+  }], {
+    ...LAYOUT_DEFAULTS,
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, title: '预测分位组(1 = 最负,10 = 最正)', tickmode: 'linear' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '平均实际收益(%)' },
+  }, { responsive: true, displayModeBar: false });
+
+  Plotly.newPlot('lsCumPlot', [{
+    x: dec.cum_dates, y: dec.cum_long_short, type: 'scatter', mode: 'lines',
+    line: { color: UP_COLOR, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(218,54,51,.15)',
+  }], {
+    ...LAYOUT_DEFAULTS,
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, type: 'date' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '日度价差累计(%)' },
+  }, { responsive: true, displayModeBar: false });
+
+  document.getElementById('lsNote').innerHTML =
+    `日均多空价差 = <b>${fmt(dec.long_short_daily_mean, 3)}%</b>,` +
+    `标准差 = ${fmt(dec.long_short_daily_std, 2)}%,年化 Sharpe ≈ <b>${fmt(dec.long_short_sharpe, 2)}</b>。` +
+    `注:此为无摩擦、全横截面、双边多空计算,真实可交易的 Sharpe 将明显偏低。`;
+}
+
+// ─── Backtest panel ─────────────────────────────────────────────────────────
+let btActive = 0;
+
+function renderBacktest(d) {
+  const bt = (d.backtest && d.backtest.scenarios) ? d.backtest.scenarios : [];
+  if (!bt.length) {
+    document.getElementById('btTabs').innerHTML =
+      '<span class="subtitle">暂无回测数据。请先运行 <code>./venv/Scripts/python -m backtest.xgb_markowitz</code>。</span>';
+    return;
+  }
+  // Tabs
+  document.getElementById('btTabs').innerHTML = bt.map((s, i) =>
+    `<div class="bt-tab ${i === btActive ? 'active' : ''}" data-idx="${i}">${s.label_cn}</div>`
+  ).join('');
+  document.querySelectorAll('#btTabs .bt-tab').forEach(el => {
+    el.addEventListener('click', () => {
+      btActive = parseInt(el.dataset.idx);
+      renderBacktest(window.D);
+    });
+  });
+  drawBacktestScenario(bt[btActive]);
+}
+
+function drawBacktestScenario(s) {
+  const cagrCls = s.cagr > 0 ? 'good' : 'bad';
+  const tr      = s.total_return > 0 ? 'good' : 'bad';
+  const bcagr   = s.bench_cagr > 0 ? 'good' : 'bad';
+  const alpha   = s.alpha_ann > 0 ? 'good' : 'bad';
+  const cards = [
+    ['期末净值',   fmtMoney(s.final_nav),              `起始 ${fmtMoney(s.initial)}`,          ''],
+    ['累计收益',   fmtPct(s.total_return, 2),          `${s.date_start} → ${s.date_end}`,     tr],
+    ['年化收益',   fmtPct(s.cagr, 2),                  `持续 ${s.years.toFixed(2)} 年`,        cagrCls],
+    ['年化波动',   fmtPct(s.vol_ann, 2),               '日度收益标准差 × √252',               ''],
+    ['夏普比率',   fmt(s.sharpe, 2),                   'rf = 0',                              s.sharpe > 0 ? 'good' : 'bad'],
+    ['最大回撤',   fmtPct(s.max_drawdown, 2),          `${s.mdd_peak_date} → ${s.mdd_trough_date}`, 'bad'],
+    ['Calmar 比率', fmt(s.calmar, 2),                  'CAGR / |最大回撤|',                   ''],
+    ['沪深 300 年化', fmtPct(s.bench_cagr, 2),         `累计 ${fmtPct(s.bench_total, 2)}`,    bcagr],
+    ['年化 Alpha',  fmtPct(s.alpha_ann, 2),            '对 CSI300 回归',                      alpha],
+    ['Beta',        fmt(s.beta, 2),                    '市场敞口',                            ''],
+    ['信息比率',    fmt(s.info_ratio, 2),              '主动收益 / 跟踪误差',                 s.info_ratio > 0 ? 'good' : 'bad'],
+    ['基准最大回撤', fmtPct(s.bench_mdd, 2),           'CSI300',                              'bad'],
+  ];
+  document.getElementById('btCards').innerHTML = cards.map(([l, v, h, cls]) =>
+    `<div class="card"><div class="label">${l}</div><div class="value ${cls}">${v}</div><div class="hint">${h}</div></div>`
+  ).join('');
+
+  // Equity curve
+  Plotly.newPlot('btEquity', [
+    { x: s.curve.dates, y: s.curve.nav, type: 'scatter', mode: 'lines',
+      line: { color: UP_COLOR, width: 2 }, name: '策略净值' },
+    { x: s.curve.dates, y: s.curve.bench, type: 'scatter', mode: 'lines',
+      line: { color: '#888', width: 1.5, dash: 'dot' }, name: '沪深 300' },
+  ], {
+    ...LAYOUT_DEFAULTS, showlegend: true, legend: { orientation: 'h', y: 1.08 },
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, type: 'date' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '净值(CNY)', type: 'log' },
+  }, { responsive: true, displayModeBar: false });
+
+  Plotly.newPlot('btDrawdown', [
+    { x: s.curve.dates, y: s.curve.dd_pct, type: 'scatter', mode: 'lines',
+      line: { color: DOWN_COLOR, width: 1 },
+      fill: 'tozeroy', fillcolor: 'rgba(46,160,67,.25)', name: '策略回撤' },
+  ], {
+    ...LAYOUT_DEFAULTS,
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, type: 'date' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '回撤(%)' },
+  }, { responsive: true, displayModeBar: false });
+
+  document.getElementById('btNote').innerHTML =
+    `策略相较沪深 300:年化 Alpha <b class="${alpha}">${fmtPct(s.alpha_ann, 2)}</b>,` +
+    `Beta <b>${fmt(s.beta, 2)}</b>,信息比率 <b>${fmt(s.info_ratio, 2)}</b>。` +
+    ` Y 轴为对数坐标。`;
+
+  // Trade stats
+  const t = s.trades || {};
+  if (t.n_trades) {
+    const tcards = [
+      ['总交易次数', t.n_trades.toLocaleString(), '买入并退出的完整交易对'],
+      ['胜率',       fmtPct(t.hit_rate, 2),       '盈利交易占比',       t.hit_rate > 0.5 ? 'good' : 'bad'],
+      ['平均盈利',   fmt(t.avg_win_pct, 2) + '%', '仅统计盈利交易',     'good'],
+      ['平均亏损',   fmt(t.avg_loss_pct, 2) + '%','仅统计亏损交易',     'bad'],
+      ['平均收益',   fmt(t.avg_ret_pct, 2) + '%', '全部交易算术平均',   t.avg_ret_pct > 0 ? 'good' : 'bad'],
+      ['持仓中位天数', fmt(t.median_hold_days, 1), '交易持有期中位数'],
+      ['止盈触发率', fmtPct(t.pct_tp, 1),         '+3% 止盈',           'good'],
+      ['止损触发率', fmtPct(t.pct_sl, 1),         '-2% 止损',           'bad'],
+      ['持有到期率', fmtPct(t.pct_horizon, 1),    '5 日强制平仓',       ''],
+    ];
+    document.getElementById('btTradeCards').innerHTML = tcards.map(([l, v, h, cls]) =>
+      `<div class="card"><div class="label">${l}</div><div class="value ${cls || ''}">${v}</div><div class="hint">${h || ''}</div></div>`
+    ).join('');
+  } else {
+    document.getElementById('btTradeCards').innerHTML = '';
+  }
+}
+
+function renderGroups(d) {
+  const renderTbl = (el, rows, maxRows) => {
+    rows = rows.slice(0, maxRows);
+    const maxIC  = Math.max(...rows.map(r => Math.abs(r.rank_ic)));
+    const head = `<thead><tr>
+        <th>分组</th><th style="text-align:right">股票数</th>
+        <th style="text-align:right">样本数</th>
+        <th style="text-align:right">排名 IC</th>
+        <th style="text-align:right">Pearson IC</th>
+        <th style="text-align:right">命中率</th>
+        <th style="text-align:right">MAE</th>
+      </tr></thead>`;
+    const body = rows.map(r => {
+      const frac = maxIC > 0 ? Math.abs(r.rank_ic) / maxIC : 0;
+      const color = r.rank_ic >= 0 ? UP_COLOR : DOWN_COLOR;
+      return `<tr>
+        <td><b>${r.group}</b><div class="heat-bar"><div style="width:${frac*100}%;background:${color}"></div></div></td>
+        <td>${r.stocks.toLocaleString()}</td>
+        <td>${r.rows.toLocaleString()}</td>
+        <td class="${clsPos(r.rank_ic)}">${fmt(r.rank_ic, 4)}</td>
+        <td class="${clsPos(r.pearson_ic)}">${fmt(r.pearson_ic, 4)}</td>
+        <td>${fmtPct(r.hit_rate, 1)}</td>
+        <td>${fmt(r.mae, 3)}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = head + '<tbody>' + body + '</tbody>';
+  };
+  renderTbl(document.getElementById('groupProvince'), d.group_by_province, 20);
+  renderTbl(document.getElementById('groupBoard'),    d.group_by_board, 10);
+  renderTbl(document.getElementById('groupExchange'), d.group_by_exchange, 10);
+}
+
+function renderFeatureImportance(d) {
+  const fi = d.feature_importance_top30;
+  const names = fi.map(f => f.feature).reverse();
+  const gains = fi.map(f => f.total_gain).reverse();
+  Plotly.newPlot('fiPlot', [{
+    x: gains, y: names, type: 'bar', orientation: 'h',
+    marker: { color: BLUE },
+    text: gains.map(v => v.toLocaleString('en-US', { maximumFractionDigits: 0 })),
+    textposition: 'outside',
+  }], {
+    ...LAYOUT_DEFAULTS,
+    height: 600,
+    margin: { t: 20, l: 230, r: 80, b: 40 },
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, title: '总增益(跨 212 折累计)' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, automargin: true, tickfont: { family: 'Menlo, monospace', size: 11 } },
+  }, { responsive: true, displayModeBar: false });
+}
+
+function renderLiveTopN(d) {
+  document.getElementById('liveTop').innerHTML = d.live_topn.top.map(s => stockCard(s, 'outperform')).join('');
+  document.getElementById('liveBot').innerHTML = d.live_topn.bottom.map(s => stockCard(s, 'underperform')).join('');
+
+  [...d.live_topn.top, ...d.live_topn.bottom].forEach(s => {
+    const el = document.getElementById(`spark-${s.ts_code.replace('.', '_')}`);
+    if (!el || !s.history) return;
+    const line_color = s.pred_pct_chg > 0 ? UP_COLOR : DOWN_COLOR;
+    Plotly.newPlot(el, [{
+      x: s.history.dates, y: s.history.closes, type: 'scatter', mode: 'lines',
+      line: { color: line_color, width: 1.5 }, hoverinfo: 'skip',
+    }], {
+      paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+      margin: { t: 4, l: 4, r: 4, b: 4 },
+      xaxis: { visible: false }, yaxis: { visible: false },
+      showlegend: false,
+    }, { displayModeBar: false, staticPlot: true });
+  });
+}
+
+// 中英因子标签映射
+const REASON_MAP = [
+  [/^strong 5-day momentum \(\+([\d.]+)%\/day\)/, (m) => `5 日强动量(日均 +${m[1]}%)`],
+  [/^5-day drawdown \(([-\d.]+)%\/day\)/,        (m) => `5 日回调(日均 ${m[1]}%)`],
+  [/^trading ([+-]?[\d.]+)% above 20-day MA/,    (m) => `高于 20 日均线 ${m[1]}%`],
+  [/^trading ([+-]?[\d.]+)% below 20-day MA/,    (m) => `低于 20 日均线 ${m[1]}%`],
+  [/^volume spike: ([\d.]+)× 20-day avg/,        (m) => `放量:${m[1]}× 20 日均量`],
+  [/^wide range \(([\d.]+)% H-L\)/,              (m) => `振幅较大(${m[1]}% 高低差)`],
+  [/^open gap ([+-]?[\d.]+)%/,                   (m) => `开盘跳空 ${m[1]}%`],
+  [/^4\+ up days of the last 5/,                  ()  => '近 5 日有 4 日以上上涨'],
+  [/^1 or fewer up days of last 5/,               ()  => '近 5 日仅 1 日或更少上涨'],
+  [/^high realized vol \(([\d.]+)%\)/,            (m) => `已实现波动较高(${m[1]}%)`],
+];
+function localizeReason(r) {
+  for (const [re, fn] of REASON_MAP) {
+    const m = r.match(re);
+    if (m) return fn(m);
+  }
+  return r;
+}
+
+function stockCard(s, klass) {
+  const sid = s.ts_code.replace('.', '_');
+  const prob = Math.round((s.prob_up || 0) * 100);
+  const pred = s.pred_pct_chg;
+  const facts = [
+    ['前收盘价',    s.last_close != null ? fmt(s.last_close, 2) : '—'],
+    ['前日涨跌',    s.last_pct_chg != null ? sign(s.last_pct_chg) + '%' : '—'],
+    ['5 日均收益',  s.ret_5d_mean != null ? sign(s.ret_5d_mean) + '%' : '—'],
+    ['20 日波动',   s.vol_20d != null ? fmt(s.vol_20d, 1) + '%' : '—'],
+    ['vs 20日均线', s.close_vs_ma20 != null ? sign(s.close_vs_ma20) + '%' : '—'],
+    ['量比(20日)',  s.amount_ratio_20 != null ? fmt(s.amount_ratio_20, 2) + '×' : '—'],
+    ['振幅',        s.hl_range_pct != null ? fmt(s.hl_range_pct, 1) + '%' : '—'],
+    ['跳空',        s.open_gap_pct != null ? sign(s.open_gap_pct) + '%' : '—'],
+  ];
+  const reasons = (s.reasons || []).map(r =>
+    `<span class="reason-tag">${localizeReason(r)}</span>`
+  ).join('');
+  const piTxt = `80% 预测区间: [${fmt(s.pi_lo_80, 2)}%, ${fmt(s.pi_hi_80, 2)}%]`;
+  const probs = `
+    P(上涨): ${fmtPct(s.prob_up, 1)} · P(>1%): ${fmtPct(s.prob_gt_1pct, 1)} ·
+    P(>3%): ${fmtPct(s.prob_gt_3pct, 1)} · P(>5%): ${fmtPct(s.prob_gt_5pct, 1)}`;
+  return `<div class="stock ${klass}">
+    <div class="s-head">
+      <div><div class="s-name">${s.name || s.ts_code}</div>
+           <div class="s-ts">${s.ts_code} · ${s.province || '—'} · ${s.board_en || '—'} · ${s.exchange || ''}</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="s-pred ${clsPos(pred)}">${sign(pred)}%</div>
+        <div class="s-meta">${piTxt}</div>
+      </div>
+    </div>
+    <div class="probbar"><div style="width:${prob}%"></div></div>
+    <div class="s-meta">${probs}</div>
+    <div class="spark" id="spark-${sid}"></div>
+    <div class="factors">
+      ${facts.map(([k,v]) => `<div><span>${k}</span> <b>${v}</b></div>`).join('')}
+    </div>
+    ${reasons ? `<div class="reasons">${reasons}</div>` : ''}
+  </div>`;
+}
+
+function renderDistribution(d) {
+  const h = d.live_distribution;
+  const centers = h.bin_edges.slice(0, -1).map((e, i) => (e + h.bin_edges[i+1]) / 2);
+  const colors = centers.map(v => v > 0 ? UP_COLOR : DOWN_COLOR);
+  Plotly.newPlot('histPlot', [{
+    x: centers, y: h.bin_counts, type: 'bar', marker: { color: colors },
+    width: centers.map((_, i) => h.bin_edges[i+1] - h.bin_edges[i]),
+  }], {
+    ...LAYOUT_DEFAULTS,
+    xaxis: { ...LAYOUT_DEFAULTS.xaxis, title: '预测 pct_chg (%)' },
+    yaxis: { ...LAYOUT_DEFAULTS.yaxis, title: '频次' },
+  }, { responsive: true, displayModeBar: false });
+  const total = h.n_up_signals + h.n_down_signals;
+  document.getElementById('distUp').innerText     = h.n_up_signals.toLocaleString();
+  document.getElementById('distDown').innerText   = h.n_down_signals.toLocaleString();
+  document.getElementById('distSUp').innerText    = h.n_strong_up.toLocaleString();
+  document.getElementById('distSDown').innerText  = h.n_strong_down.toLocaleString();
+  document.getElementById('distMed').innerText    = fmt(h.p50, 3) + '%';
+  document.getElementById('distStd').innerText    = fmt(h.std, 3) + '%';
+  document.getElementById('distP5').innerText     = fmt(h.p05, 2) + '%';
+  document.getElementById('distP95').innerText    = fmt(h.p95, 2) + '%';
+  document.getElementById('distUpPct').innerText   = `${((h.n_up_signals/total)*100).toFixed(1)}%`;
+  document.getElementById('distDownPct').innerText = `${((h.n_down_signals/total)*100).toFixed(1)}%`;
+}
+
+// ─── Table with sort + filter ──────────────────────────────────────────────
+let sortKey = 'pred_pct_chg_next';
+let sortAsc = false;
+let tableData = [];
+
+function renderLiveTable(d) {
+  tableData = d.live_table;
+  document.getElementById('tableN').innerText = tableData.length.toLocaleString();
+  document.getElementById('filter').addEventListener('input', redrawTable);
+  document.getElementById('dirFilter').addEventListener('change', redrawTable);
+  redrawTable();
+}
+
+function redrawTable() {
+  const q   = document.getElementById('filter').value.toLowerCase();
+  const dir = document.getElementById('dirFilter').value;
+
+  let rows = tableData.filter(r => {
+    if (dir === 'up'         && !(r.pred_pct_chg_next > 0))  return false;
+    if (dir === 'down'       && !(r.pred_pct_chg_next < 0))  return false;
+    if (dir === 'strongUp'   && !(r.pred_pct_chg_next >= 3)) return false;
+    if (dir === 'strongDown' && !(r.pred_pct_chg_next <= -3)) return false;
+    if (!q) return true;
+    return (r.ts_code + ' ' + r.name + ' ' + r.province + ' ' + r.board_en).toLowerCase().includes(q);
+  });
+
+  rows.sort((a, b) => {
+    const va = a[sortKey], vb = b[sortKey];
+    if (typeof va === 'number') return sortAsc ? va - vb : vb - va;
+    return sortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+  });
+
+  document.getElementById('rowCount').innerText = `${rows.length} / ${tableData.length} 只股票`;
+
+  const cols = [
+    ['ts_code',            '代码'],
+    ['name',               '名称'],
+    ['province',           '省份'],
+    ['board_en',           '板块'],
+    ['exchange',           '交易所'],
+    ['pred_pct_chg_next',  '预测%',    true],
+    ['prob_up',            'P(上涨)',  true],
+    ['prob_gt_3pct',       'P(>3%)',   true],
+    ['prob_lt_3pct',       'P(<-3%)',  true],
+    ['pi_lo_80',           '区间下界', true],
+    ['pi_hi_80',           '区间上界', true],
+  ];
+
+  const head = '<thead><tr>' + cols.map(([k, l]) => {
+    const arrow = sortKey === k ? (sortAsc ? ' ▲' : ' ▼') : '';
+    return `<th onclick="window.sortBy('${k}')">${l}${arrow}</th>`;
+  }).join('') + '</tr></thead>';
+
+  const maxRender = 2000;
+  const body = '<tbody>' + rows.slice(0, maxRender).map(r =>
+    '<tr>' + cols.map(([k, l, numeric]) => {
+      let v = r[k];
+      if (numeric && typeof v === 'number') {
+        const cls = k === 'pred_pct_chg_next' ? clsPos(v) : '';
+        return `<td class="${cls}">${fmt(v, 3)}</td>`;
+      }
+      return `<td>${v ?? ''}</td>`;
+    }).join('') + '</tr>'
+  ).join('') + '</tbody>';
+
+  document.getElementById('liveTable').innerHTML = head + body;
+
+  if (rows.length > maxRender) {
+    document.getElementById('rowCount').innerText += `(展示前 ${maxRender} 条)`;
+  }
+}
+
+window.sortBy = (k) => {
+  if (sortKey === k) { sortAsc = !sortAsc; }
+  else { sortKey = k; sortAsc = false; }
+  redrawTable();
+};
+</script>
+</body>
+</html>

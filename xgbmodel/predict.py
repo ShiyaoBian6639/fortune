@@ -63,13 +63,25 @@ def predict_latest(cfg: dict, out_path: str = PREDICT_OUT,
     better calibrated in the tails — see xgbmodel.probability for the math.
     """
     model, feats = _load_model(cfg)
-    panel = build_panel(cfg)
+    # Flip inference mode so the most recent feature row (whose target would be
+    # NaN because t+1 lies beyond our data) survives the panel assembly.
+    # Without this, predict_latest would score the *second-to-last* bar and
+    # its prediction would be for a date that has already happened.
+    cfg_infer = dict(cfg, for_inference=True)
+    panel = build_panel(cfg_infer)
     panel = _align_features(panel, feats)
 
     last_date = panel['trade_date'].max()
     latest = panel[panel['trade_date'] == last_date].copy()
     if latest.empty:
         raise RuntimeError("No rows for the latest trade_date — check data freshness.")
+
+    # The prediction horizon is `forward_window` trading days past last_date.
+    # With forward_window=1 (default) and last_date = 2026-04-23, the
+    # prediction is for the next trading day (normally 2026-04-24).
+    fw = cfg.get('forward_window', 1)
+    print(f"[xgbmodel.predict] feature date = {last_date.date()}  "
+          f"predicting pct_chg {fw} trading day(s) ahead")
 
     X = latest[feats]
     latest['pred_pct_chg_next'] = model.predict(X).astype('float32')
@@ -96,8 +108,44 @@ def predict_latest(cfg: dict, out_path: str = PREDICT_OUT,
     out = out.sort_values('pred_pct_chg_next', ascending=False).reset_index(drop=True)
     out.to_csv(out_path, index=False)
 
-    print(f"[xgbmodel.predict] {len(out):,} stocks predicted for {last_date.date()} "
-          f"(next-day), saved to {out_path}")
+    # ALSO archive the prediction with the FEATURE date in the filename so a
+    # series of daily runs leaves an unambiguous audit trail. The 'live
+    # pointer' (out_path) always points at the most recent run; the dated
+    # archive (out_path with `_features_YYYYMMDD` suffix) is immutable.
+    feat_str = last_date.strftime('%Y%m%d')
+    archive_path = out_path.replace('.csv', f'_features_{feat_str}.csv')
+    if archive_path == out_path:
+        archive_path = out_path + f'.features_{feat_str}.csv'
+    out.to_csv(archive_path, index=False)
+    print(f"[xgbmodel.predict] {len(out):,} stocks scored  "
+          f"(features@{last_date.date()} → forecast for t+{fw} trading day(s)), "
+          f"saved to {out_path} (+ archive {os.path.basename(archive_path)})")
+
+    # Sanity-check: warn if the live pointer now matches an older archive on
+    # disk (stale-data bug we previously had).
+    archive_dir  = os.path.dirname(out_path) or '.'
+    archive_glob = os.path.basename(out_path).replace('.csv', '_features_*.csv')
+    import glob as _glob
+    stale_archives = sorted(_glob.glob(os.path.join(archive_dir, archive_glob)))
+    if len(stale_archives) >= 2:
+        # Compare current to the previous archive (lexically earlier feature date)
+        prev = stale_archives[-2]
+        try:
+            prev_df = pd.read_csv(prev, usecols=['ts_code', 'pred_pct_chg_next'])
+            common = set(prev_df['ts_code']) & set(out['ts_code'])
+            if common:
+                a = prev_df.set_index('ts_code').loc[sorted(common), 'pred_pct_chg_next']
+                b = out.set_index('ts_code').loc[sorted(common), 'pred_pct_chg_next']
+                if a.equals(b):
+                    print(f"[xgbmodel.predict] ⚠️ WARNING: predictions are IDENTICAL to "
+                          f"{os.path.basename(prev)} — stale data?")
+                else:
+                    diff = (a - b).abs()
+                    print(f"[xgbmodel.predict] vs previous archive ({os.path.basename(prev)}): "
+                          f"differ on {(diff > 1e-6).sum()}/{len(diff)} stocks "
+                          f"(mean |Δ|={diff.mean():.4f}, max |Δ|={diff.max():.4f})")
+        except Exception as e:
+            print(f"[xgbmodel.predict] could not compare to {prev}: {e}")
     # Show compact preview: point estimate + a few probability columns
     preview_cols = ['ts_code', 'pred_pct_chg_next', 'prob_up',
                     'prob_gt_3pct', 'prob_lt_3pct', 'pi_lo_80', 'pi_hi_80']

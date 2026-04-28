@@ -12,3 +12,5 @@ treat calendar holiday as input when making predictions
 
 income, balancesheet, cashflow, forecast, express, dividend, fina_audit, fina_mainbz, disclosure_date
 limit_step, top_list, top_inst, limit_list_ths, limit_list_d,limit_cpt_list,ths_index,ths_daily,ths_member, dc_index, dc_member,cyq_perf,cyq_chips
+
+analyze the number of limit down and limit up times for each stock in the universe

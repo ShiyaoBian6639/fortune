@@ -356,12 +356,23 @@ def _pre_scan_dates(codes, out_dir, date_col):
 # ─── 1. index_weight ──────────────────────────────────────────────────────────
 
 def fetch_index_weight(force=False):
+    """Download index_weight per index, monthly-chunked.
+
+    Tushare caps a single index_weight call at 6000 rows. Big indices like
+    CSI1000 (1000 members × ≥1 monthly snapshot) push 12000+ rows/year, so
+    even yearly chunks truncate. Monthly chunks (≤1 snapshot × N members)
+    stay well under the cap for every Chinese index Tushare publishes.
+
+    Trade-off: ~120 API calls per index for 10 years × 12 months instead of
+    10. At ~80 calls/min Tushare rate limit, full backfill is ~1.5 min per
+    index. Incremental updates only fetch the months since `last_date`.
+    """
     out_dir = INDEX_DIR / 'index_weight'
     out_dir.mkdir(parents=True, exist_ok=True)
     pro   = _get_pro()
     today = _today()
 
-    print(f"\n[index_weight] {len(CHINESE_INDICES)} indices ...")
+    print(f"\n[index_weight] {len(CHINESE_INDICES)} indices (monthly-chunked) ...")
     for code in CHINESE_INDICES:
         fp   = out_dir / f"{_safe_code(code)}.csv"
         last = _last_date(fp, 'trade_date')
@@ -371,15 +382,47 @@ def fetch_index_weight(force=False):
             print(f"  {code}: up-to-date (last={last})")
             continue
 
-        print(f"  {code}: {start} → {today} ...", end=' ', flush=True)
-        df = _fetch(pro.index_weight, index_code=code, start_date=start, end_date=today)
-        if df is not None and not df.empty:
-            n = _upsert(df, fp, key_cols=['trade_date', 'con_code'], sort_col='trade_date')
-            print(f"{len(df)} new rows (total {n})")
-        elif df is not None:
-            print("no data (empty response)")
+        # Build month boundaries between [start, today]
+        start_dt = pd.Timestamp(start)
+        today_dt = pd.Timestamp(today)
+        month_starts = pd.date_range(
+            start_dt.replace(day=1), today_dt, freq='MS'
+        ).tolist()
+        if not month_starts or month_starts[0] > start_dt:
+            month_starts = [start_dt] + [m for m in month_starts if m > start_dt]
+
+        print(f"  {code}: {start} → {today} ({len(month_starts)} months) ...",
+              flush=True)
+
+        frames = []
+        had_error = False
+        cap_hits = 0
+        for i, m_start in enumerate(month_starts):
+            m_end_dt = (m_start + pd.offsets.MonthEnd(0))
+            m_start_str = max(start, m_start.strftime('%Y%m%d'))
+            m_end_str   = min(today, m_end_dt.strftime('%Y%m%d'))
+            if m_start_str > m_end_str:
+                continue
+            df = _fetch(pro.index_weight, index_code=code,
+                        start_date=m_start_str, end_date=m_end_str)
+            if df is not None and not df.empty:
+                frames.append(df)
+                if len(df) >= 5900:
+                    cap_hits += 1
+            elif df is None:
+                had_error = True
+
+        if frames:
+            new_data = pd.concat(frames, ignore_index=True)
+            n = _upsert(new_data, fp, key_cols=['trade_date', 'con_code'],
+                        sort_col='trade_date')
+            cap_note = f"  [warn] {cap_hits} months hit 6000 cap" if cap_hits else ""
+            print(f"    {len(new_data)} new rows across {len(frames)} "
+                  f"month-chunks (total {n}){cap_note}")
+        elif had_error:
+            print(f"    error — skipped (see log above)")
         else:
-            print("error — skipped (see log above)")
+            print(f"    no data (empty response)")
 
 
 # ─── 2. index_dailybasic ──────────────────────────────────────────────────────

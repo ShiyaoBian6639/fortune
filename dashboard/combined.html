@@ -1,0 +1,1699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>XGB 选股模型 + 马科维茨回测综合看板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg:        #0e1117;
+    --panel:     #161b22;
+    --panel2:    #1c232e;
+    --border:    #2a313c;
+    --text:      #c9d1d9;
+    --muted:     #7d8590;
+    --accent:    #58a6ff;
+    --up:        #da3633;
+    --down:      #2ea043;
+    --good:      #da3633;
+    --bad:       #2ea043;
+    --warn:      #d29922;
+    --tp:        #da3633;
+    --sl:        #2ea043;
+    --hz:        #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 0; line-height: 1.6;
+  }
+  header {
+    background: linear-gradient(180deg, #2a1a1c 0%, #0e1117 100%);
+    padding: 32px 40px 22px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 28px; font-weight: 700; letter-spacing: 1px; }
+  header p  { margin: 0; color: var(--muted); font-size: 13px; }
+  header .badge {
+    display: inline-block; padding: 2px 8px; margin-left: 8px;
+    background: rgba(218,54,51,.15); color: var(--up);
+    border: 1px solid rgba(218,54,51,.4); border-radius: 4px;
+    font-size: 11px; font-weight: 500;
+  }
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 8px 40px; overflow-x: auto; white-space: nowrap;
+  }
+  nav a {
+    display: inline-block; padding: 6px 12px; margin-right: 2px;
+    color: var(--muted); text-decoration: none; font-size: 12.5px;
+    border-radius: 4px;
+  }
+  nav a:hover { background: var(--panel2); color: var(--text); }
+  nav .sep { color: var(--border); margin: 0 4px; user-select: none; }
+  section { padding: 28px 40px; border-bottom: 1px solid var(--border); }
+  section h2 { font-size: 19px; margin: 0 0 4px; }
+  section h3 { font-size: 14px; margin: 16px 0 8px; }
+  section .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+  .cards {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; letter-spacing: .3px; }
+  .card .value {
+    font-size: 22px; font-weight: 600; margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .good { color: var(--good); }
+  .bad  { color: var(--bad);  }
+  .warn { color: var(--warn); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 1100px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  .plot {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; min-height: 360px;
+  }
+  pre {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px; overflow-x: auto;
+    font-size: 12px; color: var(--text);
+  }
+  table.ttbl {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  }
+  table.ttbl th, table.ttbl td {
+    padding: 6px 10px; border-bottom: 1px solid var(--border);
+    text-align: left; font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  table.ttbl th {
+    background: var(--panel2); color: var(--muted);
+    font-weight: 500; cursor: pointer; user-select: none;
+    position: sticky; top: 0;
+  }
+  table.ttbl th:hover { color: var(--text); }
+  table.ttbl tr:hover td { background: var(--panel2); }
+  .reason-tp { color: var(--tp); font-weight: 600; }
+  .reason-sl { color: var(--sl); font-weight: 600; }
+  .reason-hz { color: var(--hz); font-weight: 600; }
+  .controls {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+    margin-bottom: 12px;
+  }
+  .controls input, .controls select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 10px; font-size: 13px;
+  }
+  .scroll-table {
+    max-height: 600px; overflow: auto;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .scroll-table table.ttbl { border: 0; border-radius: 0; }
+  .pager {
+    display: flex; gap: 8px; align-items: center; margin-top: 8px;
+    color: var(--muted); font-size: 12px;
+  }
+  .pager button {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  .pager button:hover { border-color: var(--accent); }
+  .pager button:disabled { opacity: .4; cursor: not-allowed; }
+  code { color: var(--accent); background: var(--panel2); padding: 1px 6px;
+         border-radius: 3px; font-size: 12px; }
+  .group-pill {
+    display: inline-block; padding: 2px 9px; border-radius: 11px;
+    background: var(--panel2); color: var(--accent); font-size: 11px;
+    border: 1px solid var(--border); white-space: nowrap;
+  }
+  .info-block {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px 18px; line-height: 1.65;
+    font-size: 13px;
+  }
+  .info-block .formula {
+    background: var(--panel2); border-radius: 4px; padding: 10px 14px;
+    margin: 8px 0; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 13px; color: var(--accent);
+  }
+  .legend {
+    display: inline-flex; gap: 14px; margin-left: 12px;
+    font-size: 12px; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>XGB 选股模型 + 长多头马科维茨组合 综合看板
+    <span class="badge">walk-forward 212折 · QP 求解</span></h1>
+  <p id="hdr-sub">加载中…</p>
+</header>
+<nav>
+  <a href="#live">下一交易日预测</a>
+  <a href="#audit">无前视保证</a>
+  <a href="#st_outcomes">ST 个股结局</a>
+  <a href="#st_capped">ST 限额回测</a>
+  <span class="sep">|</span>
+  <a href="#overview">模型概览</a>
+  <a href="#target">预测目标</a>
+  <a href="#features">特征工程</a>
+  <a href="#importance">特征重要性</a>
+  <a href="#accuracy">预测精度</a>
+  <span class="sep">|</span>
+  <a href="#bt-summary">回测概览</a>
+  <a href="#equity">净值曲线</a>
+  <a href="#barra">Barra 风险归因</a>
+  <a href="#exits">卖出原因</a>
+  <a href="#timeline">个股买卖时点</a>
+  <a href="#stocks">个股贡献</a>
+  <a href="#trades">完整交易明细</a>
+</nav>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="live">
+  <h2>下一交易日预测 + 组合选股</h2>
+  <p class="subtitle" id="live_subtitle">加载中…</p>
+  <div id="live_warning" class="info-block" style="display:none; margin-bottom:14px;
+       background:rgba(218,153,34,.10); border-color:rgba(218,153,34,.45);"></div>
+
+  <div class="info-block" style="margin-bottom:14px;background:rgba(218,54,51,.08);border-color:rgba(218,54,51,.45);">
+    <h3 style="margin-top:0;color:var(--up);">⚠️ 历史回测高度依赖 ST 个股 — 用 ST 限额而非完全排除</h3>
+    <p>
+      经 tushare <code>namechange</code> 权威名单核实,在<b>实际交易当天</b>:
+    </p>
+    <ul>
+      <li>历史回测中 <b>57.2% (4,393 / 7,676)</b> 的入场都是 ST/*ST 个股</li>
+      <li>累计实现盈亏的 <b>99.7%</b> 来自 ST 个股 (+141.0 亿元 / +141.3 亿元 总额)</li>
+      <li>但 310 只 ST 个股最终只有 <b>1 只真正退市</b> (策略仍盈利 +85万),178 只摘帽,131 只仍 ST</li>
+      <li>限额回测 (max 4 ST/日) 的 CAGR 仍达 <b>148.91%</b> (原始 169.71%) — alpha 没全部来自 ST</li>
+    </ul>
+    <p>
+      所以<b>不必完全排除 ST</b>,只需<b>限额 4 只/日</b>就能保留绝大部分 alpha
+      并大幅降低退市/流动性/停牌风险。下方默认视图与<code>--max_st_per_day 4</code>
+      回测保持一致。
+    </p>
+    <div class="controls" style="margin-top:8px;flex-direction:column;align-items:flex-start;gap:6px;">
+      <label style="display:flex;align-items:center;gap:6px;">
+        <input id="live_view_toggle" type="radio" name="live_view" value="no_st" checked>
+        <span><b>回测一致视图</b> · 候选池=40 · 限额 4 ST/日 (实盘推荐) ⭐</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;">
+        <input type="radio" name="live_view" value="with_st">
+        <span><b>回测一致视图</b> · 候选池=40 · 不限 ST (匹配原始回测)</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;">
+        <input type="radio" name="live_view" value="expanded">
+        <span><b>扩展候选池视图</b> · 池=200 · 限额 4 ST/日 (诊断用,模型在涨停后看到了什么)</span>
+      </label>
+    </div>
+  </div>
+
+  <div id="cards_live" class="cards"></div>
+
+  <h3>候选筛选漏斗</h3>
+  <p class="subtitle" style="margin:0 0 10px;">
+    从预测最强的前 200 只开始过滤：当日触及涨跌停 (主板 ±10%、创/科 ±20%) 自动排除，
+    历史数据少于 20 日的也排除。剩余进入 QP 求解。
+  </p>
+  <div id="cards_funnel" class="cards" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));"></div>
+  <details style="margin-top:8px;">
+    <summary style="cursor:pointer;color:var(--muted);font-size:13px;">
+      展开查看被过滤的候选 (前 60 只)
+    </summary>
+    <div class="scroll-table" style="max-height:380px;margin-top:8px;">
+      <table class="ttbl" id="tbl_live_rejects"></table>
+    </div>
+  </details>
+
+  <h3 style="margin-top:18px;">本策略次日组合 (top-K=10, 长多头 QP)</h3>
+  <details open style="margin:0 0 10px;">
+    <summary style="cursor:pointer;color:var(--accent);font-size:13px;">
+      <b>📖 μ 与 w_qp 是什么? 马科维茨的输入到底是什么?</b>
+    </summary>
+    <div class="info-block" style="margin-top:8px;">
+      <h4 style="margin-top:0;">μ 是 XGBoost 预测的次日<b>相对沪深300超额收益</b>(%)</h4>
+      <ul>
+        <li>训练目标：<code>y_{i,t} = pct_chg_{i,t+1} − pct_chg_{CSI300,t+1}</code> (横截面去均值)</li>
+        <li>预测输出：<code>μ̂_{i,t+1} = E[y_i | 截止 t 的特征]</code> — 即"该股次日相对大盘多涨几个百分点"</li>
+        <li>不是绝对涨幅,不是相对昨日的涨跌,而是<b>相对 CSI300 的超额收益</b></li>
+        <li>μ &gt; 0 → 预测跑赢大盘; μ &lt; 0 → 预测跑输大盘 (但仍可能绝对上涨)</li>
+      </ul>
+
+      <h4>w_qp 是<b>长多头马科维茨 QP 求出的组合权重</b></h4>
+      <p>对选中的 K = 10 只股票求解：</p>
+      <div class="formula" style="margin:6px 0;">
+        minimize&nbsp;&nbsp;0.5·λ·wᵀΣw − μᵀw<br>
+        s.t.&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Σ wᵢ = 1, &nbsp;wᵢ ≥ 0
+      </div>
+      <ul>
+        <li><b>输入 1: μ 向量</b> — 上面 XGBoost 的 10 个预测值 (% 单位)</li>
+        <li><b>输入 2: Σ 矩阵 (10×10)</b> — 不是原始 pct_chg 序列,而是用过去 60 个交易日 (严格在预测日之前) 的 pct_chg 经 Ledoit-Wolf 收缩估计得到的协方差矩阵</li>
+        <li>目标：最大化 μᵀw (预期收益) − 0.5·λ·wᵀΣw (波动惩罚), λ=1</li>
+        <li>约束：全仓 (Σwᵢ=1) + 不许做空 (wᵢ≥0)</li>
+      </ul>
+
+      <h4>为什么 10 只股票多数 μ 为负?</h4>
+      <p>因为 XGBoost 训练时目标已经横截面去均值,所以<b>市场上多数股票预测会跑输大盘</b>。同时<b>涨跌停过滤</b>大量剔除了 μ 最高的候选。本日具体情况：</p>
+      <ul style="font-size:12px;">
+        <li>全市场 5,078 只股票中, 只有 <b>66 只 (1.3%)</b> μ &gt; 0</li>
+        <li>μ 排名前 30 的股票 — <b>全部</b> 在特征日 (2026-04-24) 触及涨停被过滤 (主板/创科 10/20%, ST 5%)</li>
+        <li>排名前 60 才出现第一个未触停的候选：<b>*ST摩登 (rank=60, μ=+0.22%)</b></li>
+        <li>所以本组合的 10 只股票来自 <b>rank 60–76</b>, 其中只有 *ST摩登 仍有正 μ</li>
+      </ul>
+      <p style="color:var(--muted);font-size:11.5px;">
+        这是"涨停后效应"：昨日预测的强势股已经在本日涨停封板, 下一交易日的可买池只剩次级候选。
+        QP 仍会给最大正 μ 的股票最高权重 (本日 *ST摩登 拿到 31.4% 权重),
+        其余按 Σ 风险分散到几个 μ ≈ 0 的股票上, 以满足 Σwᵢ=1 的全仓约束。
+        长期看,组合的预期超额收益 = wᵀμ ≈ 0.06%, 看似很小,但叠加 200+ 个交易日就形成了回测的高夏普。
+      </p>
+    </div>
+  </details>
+  <p class="subtitle" style="margin:0 0 10px;">
+    <b>仓位规模与回测保持完全一致</b>：起始 100 万元，可投资金额 95% (留 5% 现金缓冲)，
+    扣除入场费 10bps、退出费 15bps (含印花税)、市场冲击 10bps×√(单笔/20日均额)，
+    单股不超过 20 日均成交额的 5% (流动性上限)，按 100 股最小手取整。
+  </p>
+  <details style="margin-bottom:10px;">
+    <summary style="cursor:pointer;color:var(--muted);font-size:13px;">展开查看本组合与回测的参数一致性 ✓</summary>
+    <table class="ttbl" style="margin-top:8px;width:auto;" id="tbl_consistency"></table>
+  </details>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_live_portfolio"></table>
+  </div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_live_pred_dist"></div>
+    <div class="plot" id="plot_live_weights"></div>
+  </div>
+
+  <h3>预测最强的 30 只 (μ 排名)</h3>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_live_top"></table>
+  </div>
+
+  <h3>预测最弱的 30 只</h3>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_live_bottom"></table>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="audit">
+  <h2>无前视数据保证 (Leakage Audit)</h2>
+  <p class="subtitle">
+    所有训练、预测、回测决策 — 包括上面的 "下一交易日预测" — 均严格仅使用
+    历史数据。本节列出每条数据流的具体保证及证据位置 (源代码引用)。
+  </p>
+  <div class="info-block" id="audit_guarantees"></div>
+
+  <h3>数据源时效性</h3>
+  <p class="subtitle" style="margin:0 0 10px;">
+    每个数据源的最新可用日期。最新的回测预测来自 OOF test.csv，最新的实时预测
+    使用下方 "OHLCV / daily_basic / moneyflow / ..." 中最早的最新日期之前的数据。
+  </p>
+  <div class="scroll-table" style="max-height:380px;">
+    <table class="ttbl" id="tbl_audit_sources"></table>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="st_outcomes">
+  <h2>ST 个股结局分析</h2>
+  <p class="subtitle">
+    根据 tushare <code>namechange</code> 接口 (权威数据,不依赖涨跌幅推断) 识别历史回测中
+    每一笔交易当日股票是否处于 ST/*ST 状态。然后查询每只 ST 股票的<b>当前</b> 上市状态
+    (来自 tushare <code>stock_basic</code>,L=正常上市 / D=已退市 / P=暂停上市) +
+    最新名称是否仍含 ST/*ST 来判断是否摘帽 (recovered)。
+  </p>
+  <div id="cards_st_headline" class="cards"></div>
+  <div class="grid-2">
+    <div class="plot" id="plot_st_outcomes" style="min-height:360px;"></div>
+    <div>
+      <table class="ttbl" id="tbl_st_outcomes_summary"></table>
+    </div>
+  </div>
+  <h3 style="margin-top:18px;">前 50 大 ST 个股贡献 (按累计盈亏)</h3>
+  <p class="subtitle" style="margin:0 0 10px;">
+    每只都是<b>在交易当时确实是 ST/*ST</b> 的个股,按本策略累计盈亏排序。
+    "结局"列显示该股<b>当前</b>的状态: <span class="bad">delisted</span> = 已退市,
+    <span class="warn">paused</span> = 暂停上市, <span class="warn">still_st</span> = 仍 ST,
+    <span class="good">recovered</span> = 已摘帽。
+  </p>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_st_outcomes_top"></table>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="st_capped">
+  <h2>ST 限额回测对照 (max 4 ST per day)</h2>
+  <p class="subtitle">
+    用同样的预测、同样的 QP、同样的执行模型,但每日组合中 <b>ST 股票数上限 = 4</b>
+    (其余位置必须从非-ST 候选中补齐)。判断模型在收紧 ST 风险敞口后是否仍有 alpha。
+    原始回测 (无限额,可达 10 ST) 作为基准,以下并列展示。
+  </p>
+  <div id="cards_capped" class="cards"></div>
+  <div class="plot" id="plot_capped_equity" style="min-height:420px;"></div>
+  <div class="info-block" id="capped_takeaway" style="margin-top:14px;"></div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="overview">
+  <h2>模型概览</h2>
+  <p class="subtitle">XGBoost 回归模型 — 预测每只股票次日相对沪深300的超额收益。</p>
+  <div id="cards_overview" class="cards"></div>
+  <div class="grid-2">
+    <div class="info-block">
+      <h3 style="margin-top:0;">训练流程：滚动窗口前向验证 (Walk-Forward)</h3>
+      <p>采用 212 折非重叠滚动验证，每折结构：</p>
+      <div class="formula">12 周训练 → purge gap → 2 周验证 → 2 周测试</div>
+      <p>每个测试日的预测都来自训练截止日 <b>严格早于</b> 该测试日的某折模型，
+        确保完全无前视。每折独立训练 220 棵树 (或验证集早停)。</p>
+    </div>
+    <div class="info-block">
+      <h3 style="margin-top:0;">XGBoost 超参 (核心)</h3>
+      <pre id="xgb_params_dump"></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="target">
+  <h2>预测目标 (相对沪深300的超额收益)</h2>
+  <div class="info-block">
+    <p>目标变量定义：</p>
+    <div class="formula">y_{i,t} = pct_chg_{i,t+1} − pct_chg_{CSI300, t+1}</div>
+    <p>即每只股票次日相对沪深300指数的超额涨跌幅 (单位 %)。</p>
+    <h3>为何用相对收益？</h3>
+    <ul>
+      <li><b>剔除市场风险</b>：模型不是去预测大盘涨跌 (无法预测)，而是预测哪些股票会跑赢/跑输大盘。</li>
+      <li><b>样本平衡</b>：在牛熊市切换时，绝对收益分布大幅偏移；超额收益分布始终接近 0 中心，
+        让模型在不同市场状态下保持一致的优化方向。</li>
+      <li><b>策略可执行</b>：交易者关心的是相对排名 (做多看多的、回避看空的)。</li>
+    </ul>
+    <h3>预处理</h3>
+    <ol>
+      <li><b>截尾</b>: 绝对值超过 ±11% 的极端样本被截断 (A股涨跌停板宽度)。</li>
+      <li><b>横截面去均值</b>: 每个交易日内对所有股票的目标值减去当日均值 (
+        <code>target_norm='demean'</code>)。这样按当日常数平移收益的特征 (例如 "今天大盘涨了") 无法预测目标，
+        强制模型学习区分股票之间差异的信号。</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="features">
+  <h2>特征工程 (174 个特征)</h2>
+  <p class="subtitle">
+    所有特征按类别分组。每个特征显示其中文含义和数据来源。
+    上方按类别筛选，下方支持名称模糊搜索。
+  </p>
+  <div id="cards_groups" class="cards"></div>
+  <div class="controls">
+    <label>筛选类别：
+      <select id="feat_group">
+        <option value="">全部</option>
+      </select>
+    </label>
+    <label>搜索特征：<input id="feat_search" type="text"
+        placeholder="例如 turnover / momentum / cs_rank …" style="min-width:280px;"></label>
+    <span id="feat_count" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_features"></table>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="importance">
+  <h2>特征重要性 (前 50)</h2>
+  <p class="subtitle">
+    <code>total_gain</code> = XGBoost 在所有 212 折中累计的分裂增益。
+    悬停查看每个特征的中文含义、所属类别和数据来源。
+  </p>
+  <div class="plot" id="plot_importance" style="min-height:880px;"></div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="accuracy">
+  <h2>预测精度 (样本外)</h2>
+  <p class="subtitle">
+    所有指标基于 walk-forward 212 折的样本外测试集 (2017-07 至今, 6.25M 个 (pred, target) 配对)。
+  </p>
+  <div id="cards_accuracy" class="cards"></div>
+  <div class="grid-2">
+    <div class="plot" id="plot_daily_ic"></div>
+    <div class="plot" id="plot_decile"></div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="bt-summary">
+  <h2>回测概览 (XGB → 马科维茨长多头组合)</h2>
+  <p class="subtitle">
+    每日选取 μ 最高的 K=10 只股票，使用 Ledoit-Wolf 收缩协方差矩阵 Σ，
+    通过 SciPy SLSQP 求解长多头马科维茨 QP：
+    <code>min 0.5·λ·wᵀΣw − μᵀw, s.t. Σwᵢ = 1, wᵢ ≥ 0</code>。
+    买入价为收盘价；止盈 +3% / 止损 −2% / 强平 5 日。
+  </p>
+  <div id="cards_bt" class="cards"></div>
+  <div class="grid-2">
+    <div>
+      <h3>策略 vs 沪深300</h3>
+      <div id="cards_bt_strat" class="cards" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));"></div>
+    </div>
+    <div>
+      <h3>交易质量</h3>
+      <div id="cards_bt_trades" class="cards" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="equity">
+  <h2>净值曲线与回撤</h2>
+  <div class="plot" id="plot_equity"></div>
+  <div class="grid-2" style="margin-top:14px;">
+    <div class="plot" id="plot_dd"></div>
+    <div class="plot" id="plot_pos"></div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="barra">
+  <h2>Barra 风险归因</h2>
+  <p class="subtitle">
+    将策略每日收益分解为 5 个 Barra 风格因子的贡献加上残差 α (选股 α)。
+    因子暴露 = 持仓个股的因子 z-score 平均值；因子收益 = 当日按 z-score 排序后五分位
+    多空价差 (top quintile − bottom quintile)。投资比例 = 当日 invested / NAV，
+    用以校正现金占比导致的低估。
+  </p>
+  <div id="cards_barra" class="cards"></div>
+  <div class="grid-2">
+    <div class="plot" id="plot_barra_exposure"></div>
+    <div class="plot" id="plot_barra_contrib"></div>
+  </div>
+  <div class="info-block" style="margin-top:14px;">
+    <h3 style="margin-top:0;">如何阅读</h3>
+    <ul>
+      <li><b>左图 (因子暴露)</b>：策略持仓的平均 z-score 在每个交易日的时序。
+        正暴露 = 偏向高分位；负暴露 = 偏向低分位。例如 SIZE > 0 表示偏好大盘股。</li>
+      <li><b>右图 (累计贡献分解)</b>：把策略累计收益 (黑色) 拆成 5 个因子贡献 + α 残差 (红色)。
+        如果策略的高收益主要由 α 解释，说明是真正的选股能力；如果由因子解释，
+        则更多是风格 beta，可能是后视偏误或机制套利。</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="exits">
+  <h2>卖出原因</h2>
+  <div class="grid-2">
+    <div class="plot" id="plot_reasons" style="min-height:300px;"></div>
+    <div>
+      <table class="ttbl" id="tbl_reasons"></table>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="timeline">
+  <h2>个股买卖时点 (2017 → 至今)</h2>
+  <p class="subtitle">
+    回测累计盈亏前 20 名个股。下拉框选择后，图中蓝色折线为该股 2017-01-01 起的收盘价，
+    标记为本策略每一次买卖。
+    <span class="reason-tp">▲ 红</span> = 止盈 ·
+    <span class="reason-sl">▲ 绿</span> = 止损 ·
+    <span class="reason-hz">▲ 黄</span> = 强平 ·
+    <span style="color:#58a6ff;font-weight:600;">▲ 蓝</span> = 买入。
+  </p>
+  <div class="controls">
+    <label>选择个股：<select id="tl_select" style="min-width:340px;font-size:13px;"></select></label>
+    <span id="tl_meta" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="plot" id="plot_timeline" style="min-height:520px;"></div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="stocks">
+  <h2>个股贡献</h2>
+  <p class="subtitle">按累计实现盈亏排序。</p>
+  <div class="controls">
+    <label>筛选代码/名称：<input id="stk_filter" type="text" placeholder="例如 600519 或 茅台"></label>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_stocks"></table>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<section id="trades">
+  <h2>完整交易明细</h2>
+  <div class="controls">
+    <label>搜索：<input id="tr_search" type="text" placeholder="代码、名称、原因、日期前缀..."></label>
+    <label>原因：
+      <select id="tr_reason">
+        <option value="">全部</option>
+        <option value="take_profit">止盈</option>
+        <option value="stop_loss">止损</option>
+        <option value="horizon">强平</option>
+      </select>
+    </label>
+    <label>最小 |收益| %：<input id="tr_minret" type="number" step="0.1" value="0" style="width:80px"></label>
+    <span id="tr_count" style="color:var(--muted);font-size:12px;"></span>
+  </div>
+  <div class="scroll-table">
+    <table class="ttbl" id="tbl_trades"></table>
+  </div>
+  <div class="pager">
+    <button id="tr_prev">‹ 上一页</button>
+    <span id="tr_pageinfo"></span>
+    <button id="tr_next">下一页 ›</button>
+  </div>
+</section>
+
+<script>
+const PLOT_LAYOUT = {
+  paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+  font: { color: '#c9d1d9', size: 11,
+          family: '"PingFang SC","Microsoft YaHei",-apple-system,sans-serif' },
+  xaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  yaxis: { gridcolor: '#2a313c', zerolinecolor: '#2a313c' },
+  margin: { l: 60, r: 24, t: 40, b: 44 },
+  hovermode: 'closest',
+};
+const PLOT_CONFIG = { displaylogo: false, responsive: true };
+
+const REASON_CN = { take_profit:'止盈', stop_loss:'止损', horizon:'强平' };
+const REASON_COLOR = {
+  open: '#58a6ff', take_profit: '#da3633', stop_loss: '#2ea043', horizon: '#d29922',
+};
+const REASON_MARKER_LABEL = {
+  open: '买入', take_profit: '止盈卖出', stop_loss: '止损卖出', horizon: '强平卖出',
+};
+const FACTOR_COLOR = {
+  SIZE:       '#58a6ff',
+  VALUE:      '#d29922',
+  MOMENTUM:   '#da3633',
+  VOLATILITY: '#2ea043',
+  LIQUIDITY:  '#a371f7',
+};
+
+function fmtPct(x, dp=2) { return (x*100).toFixed(dp) + '%'; }
+function fmtMoney(x)     { return Math.round(x).toLocaleString('en-US'); }
+function fmtBig(x, dp=2) {
+  // For large values: 1234567 → 1.23M / 1.23B
+  const a = Math.abs(x);
+  if (a >= 1e9) return (x/1e9).toFixed(dp) + 'B';
+  if (a >= 1e6) return (x/1e6).toFixed(dp) + 'M';
+  if (a >= 1e3) return (x/1e3).toFixed(dp) + 'K';
+  return x.toFixed(dp);
+}
+function signClass(x) { return x >= 0 ? 'good' : 'bad'; }
+function card(label, value, hint, cls='') {
+  return `<div class="card"><div class="label">${label}</div>` +
+         `<div class="value ${cls}">${value}</div>` +
+         (hint ? `<div class="hint">${hint}</div>` : '') + `</div>`;
+}
+
+// Embedded data wins over fetch — single-file build embeds JSON directly.
+function getData() {
+  if (typeof window !== 'undefined' && window.COMBINED_DATA) {
+    return Promise.resolve(window.COMBINED_DATA);
+  }
+  return fetch('combined_data.json').then(r => r.json());
+}
+
+getData().then(D => {
+  const P = D.predictions, BT = D.backtest, FC = D.feature_catalog,
+        FI = D.feature_importance_top50 || [], BR = D.barra,
+        LIVE = D.live, AUDIT = D.leakage_audit;
+
+  document.getElementById('hdr-sub').textContent =
+    `XGBoost 回归模型 (${P.model_meta.n_features} 特征 · ${P.model_meta.n_folds} 折) · ` +
+    `OOS 期间 ${P.overall_metrics.date_start} → ${P.overall_metrics.date_end}  |  ` +
+    `回测期间 ${BT.metrics.date_start} → ${BT.metrics.date_end} ` +
+    `(${BT.metrics.years.toFixed(2)} 年)`;
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  LIVE — next trading day prediction + portfolio selection
+  //  Two views: no-ST (default, recommended) and with-ST (backtest-consistent)
+  // ════════════════════════════════════════════════════════════════════════
+  const LIVE_NO_ST    = D.live;
+  const LIVE_WITH_ST  = D.live_with_st;
+  const LIVE_EXPANDED = D.live_expanded;
+  let CURRENT_LIVE    = LIVE_NO_ST || LIVE_WITH_ST || LIVE_EXPANDED;
+
+  function renderLiveBlock(data) {
+    const LIVE = data;
+    if (!LIVE) return;
+    const cap = LIVE.execution_params && LIVE.execution_params.max_st_per_day;
+    const capLabel = (cap === undefined || cap === null) ? '?'
+                     : (cap < 0  ? '不限 ST'
+                     : (cap === 0 ? '完全排除 ST'
+                     : `ST 限额 ${cap} 只/日`));
+    document.getElementById('live_subtitle').innerHTML =
+      `特征截止日 <code>${LIVE.feature_date}</code> → 预测目标日 <code>${LIVE.forecast_date}</code> ` +
+      (LIVE.forecast_known
+        ? `<span class="warn">(目标日已开盘)</span>`
+        : `<span class="good">(尚未开盘 — 预测仍可用)</span>`) +
+      `  ·  全市场 ${LIVE.n_candidates.toLocaleString()} 只股票均生成了预测 · ` +
+      `当前视图: <b>${capLabel}</b>`;
+    const wEl = document.getElementById('live_warning');
+    if (LIVE.stale_warning) {
+      wEl.style.display = 'block';
+      wEl.style.background = 'rgba(218,54,51,.10)';
+      wEl.style.borderColor = 'rgba(218,54,51,.45)';
+      wEl.innerHTML = '<b>⚠️ 警告：预测数据陈旧</b><br>' +
+                       LIVE.stale_warning.replace(/`([^`]+)`/g, '<code>$1</code>');
+    } else if (LIVE.cash_recommendation) {
+      wEl.style.display = 'block';
+      wEl.style.background = 'rgba(46,160,67,.10)';
+      wEl.style.borderColor = 'rgba(46,160,67,.45)';
+      wEl.innerHTML = '<b>💰 建议：本日持币观望 (cash recommendation)</b><br>' +
+        '在当前过滤条件下,模型对所有可交易候选的 μ 预测均 ≤ 0 。' +
+        '长多头 QP 求解返回零权重 — 没有任何个股的预期超额收益足以吸收交易成本。' +
+        '<br><span style="color:var(--muted);font-size:11.5px;">' +
+        '下方表格仍列出过滤后的候选,但分配资金 / 股数均为 0 。' +
+        '若要看模型不受 ST 限额约束的最强 μ 推荐,切换到"不限 ST"视图。</span>';
+    } else {
+      wEl.style.display = 'none';
+    }
+
+    document.getElementById('cards_live').innerHTML = [
+      card('特征日',    LIVE.feature_date, '即数据截止日'),
+      card('预测日',    LIVE.forecast_date,
+           LIVE.forecast_known ? '已经过去' : '下一交易日', LIVE.forecast_known ? 'warn' : 'good'),
+      card('μ 中位',    LIVE.pred_stats.q05.toFixed(2) + '% / ' + LIVE.pred_stats.q95.toFixed(2) + '%',
+           '5% / 95% 分位'),
+      card('μ 极值',    LIVE.pred_stats.min.toFixed(2) + '% / +' + LIVE.pred_stats.max.toFixed(2) + '%',
+           '最弱 / 最强'),
+      card('选股数',    LIVE.portfolio.length + ' 只', '满足约束的 top-K'),
+      card('Σ 离对角',  LIVE.cov_offdiag_max_abs.toFixed(3),
+           'max |Σ_ij|, i≠j (相关性)', LIVE.cov_offdiag_max_abs > 5 ? 'warn' : ''),
+    ].join('');
+
+    // Funnel cards
+    if (LIVE.funnel) {
+      const F = LIVE.funnel;
+      const stCappedLabel = F.max_st_per_day === undefined || F.max_st_per_day === null
+        ? 'ST 限额超限'
+        : (F.max_st_per_day < 0 ? '(无限额)'
+        : (F.max_st_per_day === 0 ? 'ST 完全排除'
+        : `ST 限额 ${F.max_st_per_day}/日 已满`));
+      const passLabel = (F.st_in_pass !== undefined && F.nonst_in_pass !== undefined)
+        ? `ST ${F.st_in_pass} + 非-ST ${F.nonst_in_pass}`
+        : '进入 QP 求解';
+      document.getElementById('cards_funnel').innerHTML = [
+        card('候选池起始',     F.pool + ' 只', '预测最强的前 N 名'),
+        card('当日无数据',     F.no_close_row + ' 只', '停牌 / 退市 / 新股', F.no_close_row > 0 ? 'warn' : ''),
+        card('ST 被限额排除',  (F.st_capped || 0) + ' 只', stCappedLabel,
+             F.st_capped > 0 ? 'warn' : ''),
+        card('主板触及涨停',    F.at_limit_main + ' 只', '|pct_chg| ≥ 10%', F.at_limit_main > 0 ? 'warn' : ''),
+        card('创/科触及涨停',   F.at_limit_chinext + ' 只', '|pct_chg| ≥ 20%', F.at_limit_chinext > 0 ? 'warn' : ''),
+        card('历史不足',       F.insufficient_history + ' 只', 'σ_60 样本 <20', F.insufficient_history > 0 ? 'warn' : ''),
+        card('通过过滤',       F.pass + ' 只', passLabel, 'good'),
+      ].join('');
+
+      // Rejects table
+      const rejects = LIVE.rejects || [];
+      let rh = `<thead><tr>
+        <th>代码</th><th>名称</th><th>μ 预测 %</th>
+        <th>当日 pct_chg %</th><th>过滤原因</th>
+      </tr></thead><tbody>`;
+      rejects.forEach(r => {
+        rh += `<tr>
+          <td>${r.ts_code}</td>
+          <td>${r.name || ''}</td>
+          <td class="${r.pred>=0?'good':'bad'}">${r.pred>=0?'+':''}${r.pred.toFixed(2)}%</td>
+          <td>${r.pct_chg != null ? (r.pct_chg>=0?'+':'') + r.pct_chg.toFixed(2) + '%' : '—'}</td>
+          <td style="color:var(--muted);font-size:11.5px;">${r.reason}</td>
+        </tr>`;
+      });
+      rh += '</tbody>';
+      document.getElementById('tbl_live_rejects').innerHTML = rh;
+    }
+
+    // Portfolio table
+    let html = `<thead><tr>
+      <th>排名</th><th>代码</th><th>名称</th>
+      <th>状态</th>
+      <th>μ 全市场排名</th>
+      <th>μ 预测 %</th><th>80% 预测区间</th>
+      <th>P(↑)</th><th>P(>3%)</th>
+      <th>σ_60</th>
+      <th>权重 QP</th><th>权重 (对角对照)</th>
+      <th>建议买入价</th>
+      <th>分配资金 (流动性后)</th>
+      <th>股数 (100手)</th>
+      <th>20日均额</th>
+      <th>市场冲击</th>
+      <th>实际成本</th>
+    </tr></thead><tbody>`;
+    LIVE.portfolio.forEach((p, i) => {
+      const piStr = (p.pi_lo_80 != null && p.pi_hi_80 != null)
+        ? `[${p.pi_lo_80.toFixed(2)}, ${p.pi_hi_80.toFixed(2)}]` : '—';
+      const advStr = p.adv20_cny != null ? (p.adv20_cny/1e6).toFixed(1) + 'M' : '—';
+      const cappedTag = p.capped_by_adv
+        ? ' <span style="color:var(--warn);font-size:10px;">(限流)</span>' : '';
+      const stTag = p.is_st
+        ? '<span style="color:var(--up);font-weight:600;background:rgba(218,54,51,.15);padding:1px 6px;border-radius:3px;font-size:10px;">⚠️ *ST</span>'
+        : (p.band_pct && p.band_pct >= 19
+            ? '<span style="color:var(--accent);font-size:10px;">创/科</span>'
+            : '<span style="color:var(--muted);font-size:10px;">主板</span>');
+      const rowStyle = p.is_zero_weight
+        ? ' style="opacity:0.55;"'
+        : '';
+      const rankTxt = p.mu_rank != null
+        ? `#${p.mu_rank} / ${LIVE.n_candidates.toLocaleString()}`
+        : '—';
+      html += `<tr${rowStyle}>
+        <td>${i + 1}</td>
+        <td>${p.ts_code}</td>
+        <td>${p.name || ''}</td>
+        <td>${stTag}</td>
+        <td><span style="color:var(--muted);font-size:11.5px;">${rankTxt}</span></td>
+        <td class="${p.pred>=0?'good':'bad'}">${p.pred>=0?'+':''}${p.pred.toFixed(2)}%</td>
+        <td>${piStr}</td>
+        <td>${p.prob_up != null ? (p.prob_up*100).toFixed(1)+'%' : '—'}</td>
+        <td>${p.prob_gt_3pct != null ? (p.prob_gt_3pct*100).toFixed(1)+'%' : '—'}</td>
+        <td>${p.sigma.toFixed(2)}%</td>
+        <td><b>${(p.weight_qp*100).toFixed(1)}%</b></td>
+        <td>${(p.weight_diag*100).toFixed(1)}%</td>
+        <td>${p.close.toFixed(2)}</td>
+        <td>${fmtMoney(p.cny_alloc)}${cappedTag}</td>
+        <td>${p.shares.toLocaleString()}</td>
+        <td>${advStr}</td>
+        <td>${(p.impact_bps_est != null ? p.impact_bps_est : 0).toFixed(1)} bps</td>
+        <td>${fmtMoney(p.cost_basis || 0)}</td>
+      </tr>`;
+    });
+    // Footer row with totals
+    if (LIVE.total_alloc_cny != null) {
+      html += `<tr style="background:var(--panel2);font-weight:600;">
+        <td colspan="13" style="text-align:right;color:var(--muted);">合计</td>
+        <td>${fmtMoney(LIVE.total_alloc_cny)} 元</td>
+        <td colspan="3" style="color:var(--muted);">
+          ST 数: ${LIVE.n_st_in_portfolio || 0} · 流动性受限: ${LIVE.n_capped_by_adv} 只
+        </td>
+        <td>${fmtMoney(LIVE.total_cost_cny)} 元</td>
+      </tr>`;
+    }
+    html += '</tbody>';
+    document.getElementById('tbl_live_portfolio').innerHTML = html;
+
+    // Consistency table — show that every execution param matches the backtest
+    if (LIVE.execution_params) {
+      const E = LIVE.execution_params;
+      const rows = [
+        ['top-K (持仓数量)',     E.top_k,                     '10',  '✓'],
+        ['候选池大小',          E.candidate_pool,             '40 (top_k×4)',  '⚠️ 实时放宽'],
+        ['涨跌停过滤 (主板)',    E.limit_pct_main + '%',       '9.8%',          '✓'],
+        ['涨跌停过滤 (创/科)',   E.limit_pct_chinext + '%',    '9.8% (统一)',   '⚠️ 实时按板分'],
+        ['Σ 估计窗口',          E.cov_window + ' 日',         '60 日',         '✓'],
+        ['Σ 收缩方法',          'Ledoit-Wolf',                'Ledoit-Wolf',   '✓'],
+        ['风险厌恶 λ',          E.risk_aversion,              '1.0',           '✓'],
+        ['初始资金',           fmtMoney(E.initial) + ' 元',  '1,000,000 元',  '✓'],
+        ['可投资比例',         '95%',                         '95%',            '✓'],
+        ['入场费率',           E.entry_bps + ' bps',          '10 bps',        '✓'],
+        ['退出费率',           E.exit_bps  + ' bps',          '15 bps (含印花税)', '✓'],
+        ['流动性上限 (单股)',   '20日均额的 ' + (E.max_pos_adv*100) + '%', '5% × 20日均额', '✓'],
+        ['市场冲击',           E.impact_bps + ' bps × √(单笔/均额)',
+                                '10 bps × √(单笔/均额)',     '✓'],
+        ['手数取整',           '100 股',                      '100 股',         '✓'],
+      ];
+      let ch = `<thead><tr>
+        <th>参数</th><th>实时仓位</th><th>历史回测</th><th>一致?</th></tr></thead><tbody>`;
+      rows.forEach(r => {
+        const cls = r[3] === '✓' ? 'good' : 'warn';
+        ch += `<tr>
+          <td>${r[0]}</td>
+          <td><code>${r[1]}</code></td>
+          <td><code>${r[2]}</code></td>
+          <td class="${cls}">${r[3]}</td>
+        </tr>`;
+      });
+      ch += '</tbody>';
+      document.getElementById('tbl_consistency').innerHTML = ch;
+    }
+
+    // Helper: render an empty-state placeholder when a plot has no data
+    function renderEmptyPlot(divId, msg) {
+      const el = document.getElementById(divId);
+      if (!el) return;
+      el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;
+        height:320px;color:var(--muted);font-size:13px;text-align:center;
+        border:1px dashed var(--border);border-radius:6px;padding:20px;">
+        <div>${msg}</div></div>`;
+    }
+
+    // Prediction histogram
+    const allPreds = [...LIVE.top.map(r => r.pred), ...LIVE.bottom.map(r => r.pred)];
+    if (allPreds.length === 0) {
+      const fn = LIVE.funnel || {};
+      const atLimit = (fn.at_limit_main || 0) + (fn.at_limit_chinext || 0);
+      const reasonLines = [];
+      if (atLimit > 0) reasonLines.push(`前 ${fn.pool || '?'} 中有 <b>${atLimit}</b> 只在 <code>${LIVE.feature_date}</code> 已触及涨跌停`);
+      if (fn.no_close_row) reasonLines.push(`${fn.no_close_row} 只缺少当日收盘行`);
+      if (fn.insufficient_history) reasonLines.push(`${fn.insufficient_history} 只历史不足 20 日`);
+      if (fn.no_file) reasonLines.push(`${fn.no_file} 只数据文件缺失`);
+      const detail = reasonLines.length
+        ? '<br>具体过滤原因：<ul style="margin:8px 0 0;padding-left:20px;text-align:left;">'
+          + reasonLines.map(l => `<li>${l}</li>`).join('') + '</ul>'
+        : '';
+      renderEmptyPlot('plot_live_pred_dist',
+        `<b>当前候选池为空</b><br>没有股票通过过滤,故无法绘制 μ 分布。${detail}<br>
+        <span style="font-size:11px;">尝试 "扩展候选池视图" (池=200) 通常可见到通过样本。</span>`);
+    } else {
+      Plotly.newPlot('plot_live_pred_dist', [{
+        x: allPreds,
+        type: 'histogram',
+        marker: { color: allPreds.map(v => v >= 0 ? '#da3633' : '#2ea043') },
+        nbinsx: 30,
+      }], {
+        ...PLOT_LAYOUT, height: 320,
+        title: { text: '前30 + 后30 的 μ 分布 (单位 %)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, title: 'μ 预测 (相对沪深300超额, %)' },
+        yaxis: { ...PLOT_LAYOUT.yaxis, title: '股票数' },
+      }, PLOT_CONFIG);
+    }
+
+    // Weights bar
+    if (!LIVE.portfolio || LIVE.portfolio.length === 0) {
+      renderEmptyPlot('plot_live_weights',
+        `<b>本视图组合为空</b><br>QP 没有可分配权重的候选 (上方原因相同)。<br>
+        <span style="font-size:11px;">"扩展候选池视图" 通常会有 10 只持仓。</span>`);
+    } else {
+      Plotly.newPlot('plot_live_weights', [{
+        type: 'bar',
+        x: LIVE.portfolio.map(p => p.ts_code),
+        y: LIVE.portfolio.map(p => p.weight_qp * 100),
+        name: 'QP 权重',
+        marker: { color: '#da3633' },
+        text: LIVE.portfolio.map(p => p.name || ''),
+        hovertemplate: '<b>%{x}</b> %{text}<br>QP 权重: %{y:.2f}%<extra></extra>',
+      }, {
+        type: 'bar',
+        x: LIVE.portfolio.map(p => p.ts_code),
+        y: LIVE.portfolio.map(p => p.weight_diag * 100),
+        name: '对角 Σ 对照',
+        marker: { color: '#7d8590' },
+        hovertemplate: '<b>%{x}</b><br>对角 Σ 权重: %{y:.2f}%<extra></extra>',
+      }], {
+        ...PLOT_LAYOUT, height: 320, barmode: 'group',
+        title: { text: '组合权重对比 (QP 全 Σ vs 对角 Σ 收缩)', font: { size: 13 } },
+        xaxis: { ...PLOT_LAYOUT.xaxis, title: 'ts_code', tickangle: -45 },
+        yaxis: { ...PLOT_LAYOUT.yaxis, title: '权重 %', ticksuffix: '%' },
+        legend: { x: 0.7, y: 0.99 },
+      }, PLOT_CONFIG);
+    }
+
+    // Top-30 + Bottom-30 tables
+    function renderLiveTable(rows, dest, isTop) {
+      let h = `<thead><tr>
+        <th>排名</th><th>代码</th><th>名称</th>
+        <th>μ 预测 %</th><th>80% 预测区间</th>
+        <th>P(↑)</th><th>P(${isTop ? '>3%' : '<−3%'})</th>
+      </tr></thead><tbody>`;
+      rows.forEach((r, i) => {
+        const piStr = (r.pi_lo_80 != null && r.pi_hi_80 != null)
+          ? `[${r.pi_lo_80.toFixed(2)}, ${r.pi_hi_80.toFixed(2)}]` : '—';
+        h += `<tr>
+          <td>${i + 1}</td><td>${r.ts_code}</td><td>${r.name || ''}</td>
+          <td class="${r.pred>=0?'good':'bad'}">${r.pred>=0?'+':''}${r.pred.toFixed(2)}%</td>
+          <td>${piStr}</td>
+          <td>${r.prob_up != null ? (r.prob_up*100).toFixed(1)+'%' : '—'}</td>
+          <td>${(isTop ? r.prob_gt_3pct : r.prob_lt_3pct) != null
+                ? ((isTop ? r.prob_gt_3pct : r.prob_lt_3pct)*100).toFixed(1)+'%' : '—'}</td>
+        </tr>`;
+      });
+      h += '</tbody>';
+      document.getElementById(dest).innerHTML = h;
+    }
+    renderLiveTable(LIVE.top, 'tbl_live_top', true);
+    renderLiveTable(LIVE.bottom, 'tbl_live_bottom', false);
+  }   // end renderLiveBlock
+
+  if (CURRENT_LIVE) {
+    renderLiveBlock(CURRENT_LIVE);
+    // Toggle handler
+    document.querySelectorAll('input[name="live_view"]').forEach(el => {
+      el.addEventListener('change', e => {
+        const v = e.target.value;
+        CURRENT_LIVE = (v === 'with_st')  ? LIVE_WITH_ST
+                     : (v === 'expanded') ? LIVE_EXPANDED
+                     :                      LIVE_NO_ST;
+        if (CURRENT_LIVE) renderLiveBlock(CURRENT_LIVE);
+      });
+    });
+  } else {
+    document.getElementById('live_subtitle').innerHTML =
+      '<span class="bad">未生成实时预测 — 请运行 ' +
+      '<code>./venv/Scripts/python -m xgbmodel.main --mode predict</code> 后重建看板。</span>';
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  ST OUTCOMES — what happened to ST stocks the strategy traded
+  // ════════════════════════════════════════════════════════════════════════
+  const STO = D.st_outcomes;
+  if (STO) {
+    const H = STO.headline;
+    document.getElementById('cards_st_headline').innerHTML = [
+      card('回测中 ST 股票总数',  H.st_stocks_traded.toLocaleString() + ' 只',
+           '在交易当时确认为 ST/*ST'),
+      card('ST 交易笔数',         H.st_trades.toLocaleString() + ' 笔',
+           `占总交易 ${(H.pct_st_trades*100).toFixed(1)}%`),
+      card('ST 累计盈亏',         fmtMoney(H.st_pnl) + ' 元',
+           `占总盈亏 ${(H.pct_st_pnl*100).toFixed(1)}%`,
+           H.pct_st_pnl > 0.5 ? 'warn' : ''),
+      card('回测样本时点',        STO.as_of, '查询当下时点'),
+    ].join('');
+
+    // Outcome donut + table
+    const palette = {
+      delisted:  '#da3633',
+      paused:    '#d29922',
+      still_st:  '#bc8cff',
+      recovered: '#2ea043',
+      unknown:   '#7d8590',
+    };
+    const labels_zh = {
+      delisted:  '已退市',
+      paused:    '暂停上市',
+      still_st:  '仍为 ST',
+      recovered: '已摘帽 (恢复)',
+      unknown:   '未知',
+    };
+    const traceLabels = STO.by_outcome.map(r => labels_zh[r.outcome] || r.outcome);
+    const traceValues = STO.by_outcome.map(r => r.stocks);
+    const traceColors = STO.by_outcome.map(r => palette[r.outcome] || '#7d8590');
+
+    Plotly.newPlot('plot_st_outcomes', [{
+      type: 'pie',
+      labels: traceLabels,
+      values: traceValues,
+      marker: { colors: traceColors },
+      hole: 0.5,
+      textinfo: 'label+percent',
+      textfont: { color: '#fff' },
+    }], {
+      ...PLOT_LAYOUT, height: 360,
+      title: { text: `${H.st_stocks_traded} 只 ST 个股的当前归宿`, font: { size: 13 } },
+      showlegend: true, legend: { x: 0.05, y: 0.05, orientation: 'h' },
+    }, PLOT_CONFIG);
+
+    let sh = `<thead><tr>
+      <th>结局</th><th>股票数</th><th>占比</th><th>交易笔数</th><th>累计盈亏 (元)</th>
+    </tr></thead><tbody>`;
+    const total_stocks = STO.by_outcome.reduce((s, r) => s + r.stocks, 0);
+    STO.by_outcome.forEach(r => {
+      const pct = (r.stocks / total_stocks * 100).toFixed(1);
+      const cls = r.outcome === 'recovered' ? 'good'
+                : (r.outcome === 'delisted' ? 'bad' : '');
+      sh += `<tr>
+        <td><span style="color:${palette[r.outcome] || '#7d8590'};font-weight:600;">
+            ${labels_zh[r.outcome] || r.outcome}</span></td>
+        <td class="${cls}">${r.stocks.toLocaleString()}</td>
+        <td>${pct}%</td>
+        <td>${r.trades.toLocaleString()}</td>
+        <td>${fmtMoney(r.total_pnl)}</td>
+      </tr>`;
+    });
+    sh += '</tbody>';
+    document.getElementById('tbl_st_outcomes_summary').innerHTML = sh;
+
+    let th = `<thead><tr>
+      <th>代码</th><th>当前名称</th><th>结局</th><th>当前状态</th>
+      <th>笔数</th><th>胜率</th><th>累计盈亏 (元)</th>
+      <th>首次进场</th><th>最后一次</th>
+    </tr></thead><tbody>`;
+    (STO.top_contributors || []).forEach(r => {
+      const cls = r.total_pnl >= 0 ? 'good' : 'bad';
+      const oCls = r.outcome === 'recovered' ? 'good'
+                  : (r.outcome === 'delisted' ? 'bad' : 'warn');
+      th += `<tr>
+        <td>${r.ts_code}</td>
+        <td>${r.current_name || ''}</td>
+        <td class="${oCls}">${labels_zh[r.outcome] || r.outcome}</td>
+        <td>${r.list_status}</td>
+        <td>${r.trades}</td>
+        <td>${(r.hit_rate*100).toFixed(1)}%</td>
+        <td class="${cls}">${fmtMoney(r.total_pnl)}</td>
+        <td>${r.first_entry}</td>
+        <td>${r.last_entry}</td>
+      </tr>`;
+    });
+    th += '</tbody>';
+    document.getElementById('tbl_st_outcomes_top').innerHTML = th;
+  } else {
+    document.getElementById('cards_st_headline').innerHTML =
+      '<div class="card" style="grid-column:1/-1;color:var(--muted);">' +
+      'ST 结局分析未生成 — 请先运行 <code>./venv/Scripts/python -m api.st_history --download</code> 后重建。' +
+      '</div>';
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  CAPPED BACKTEST — max 4 ST per day comparison
+  // ════════════════════════════════════════════════════════════════════════
+  const CAPPED = D.capped_backtest;
+  if (CAPPED) {
+    const m0 = BT.metrics, m1 = CAPPED.metrics;
+    const dCAGR = (m1.cagr - m0.cagr) * 100;
+    const dSharpe = m1.sharpe - m0.sharpe;
+    const dMDD = (m1.max_drawdown - m0.max_drawdown) * 100;
+    document.getElementById('cards_capped').innerHTML = [
+      card('原始 CAGR (无 ST 限额)', fmtPct(m0.cagr, 2), `${BT.trade_summary.n_trades.toLocaleString()} 笔`,
+           signClass(m0.cagr)),
+      card('限额 CAGR (max 4 ST)',  fmtPct(m1.cagr, 2), `${CAPPED.n_trades.toLocaleString()} 笔`,
+           signClass(m1.cagr)),
+      card('CAGR 变化',             (dCAGR>=0?'+':'') + dCAGR.toFixed(2) + '% pt',
+           '限额版 vs 原始', dCAGR >= 0 ? 'good' : 'bad'),
+      card('原始 Sharpe',           m0.sharpe.toFixed(2)),
+      card('限额 Sharpe',           m1.sharpe.toFixed(2)),
+      card('Sharpe 变化',           (dSharpe>=0?'+':'') + dSharpe.toFixed(2),
+           '', dSharpe >= 0 ? 'good' : 'bad'),
+      card('原始最大回撤',          fmtPct(m0.max_drawdown, 1), '', 'bad'),
+      card('限额最大回撤',          fmtPct(m1.max_drawdown, 1), '', 'bad'),
+      card('回撤变化',              (dMDD>=0?'+':'') + dMDD.toFixed(2) + '% pt',
+           '限额比原始', dMDD >= 0 ? 'good' : 'bad'),
+    ].join('');
+
+    Plotly.newPlot('plot_capped_equity', [
+      { x: BT.equity.dates, y: BT.equity.nav, name: '原始策略 (无 ST 限额)',
+        type: 'scatter', mode: 'lines', line: { color: '#da3633', width: 1.6 } },
+      { x: CAPPED.equity_dates, y: CAPPED.equity_nav, name: '限额策略 (max 4 ST)',
+        type: 'scatter', mode: 'lines', line: { color: '#58a6ff', width: 1.6 } },
+      { x: BT.equity.dates, y: BT.equity.csi300, name: '沪深300 买入持有',
+        type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 1.0 } },
+    ], {
+      ...PLOT_LAYOUT, height: 420,
+      title: { text: '净值对照 (对数轴)', font: { size: 13 } },
+      yaxis: { ...PLOT_LAYOUT.yaxis, type: 'log', title: '净值 (对数)' },
+      xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+      legend: { x: 0.01, y: 0.99 },
+      hovermode: 'x unified',
+    }, PLOT_CONFIG);
+
+    // Plain-language takeaway
+    const ratio = m1.cagr / m0.cagr;
+    let verdict;
+    if (ratio > 0.85) verdict = '<span class="good">几乎不影响 alpha</span> — 限额回测仍保留了原策略的核心收益,说明模型在非-ST 个股上也有一定 alpha。';
+    else if (ratio > 0.50) verdict = '<span class="warn">显著降低但仍可观</span> — 限额版本的回报明显减少,但仍跑赢沪深300,说明 alpha 不完全依赖 ST。';
+    else if (ratio > 0.10) verdict = '<span class="warn">大幅削弱</span> — 限额回测的回报远低于原始,说明 alpha 主要来自 ST 交易。';
+    else                   verdict = '<span class="bad">几乎抹平</span> — 限额版本几乎没有超额收益,确认原策略 alpha 几乎全部来自 ST 交易。';
+    document.getElementById('capped_takeaway').innerHTML =
+      '<h3 style="margin-top:0;">结论</h3>' +
+      `<p>限额回测 CAGR / 原始 CAGR = <code>${(ratio*100).toFixed(1)}%</code>。${verdict}</p>` +
+      `<p style="color:var(--muted);font-size:12.5px;">原始: CAGR ${fmtPct(m0.cagr,2)} · Sharpe ${m0.sharpe.toFixed(2)} · MDD ${fmtPct(m0.max_drawdown,1)} · ${BT.trade_summary.n_trades.toLocaleString()} 笔。<br>` +
+      `限额: CAGR ${fmtPct(m1.cagr,2)} · Sharpe ${m1.sharpe.toFixed(2)} · MDD ${fmtPct(m1.max_drawdown,1)} · ${CAPPED.n_trades.toLocaleString()} 笔。</p>`;
+  } else {
+    document.getElementById('cards_capped').innerHTML =
+      '<div class="card" style="grid-column:1/-1;color:var(--muted);">' +
+      '限额回测未运行 — 请运行 <code>./venv/Scripts/python -m backtest.xgb_markowitz --solver qp --max_st_per_day 4 --tag qp_st4</code> 后重建看板。' +
+      '</div>';
+    document.getElementById('plot_capped_equity').innerHTML =
+      '<div style="padding:80px;color:var(--muted);text-align:center;">(等待限额回测数据)</div>';
+    document.getElementById('capped_takeaway').style.display = 'none';
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  LEAKAGE AUDIT
+  // ════════════════════════════════════════════════════════════════════════
+  if (AUDIT) {
+    let g = '<h3 style="margin-top:0;">7 项数据保证</h3><ol>';
+    AUDIT.guarantees.forEach(item => {
+      g += `<li style="margin-bottom:10px;">
+        <b>${item.topic}</b><br>
+        ${item.guarantee}<br>
+        <span style="color:var(--muted);font-size:11.5px;">证据：<code>${item.evidence}</code></span>
+      </li>`;
+    });
+    g += '</ol>';
+    document.getElementById('audit_guarantees').innerHTML = g;
+
+    let s = `<thead><tr>
+      <th>数据源</th><th>说明</th><th>最新日期</th><th>样本/文件数</th>
+    </tr></thead><tbody>`;
+    AUDIT.data_freshness.sources.forEach(src => {
+      const ld = src.latest_date || '—';
+      const isFresh = LIVE && ld >= LIVE.feature_date.replaceAll('-','');
+      const cls = isFresh ? 'good' : (ld < '20260420' ? 'bad' : '');
+      s += `<tr>
+        <td><code style="font-size:11.5px;">${src.name}</code></td>
+        <td>${src.desc}</td>
+        <td class="${cls}">${ld}</td>
+        <td>${src.samples != null ? src.samples.toLocaleString() : '—'}</td>
+      </tr>`;
+    });
+    s += '</tbody>';
+    document.getElementById('tbl_audit_sources').innerHTML = s;
+
+    // Surface stale-data warnings in the live section
+    if (LIVE) {
+      const fdNum = LIVE.feature_date.replaceAll('-','');
+      const stale = AUDIT.data_freshness.sources.filter(src =>
+        src.latest_date && src.latest_date < fdNum &&
+        !src.name.includes('xgb_preds')   // OOF preds always lag — that's expected
+      );
+      if (stale.length) {
+        const w = document.getElementById('live_warning');
+        w.style.display = 'block';
+        w.innerHTML = '<b>⚠️ 数据源滞后于特征日 ' + LIVE.feature_date + '：</b><br>' +
+          stale.map(s => `<code>${s.name}</code> (最新 ${s.latest_date})`).join('  ·  ') +
+          '<br><span style="color:var(--muted);font-size:11.5px;">' +
+          '本次预测中这些数据源会用其最近一日的值 (forward-fill) — 不影响无前视性，' +
+          '但下载到最新日期后预测精度可能进一步提高。</span>';
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  MODEL OVERVIEW
+  // ════════════════════════════════════════════════════════════════════════
+  document.getElementById('cards_overview').innerHTML = [
+    card('特征数量',     P.model_meta.n_features, '174 个'),
+    card('训练折数',     P.model_meta.n_folds, 'walk-forward'),
+    card('训练耗时',     (P.model_meta.total_train_seconds/60).toFixed(1) + ' 分钟', '212 折总和'),
+    card('每折树数',     P.model_meta.canonical_n_estimators, '由验证集早停决定'),
+    card('OOS 配对样本数', (P.overall_metrics.rows/1e6).toFixed(2) + 'M', `${P.overall_metrics.stocks} 只股票`),
+    card('目标',         '超额收益', '相对沪深300', 'good'),
+    card('正向预测命中', fmtPct(P.overall_metrics.hit_rate, 2), '方向正确率'),
+    card('Top-10% 命中', fmtPct(P.overall_metrics.hit_rate_top10pct, 2), '高置信度'),
+  ].join('');
+
+  document.getElementById('xgb_params_dump').textContent =
+    JSON.stringify(D.xgb_params, null, 2);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  FEATURE CATALOG
+  // ════════════════════════════════════════════════════════════════════════
+  const groupSel = document.getElementById('feat_group');
+  FC.groups.forEach(g => {
+    const opt = document.createElement('option');
+    opt.value = g.key;
+    opt.textContent = `${g.name_zh} (${g.count})`;
+    groupSel.appendChild(opt);
+  });
+  document.getElementById('cards_groups').innerHTML = FC.groups.map(g =>
+    card(g.name_zh, g.count + ' 个', g.desc, g.count > 0 ? 'warn' : '')
+  ).join('');
+
+  function renderFeatures() {
+    const grp = document.getElementById('feat_group').value;
+    const q = document.getElementById('feat_search').value.trim().toLowerCase();
+    const rows = FC.features.filter(r =>
+      (!grp || r.group === grp) &&
+      (!q || r.name.toLowerCase().includes(q) || (r.meaning || '').toLowerCase().includes(q))
+    );
+    const groupNameMap = {};
+    FC.groups.forEach(g => groupNameMap[g.key] = g.name_zh);
+    let html = `<thead><tr>
+      <th style="min-width:170px;">特征名 (英文)</th>
+      <th>类别</th>
+      <th style="min-width:300px;">中文含义</th>
+      <th>数据来源</th>
+    </tr></thead><tbody>`;
+    for (const r of rows) {
+      html += `<tr>
+        <td><code style="font-size:11.5px;">${r.name}</code></td>
+        <td><span class="group-pill">${groupNameMap[r.group] || r.group}</span></td>
+        <td>${r.meaning || ''}</td>
+        <td style="color:var(--muted);font-size:11.5px;">${r.source || ''}</td>
+      </tr>`;
+    }
+    html += '</tbody>';
+    document.getElementById('tbl_features').innerHTML = html;
+    document.getElementById('feat_count').textContent =
+      `${rows.length} / ${FC.total} 个特征`;
+  }
+  renderFeatures();
+  document.getElementById('feat_group').addEventListener('change', renderFeatures);
+  document.getElementById('feat_search').addEventListener('input', renderFeatures);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  FEATURE IMPORTANCE — top 50
+  // ════════════════════════════════════════════════════════════════════════
+  const feat_meta = {};
+  FC.features.forEach(r => feat_meta[r.name] = r);
+  const groupNameMap = {};
+  FC.groups.forEach(g => groupNameMap[g.key] = g.name_zh);
+
+  const top50 = [...FI].sort((a,b) => a.total_gain - b.total_gain);  // ascending so largest is at top of bar chart
+  Plotly.newPlot('plot_importance', [{
+    type: 'bar', orientation: 'h',
+    x: top50.map(r => r.total_gain),
+    y: top50.map(r => r.feature),
+    marker: { color: top50.map(r => {
+      const g = (feat_meta[r.feature] || {}).group;
+      const palette = {
+        price_action:'#58a6ff', volume:'#79c0ff', technical:'#a371f7',
+        limit_move:'#da3633',  pattern:'#ff7b72', moneyflow:'#d29922',
+        block_trade:'#bc8cff', valuation:'#2ea043', macro:'#7d8590',
+        csi300_ta:'#56d364',   cross_section:'#f0883e', sector:'#e3b341',
+        calendar:'#6e7681', unknown:'#3d444d',
+      };
+      return palette[g] || '#58a6ff';
+    }) },
+    text: top50.map(r => {
+      const meta = feat_meta[r.feature] || {};
+      return `${groupNameMap[meta.group] || meta.group}<br>${meta.meaning || ''}`;
+    }),
+    hovertemplate: '<b>%{y}</b><br>%{text}<br>total_gain: %{x:,.0f}<extra></extra>',
+  }], {
+    ...PLOT_LAYOUT, height: 880,
+    title: { text: 'Top-50 特征重要性 (累计 total_gain)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, title: 'total_gain (212 折累计)' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, automargin: true, tickfont: { size: 10 } },
+    margin: { l: 200, r: 24, t: 40, b: 44 },
+  }, PLOT_CONFIG);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  PREDICTION ACCURACY
+  // ════════════════════════════════════════════════════════════════════════
+  const om = P.overall_metrics, ic = P.daily_rank_ic, dec = P.decile;
+  document.getElementById('cards_accuracy').innerHTML = [
+    card('Pearson IC',  om.pearson_ic.toFixed(4),  '全期'),
+    card('Spearman IC', om.spearman_ic.toFixed(4), '全期'),
+    card('日均 Rank IC', ic.mean.toFixed(4), `ICIR=${ic.icir.toFixed(2)}`),
+    card('IC > 0 占比', fmtPct(ic.pct_positive, 1)),
+    card('方向命中率',   fmtPct(om.hit_rate, 2)),
+    card('Top-10% 命中', fmtPct(om.hit_rate_top10pct, 2), '高置信度'),
+    card('多空 Sharpe', dec.long_short_sharpe.toFixed(2), '十分位多空年化'),
+    card('MAE',         om.mae.toFixed(3) + '%'),
+  ].join('');
+
+  Plotly.newPlot('plot_daily_ic', [
+    { x: ic.dates, y: ic.ic_daily, name: '日 Rank IC',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 0.6 } },
+    { x: ic.dates, y: ic.ic_roll20, name: '20日均值',
+      type: 'scatter', mode: 'lines', line: { color: '#58a6ff', width: 1.5 } },
+  ], {
+    ...PLOT_LAYOUT, height: 360,
+    title: { text: '每日 Rank IC (Spearman 相关) 时序', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, zeroline: true, zerolinecolor: '#7d8590' },
+    legend: { x: 0.01, y: 0.99 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  Plotly.newPlot('plot_decile', [
+    { x: dec.decile, y: dec.mean_target, name: '各分位平均目标 (%)',
+      type: 'bar',
+      marker: { color: dec.mean_target.map(v => v >= 0 ? '#da3633' : '#2ea043') },
+    },
+  ], {
+    ...PLOT_LAYOUT, height: 360,
+    title: { text: '十分位分组的平均目标值 (单位 %)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, title: '预测分位 (1=最弱, 10=最强)', dtick: 1 },
+    yaxis: { ...PLOT_LAYOUT.yaxis, title: '平均目标 (%)' },
+  }, PLOT_CONFIG);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  BACKTEST SUMMARY CARDS
+  // ════════════════════════════════════════════════════════════════════════
+  const m = BT.metrics, t = BT.trade_summary, R = BT.reasons;
+  document.getElementById('cards_bt').innerHTML = [
+    card('最终净值', fmtMoney(m.final_nav) + ' 元', `起始 ${fmtMoney(m.initial)}`, 'good'),
+    card('累计收益', fmtPct(m.total_return, 1), '', signClass(m.total_return)),
+    card('年化收益', fmtPct(m.cagr, 2), '', signClass(m.cagr)),
+    card('夏普 (rf=0)', m.sharpe.toFixed(2), '年化波动 ' + fmtPct(m.vol_ann, 1)),
+    card('最大回撤', fmtPct(m.max_drawdown, 1),
+         `${m.mdd_peak} → ${m.mdd_trough}`, 'bad'),
+    card('卡玛比率', m.calmar ? m.calmar.toFixed(2) : '—'),
+    card('信息比率', m.info_ratio.toFixed(2), '相对沪深300'),
+    card('年化 Alpha', fmtPct(m.alpha_ann, 2),
+         `β = ${m.beta.toFixed(2)}`, signClass(m.alpha_ann)),
+  ].join('');
+  document.getElementById('cards_bt_strat').innerHTML = [
+    card('策略年化', fmtPct(m.cagr, 2), '', signClass(m.cagr)),
+    card('沪深300年化', fmtPct(m.bench_cagr, 2), '', signClass(m.bench_cagr)),
+    card('策略最大回撤', fmtPct(m.max_drawdown, 1), '', 'bad'),
+    card('沪深300回撤',   fmtPct(m.bench_mdd, 1), '', 'bad'),
+    card('策略波动', fmtPct(m.vol_ann, 1)),
+    card('沪深300波动', fmtPct(m.bench_vol, 1)),
+  ].join('');
+  document.getElementById('cards_bt_trades').innerHTML = [
+    card('交易笔数', t.n_trades.toLocaleString()),
+    card('胜率',     fmtPct(t.hit_rate, 1)),
+    card('平均盈利', '+' + t.avg_win_pct.toFixed(2) + '%', '', 'good'),
+    card('平均亏损', t.avg_loss_pct.toFixed(2) + '%', '', 'bad'),
+    card('盈亏比',   isFinite(t.profit_factor) ? t.profit_factor.toFixed(2) : '∞'),
+    card('中位持仓', t.median_hold_days.toFixed(0) + ' 日'),
+  ].join('');
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  EQUITY CURVE
+  // ════════════════════════════════════════════════════════════════════════
+  const eq = BT.equity;
+  Plotly.newPlot('plot_equity', [
+    { x: eq.dates, y: eq.nav,    name: 'XGB 马科维茨 QP 前10',
+      type: 'scatter', mode: 'lines', line: { color: '#da3633', width: 1.6 } },
+    { x: eq.dates, y: eq.csi300, name: '沪深300买入持有',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 1.2 } },
+  ], {
+    ...PLOT_LAYOUT, height: 420,
+    title: { text: '净值（元，对数轴）', font: { size: 13 } },
+    yaxis: { ...PLOT_LAYOUT.yaxis, type: 'log', title: '净值（对数）' },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    legend: { x: 0.01, y: 0.99 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  const navArr = eq.nav, n = navArr.length, ddArr = new Array(n);
+  let peak = navArr[0];
+  for (let i = 0; i < n; i++) {
+    if (navArr[i] > peak) peak = navArr[i];
+    ddArr[i] = (navArr[i] / peak - 1) * 100;
+  }
+  const cArr = eq.csi300, cDD = new Array(n);
+  let cPeak = cArr[0];
+  for (let i = 0; i < n; i++) {
+    if (cArr[i] > cPeak) cPeak = cArr[i];
+    cDD[i] = (cArr[i] / cPeak - 1) * 100;
+  }
+  Plotly.newPlot('plot_dd', [
+    { x: eq.dates, y: ddArr, name: '策略回撤', fill: 'tozeroy',
+      type: 'scatter', mode: 'lines', line: { color: '#da3633', width: 1 } },
+    { x: eq.dates, y: cDD, name: '沪深300回撤',
+      type: 'scatter', mode: 'lines', line: { color: '#7d8590', width: 1 } },
+  ], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: '回撤 (%)', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis: { ...PLOT_LAYOUT.yaxis, ticksuffix: '%' },
+    legend: { x: 0.01, y: 0.05 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  Plotly.newPlot('plot_pos', [
+    { x: eq.dates, y: eq.n_pos, name: '持仓数量', yaxis: 'y',
+      type: 'scatter', mode: 'lines', line: { color: '#58a6ff', width: 1 } },
+    { x: eq.dates, y: eq.cash.map(v => v / 1e4), name: '现金 (万元)', yaxis: 'y2',
+      type: 'scatter', mode: 'lines', line: { color: '#d29922', width: 1 } },
+  ], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: '持仓数量与现金', font: { size: 13 } },
+    xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+    yaxis:  { ...PLOT_LAYOUT.yaxis, title: '持仓数量' },
+    yaxis2: { ...PLOT_LAYOUT.yaxis, title: '现金 (万元)',
+              overlaying: 'y', side: 'right', showgrid: false },
+    legend: { x: 0.01, y: 0.99 },
+    hovermode: 'x unified',
+  }, PLOT_CONFIG);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  BARRA RISK ATTRIBUTION
+  // ════════════════════════════════════════════════════════════════════════
+  if (BR && BR.factors) {
+    const facCardsHTML = BR.factors.map(f => {
+      const me = BR.summary.mean_exposure[f];
+      const cum = BR.summary.factor_cum[f];
+      const tilt = me >= 0 ? '偏多' : '偏空';
+      return card(BR.labels[f] || f,
+                  (me >= 0 ? '+' : '') + me.toFixed(2),
+                  `平均暴露 (${tilt}) · 累计贡献 ${(cum*100).toFixed(2)}%`,
+                  Math.abs(me) > 0.3 ? 'warn' : '');
+    });
+    facCardsHTML.unshift(
+      card('累计 Alpha (选股 α)', fmtPct(BR.summary.alpha_cum, 1),
+           '剔除风格因子后的选股残差', 'good'));
+    document.getElementById('cards_barra').innerHTML = facCardsHTML.join('');
+
+    const expTraces = BR.factors.map(f => ({
+      x: BR.dates, y: BR.exposures[f], name: f,
+      type: 'scatter', mode: 'lines',
+      line: { color: FACTOR_COLOR[f] || '#58a6ff', width: 1.2 },
+    }));
+    Plotly.newPlot('plot_barra_exposure', expTraces, {
+      ...PLOT_LAYOUT, height: 380,
+      title: { text: '策略每日因子暴露 (z-score 平均值)', font: { size: 13 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+      yaxis: { ...PLOT_LAYOUT.yaxis, title: 'z-score', zeroline: true, zerolinecolor: '#7d8590' },
+      legend: { x: 0.01, y: 0.99 },
+      hovermode: 'x unified',
+    }, PLOT_CONFIG);
+
+    // Cumulative attribution: α residual + each factor stacked
+    const contribTraces = BR.factors.map(f => ({
+      x: BR.contrib_dates,
+      y: BR.contrib_cum[f].map(v => v * 100),
+      name: BR.labels[f] || f,
+      type: 'scatter', mode: 'lines',
+      line: { color: FACTOR_COLOR[f] || '#58a6ff', width: 1.2 },
+    }));
+    contribTraces.push({
+      x: BR.contrib_dates,
+      y: BR.alpha_cum.map(v => v * 100),
+      name: 'α 残差 (选股能力)',
+      type: 'scatter', mode: 'lines',
+      line: { color: '#da3633', width: 2.2 },
+    });
+    Plotly.newPlot('plot_barra_contrib', contribTraces, {
+      ...PLOT_LAYOUT, height: 380,
+      title: { text: '累计收益分解：因子贡献 vs α 残差 (%)', font: { size: 13 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date' },
+      yaxis: { ...PLOT_LAYOUT.yaxis, title: '累计 (%)', ticksuffix: '%' },
+      legend: { x: 0.01, y: 0.99 },
+      hovermode: 'x unified',
+    }, PLOT_CONFIG);
+  } else {
+    document.getElementById('plot_barra_exposure').innerHTML =
+      '<div style="padding:40px;color:var(--muted);text-align:center;">Barra 数据未加载</div>';
+    document.getElementById('plot_barra_contrib').innerHTML = '';
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  EXIT REASONS
+  // ════════════════════════════════════════════════════════════════════════
+  const total = R.take_profit + R.stop_loss + R.horizon;
+  Plotly.newPlot('plot_reasons', [{
+    type: 'pie',
+    labels: ['止盈 (+3%)', '止损 (−2%)', '强平 (5日收盘)'],
+    values: [R.take_profit, R.stop_loss, R.horizon],
+    marker: { colors: ['#da3633', '#2ea043', '#d29922'] },
+    hole: 0.55, textinfo: 'label+percent', textfont: { color: '#fff' },
+  }], {
+    ...PLOT_LAYOUT, height: 320,
+    title: { text: `卖出原因构成（共 ${total.toLocaleString()} 笔）`, font: { size: 13 } },
+    showlegend: false,
+  }, PLOT_CONFIG);
+  document.getElementById('tbl_reasons').innerHTML = `
+    <thead><tr><th>原因</th><th>笔数</th><th>占比</th><th>触发条件</th></tr></thead>
+    <tbody>
+      <tr><td class="reason-tp">止盈</td><td>${R.take_profit.toLocaleString()}</td>
+          <td>${fmtPct(R.take_profit/total, 1)}</td>
+          <td>当日最高价 ≥ 入场价 × 1.03 → 以 +3% 价格卖出</td></tr>
+      <tr><td class="reason-sl">止损</td><td>${R.stop_loss.toLocaleString()}</td>
+          <td>${fmtPct(R.stop_loss/total, 1)}</td>
+          <td>当日最低价 ≤ 入场价 × 0.98 → 以 −2% 价格卖出</td></tr>
+      <tr><td class="reason-hz">强平</td><td>${R.horizon.toLocaleString()}</td>
+          <td>${fmtPct(R.horizon/total, 1)}</td>
+          <td>持仓 5 日未触发止盈/止损 → 收盘价卖出</td></tr>
+    </tbody>`;
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  TIMELINE — top 20 stocks
+  // ════════════════════════════════════════════════════════════════════════
+  const TL = BT.top_timelines || [];
+  const tlSel = document.getElementById('tl_select'), tlMeta = document.getElementById('tl_meta');
+  TL.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.ts_code;
+    const sign = s.total_pnl >= 0 ? '+' : '';
+    opt.textContent = `${s.ts_code}  ${s.name||''}  · ${s.n_trades}笔 · ${sign}${fmtMoney(s.total_pnl)}元`;
+    tlSel.appendChild(opt);
+  });
+  function renderTimeline(ts_code) {
+    const s = TL.find(x => x.ts_code === ts_code);
+    if (!s) return;
+    tlMeta.textContent =
+      `${s.n_trades} 笔交易 · 胜率 ${(s.hit_rate*100).toFixed(1)}% · ` +
+      `累计盈亏 ${s.total_pnl >= 0 ? '+' : ''}${fmtMoney(s.total_pnl)} 元 · ` +
+      `${s.dates[0]} → ${s.dates[s.dates.length-1]}`;
+    const groups = {};
+    for (const ev of s.events) {
+      const k = ev.type === 'buy' ? 'open' : ev.reason;
+      (groups[k] = groups[k] || []).push(ev);
+    }
+    function evTrace(reasonKey) {
+      const evs = groups[reasonKey] || [];
+      if (!evs.length) return null;
+      const isBuy = (reasonKey === 'open');
+      return {
+        x: evs.map(e => e.date), y: evs.map(e => e.price),
+        type: 'scatter', mode: 'markers',
+        name: REASON_MARKER_LABEL[reasonKey] + ` (${evs.length})`,
+        marker: { color: REASON_COLOR[reasonKey],
+                  symbol: isBuy ? 'triangle-up' : 'triangle-down',
+                  size: 11, line: { color: '#0e1117', width: 1 }, opacity: 0.92 },
+        text: evs.map(e => {
+          const verb = isBuy ? '买入' : '卖出';
+          const pair = isBuy ? `预计出场 ${e.paired}` : `对应买入 ${e.paired}`;
+          const reasonLabel = isBuy ? '' : `<br>原因: ${REASON_MARKER_LABEL[reasonKey]}`;
+          const retLine = isBuy ? '' :
+                `<br>收益: ${e.ret_pct >= 0 ? '+' : ''}${e.ret_pct.toFixed(2)}%` +
+                `<br>盈亏: ${e.pnl >= 0 ? '+' : ''}${fmtMoney(e.pnl)} 元 · ${e.held_days} 日`;
+          return `<b>${verb} @ ${e.price.toFixed(2)}</b><br>${pair}${reasonLabel}${retLine}`;
+        }),
+        hovertemplate: '%{text}<br>日期: %{x}<extra></extra>',
+      };
+    }
+    const traces = [{
+      x: s.dates, y: s.close, type: 'scatter', mode: 'lines',
+      name: '收盘价', line: { color: '#58a6ff', width: 1.2 },
+      hovertemplate: '%{x}<br>收盘 %{y:.2f}<extra></extra>',
+    }];
+    for (const k of ['open','take_profit','stop_loss','horizon']) {
+      const tr = evTrace(k); if (tr) traces.push(tr);
+    }
+    Plotly.newPlot('plot_timeline', traces, {
+      ...PLOT_LAYOUT, height: 520,
+      title: { text: `${s.ts_code} ${s.name||''} — 收盘价 + 本策略买卖时点`, font: { size: 14 } },
+      xaxis: { ...PLOT_LAYOUT.xaxis, type: 'date', title: '日期',
+               rangeslider: { visible: true, thickness: 0.06,
+                              bgcolor: '#1c232e', bordercolor: '#2a313c' } },
+      yaxis: { ...PLOT_LAYOUT.yaxis, title: '价格 (元)' },
+      legend: { x: 0.01, y: 0.99, orientation: 'h' },
+    }, PLOT_CONFIG);
+  }
+  if (TL.length) {
+    tlSel.value = TL[0].ts_code;
+    renderTimeline(TL[0].ts_code);
+    tlSel.addEventListener('change', e => renderTimeline(e.target.value));
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  PER-STOCK CONTRIBUTION
+  // ════════════════════════════════════════════════════════════════════════
+  const stocks = BT.per_stock;
+  function renderStocks(filter='') {
+    const f = filter.trim().toLowerCase();
+    const rows = stocks.filter(r =>
+      !f || r.ts_code.toLowerCase().includes(f) ||
+            (r.name && r.name.toLowerCase().includes(f)));
+    let html = `<thead><tr>
+      <th>代码</th><th>名称</th><th>笔数</th><th>胜次</th><th>胜率</th>
+      <th>累计盈亏</th><th>平均收益</th><th>首次买入</th><th>最后卖出</th>
+    </tr></thead><tbody>`;
+    for (const r of rows.slice(0, 500)) {
+      const cls = r.total_pnl >= 0 ? 'good' : 'bad';
+      html += `<tr>
+        <td>${r.ts_code}</td>
+        <td>${r.name || ''}</td>
+        <td>${r.trades}</td>
+        <td>${r.wins}</td>
+        <td>${(r.hit_rate*100).toFixed(1)}%</td>
+        <td class="${cls}">${fmtMoney(r.total_pnl)}</td>
+        <td class="${r.avg_ret>=0?'good':'bad'}">${r.avg_ret>=0?'+':''}${r.avg_ret.toFixed(2)}%</td>
+        <td>${r.first}</td>
+        <td>${r.last}</td>
+      </tr>`;
+    }
+    if (rows.length > 500) {
+      html += `<tr><td colspan="9" style="text-align:center;color:var(--muted);">
+        显示前 500 条，共 ${rows.length.toLocaleString()} 条 — 请细化筛选条件查看更多</td></tr>`;
+    }
+    html += '</tbody>';
+    document.getElementById('tbl_stocks').innerHTML = html;
+  }
+  renderStocks();
+  document.getElementById('stk_filter').addEventListener('input', e => renderStocks(e.target.value));
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  ALL TRADES
+  // ════════════════════════════════════════════════════════════════════════
+  const TRADES = BT.trades, PAGE_SIZE = 80;
+  let curPage = 0, curRows = TRADES;
+  const trBody = document.getElementById('tbl_trades');
+  const trCount = document.getElementById('tr_count');
+  const trPi = document.getElementById('tr_pageinfo');
+  function renderTrades() {
+    const start = curPage * PAGE_SIZE;
+    const slice = curRows.slice(start, start + PAGE_SIZE);
+    let html = `<thead><tr>
+      <th data-k="entry_date">买入日</th><th data-k="exit_date">卖出日</th>
+      <th data-k="ts_code">代码</th><th>名称</th>
+      <th data-k="entry_price">买入价</th><th data-k="exit_price">卖出价</th>
+      <th data-k="held_days">持仓日</th><th data-k="ret_pct">收益 %</th>
+      <th data-k="pnl">盈亏 (元)</th><th data-k="reason">原因</th>
+      <th data-k="pred">μ 预测</th><th data-k="sigma">σ</th><th data-k="weight">权重</th>
+    </tr></thead><tbody>`;
+    for (const r of slice) {
+      const reasonClass = { take_profit:'reason-tp', stop_loss:'reason-sl', horizon:'reason-hz' }[r.reason] || '';
+      const retClass = r.ret_pct >= 0 ? 'good' : 'bad';
+      const pnlClass = r.pnl     >= 0 ? 'good' : 'bad';
+      html += `<tr>
+        <td>${r.entry_date}</td><td>${r.exit_date}</td>
+        <td>${r.ts_code}</td><td>${r.name || ''}</td>
+        <td>${r.entry_price.toFixed(2)}</td><td>${r.exit_price.toFixed(2)}</td>
+        <td>${r.held_days}</td>
+        <td class="${retClass}">${r.ret_pct>=0?'+':''}${r.ret_pct.toFixed(2)}%</td>
+        <td class="${pnlClass}">${fmtMoney(r.pnl)}</td>
+        <td class="${reasonClass}">${REASON_CN[r.reason] || r.reason}</td>
+        <td>${r.pred.toFixed(3)}</td><td>${r.sigma.toFixed(2)}</td>
+        <td>${(r.weight*100).toFixed(1)}%</td>
+      </tr>`;
+    }
+    html += '</tbody>';
+    trBody.innerHTML = html;
+    const totalPages = Math.max(1, Math.ceil(curRows.length / PAGE_SIZE));
+    trPi.textContent = `第 ${curPage+1} / ${totalPages} 页`;
+    document.getElementById('tr_prev').disabled = curPage <= 0;
+    document.getElementById('tr_next').disabled = curPage >= totalPages - 1;
+    trCount.textContent = `${curRows.length.toLocaleString()} 笔匹配`;
+    trBody.querySelectorAll('th[data-k]').forEach(th => {
+      th.addEventListener('click', () => sortBy(th.dataset.k));
+    });
+  }
+  let sortKey = '', sortAsc = true;
+  function sortBy(k) {
+    if (sortKey === k) sortAsc = !sortAsc;
+    else { sortKey = k; sortAsc = (k === 'entry_date' || k === 'exit_date'); }
+    curRows.sort((a, b) => {
+      const av = a[k], bv = b[k];
+      if (av === bv) return 0;
+      return (av < bv ? -1 : 1) * (sortAsc ? 1 : -1);
+    });
+    curPage = 0; renderTrades();
+  }
+  function applyFilters() {
+    const q = document.getElementById('tr_search').value.trim().toLowerCase();
+    const r = document.getElementById('tr_reason').value;
+    const minR = Math.abs(parseFloat(document.getElementById('tr_minret').value) || 0);
+    curRows = TRADES.filter(t => {
+      if (r && t.reason !== r) return false;
+      if (Math.abs(t.ret_pct) < minR) return false;
+      if (q) {
+        const blob = `${t.ts_code} ${t.name || ''} ${t.reason} ${REASON_CN[t.reason] || ''} ${t.entry_date} ${t.exit_date}`.toLowerCase();
+        if (!blob.includes(q)) return false;
+      }
+      return true;
+    });
+    curPage = 0; renderTrades();
+  }
+  document.getElementById('tr_search').addEventListener('input', applyFilters);
+  document.getElementById('tr_reason').addEventListener('change', applyFilters);
+  document.getElementById('tr_minret').addEventListener('input', applyFilters);
+  document.getElementById('tr_prev').addEventListener('click', () => { if (curPage > 0) { curPage--; renderTrades(); } });
+  document.getElementById('tr_next').addEventListener('click', () => { curPage++; renderTrades(); });
+  renderTrades();
+}).catch(err => {
+  console.error(err);
+  document.getElementById('hdr-sub').innerHTML =
+    '<span style="color:var(--bad)">加载 combined_data.json 失败 — 请先运行 ' +
+    '<code>./venv/Scripts/python -m dashboard.build_combined</code></span>';
+});
+</script>
+</body>
+</html>

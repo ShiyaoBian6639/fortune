@@ -205,6 +205,12 @@ def _download_one(data_type: str, ts_code: str) -> tuple:
         df = pd.concat([existing, df], ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code', cfg['date_col']], keep='last')
 
+    # Normalise date column to str — existing CSVs have it as int64 (pandas
+    # inferred), tushare returns str. After concat the column is `object`
+    # dtype with mixed int + str values, which breaks sort_values's `<`
+    # comparison. Cast unconditionally.
+    if cfg['date_col'] in df.columns:
+        df[cfg['date_col']] = df[cfg['date_col']].astype(str)
     df = df.sort_values(cfg['date_col'])
     df.to_csv(fp, index=False, encoding='utf-8-sig')
     return ts_code, f'+{len(df)} rows'
