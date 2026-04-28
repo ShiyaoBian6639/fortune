@@ -84,6 +84,25 @@ def extract_codes(text: str) -> List[str]:
 
 
 # ─── News loading ────────────────────────────────────────────────────────────
+def load_deduped_corpus(path: Path, start: str, end: str) -> pd.DataFrame:
+    """Read the pre-deduped corpus (built by xgbmodel.dedupe_news).
+    Skips the per-source rescan + dedup that load_news_corpus does, which on a
+    full 2017-now corpus saves ~5 min and ~30-50% of articles."""
+    if path.suffix.lower() == '.parquet':
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, encoding='utf-8-sig')
+        if 'ts_codes' in df.columns and df['ts_codes'].dtype == object:
+            df['ts_codes'] = df['ts_codes'].fillna('').apply(
+                lambda s: s.split(';') if isinstance(s, str) and s else [])
+    df['datetime']   = pd.to_datetime(df['datetime'], format='mixed', errors='coerce')
+    df = df.dropna(subset=['datetime'])
+    df['trade_date'] = df['datetime'].dt.normalize()
+    df = df[(df['trade_date'] >= pd.Timestamp(start))
+            & (df['trade_date'] <= pd.Timestamp(end))]
+    return df.reset_index(drop=True)
+
+
 def load_news_corpus(news_dir: Path, start: str, end: str) -> pd.DataFrame:
     """Read every per-source-per-day CSV in news_dir and return a unified frame.
 
@@ -114,7 +133,7 @@ def load_news_corpus(news_dir: Path, start: str, end: str) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=['source','datetime','content','title','ts_code'])
     out = pd.concat(frames, ignore_index=True)
-    out['datetime'] = pd.to_datetime(out['datetime'], errors='coerce')
+    out['datetime'] = pd.to_datetime(out['datetime'], format='mixed', errors='coerce')
     out = out.dropna(subset=['datetime'])
     out['trade_date'] = out['datetime'].dt.normalize()
     out = out[(out['trade_date'] >= pd.Timestamp(start))
@@ -220,6 +239,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--news_dir', default='stock_data/news')
+    p.add_argument('--dedup_corpus', default='stock_data/news_corpus_dedup.parquet',
+                   help='preferred input — built by xgbmodel.dedupe_news. If '
+                        'absent, falls back to scanning per-source files.')
     p.add_argument('--out_csv',  default='stock_data/news_sentiment_qwen.csv')
     p.add_argument('--start',    default='2017-01-01')
     p.add_argument('--end',      default='2026-04-27')
@@ -236,8 +258,14 @@ def main():
                    help='save partial output every N articles.')
     args = p.parse_args()
 
-    print(f"[qwen-sent] loading news from {args.news_dir} ...", flush=True)
-    corpus = load_news_corpus(Path(args.news_dir), args.start, args.end)
+    # Prefer the deduped corpus if present — saves rescanning + 30-50% compute.
+    dedup_p = Path(args.dedup_corpus) if args.dedup_corpus else None
+    if dedup_p and dedup_p.exists():
+        print(f"[qwen-sent] loading DEDUPED corpus from {dedup_p} ...", flush=True)
+        corpus = load_deduped_corpus(dedup_p, args.start, args.end)
+    else:
+        print(f"[qwen-sent] loading news from {args.news_dir} (no dedup file) ...", flush=True)
+        corpus = load_news_corpus(Path(args.news_dir), args.start, args.end)
     print(f"[qwen-sent] {len(corpus):,} articles loaded "
           f"({corpus['datetime'].min()} → {corpus['datetime'].max()})", flush=True)
     if args.max_articles > 0:
@@ -250,9 +278,13 @@ def main():
                       corpus['content'].fillna('').astype(str))
     corpus['text'] = corpus['text'].str.strip()
 
-    # Extract ts_codes from each article
-    print(f"[qwen-sent] extracting stock codes from articles ...", flush=True)
-    corpus['ts_codes'] = corpus['text'].apply(extract_codes)
+    # Extract ts_codes from each article — skip if already present (deduped corpus).
+    if 'ts_codes' not in corpus.columns or corpus['ts_codes'].apply(
+            lambda x: not isinstance(x, list)).any():
+        print(f"[qwen-sent] extracting stock codes from articles ...", flush=True)
+        corpus['ts_codes'] = corpus['text'].apply(extract_codes)
+    else:
+        print(f"[qwen-sent] ts_codes already extracted (from deduped corpus)", flush=True)
     n_with_code = (corpus['ts_codes'].str.len() > 0).sum()
     print(f"[qwen-sent] {n_with_code:,} of {len(corpus):,} articles mention "
           f"≥1 A-share code ({100*n_with_code/max(len(corpus),1):.1f}%)", flush=True)
