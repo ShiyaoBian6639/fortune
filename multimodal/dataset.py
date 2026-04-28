@@ -78,6 +78,15 @@ def _resolve_news_cache_path(meta: dict, override: Optional[str]) -> str:
     return p
 
 
+def _open_price(cache_dir: str, load_in_ram: bool) -> np.ndarray:
+    """Open price_matrix.npy either as a full RAM copy or a read-only memmap."""
+    p = os.path.join(cache_dir, 'price_matrix.npy')
+    if load_in_ram:
+        # np.load without mmap_mode reads the whole file into RAM.
+        return np.load(p)
+    return np.load(p, mmap_mode='r')
+
+
 # ─── Phase 1 dataset ──────────────────────────────────────────────────────────
 
 class MultimodalStockDataset(Dataset):
@@ -91,13 +100,15 @@ class MultimodalStockDataset(Dataset):
 
     def __init__(
         self,
-        cache_dir:        str,
-        split:            str           = 'train',
-        news_cache_path:  Optional[str] = None,
-        news_window:      Optional[int] = None,
+        cache_dir:         str,
+        split:             str           = 'train',
+        news_cache_path:   Optional[str] = None,
+        news_window:       Optional[int] = None,
+        load_price_in_ram: bool          = False,
     ):
-        self.cache_dir = cache_dir
-        self.split     = split
+        self.cache_dir          = cache_dir
+        self.split              = split
+        self._load_price_in_ram = bool(load_price_in_ram)
 
         with open(os.path.join(cache_dir, 'metadata.json')) as f:
             meta = json.load(f)
@@ -123,17 +134,15 @@ class MultimodalStockDataset(Dataset):
         self._news_per_date = _load_news_per_date(news_path, trading_calendar)
         self._news_dim    = self._news_per_date.shape[1]
 
-        self._price_mm = None
+        self._price = None
         self._open_memmaps()
 
     def _open_memmaps(self):
-        self._price_mm = np.load(
-            os.path.join(self.cache_dir, 'price_matrix.npy'), mmap_mode='r',
-        )
+        self._price = _open_price(self.cache_dir, self._load_price_in_ram)
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state['_price_mm'] = None
+        state['_price'] = None
         return state
 
     def __setstate__(self, state):
@@ -150,9 +159,10 @@ class MultimodalStockDataset(Dataset):
         label    = int(self._sample_labels[gi])
 
         L = self.seq_len
-        # `np.array(...)` forces a copy out of the memmap so the tensor below
-        # owns its memory (avoids dangling-mmap issues across worker forks).
-        price = np.array(self._price_mm[end - L + 1: end + 1], dtype=np.float32)
+        # `np.array(...)` materialises the slice as a fresh array.  For memmap
+        # this also avoids dangling-mmap issues across DataLoader worker forks;
+        # for in-RAM mode it's just a cheap copy.
+        price = np.array(self._price[end - L + 1: end + 1], dtype=np.float32)
 
         W = self.news_window
         news = np.zeros((W, self._news_dim), dtype=np.float32)
@@ -178,32 +188,37 @@ class MultimodalChunkedLoader:
     Background-prefetched chunked loader for Phase 1 training.
 
     Each chunk is a randomly-permuted slice of the split's sample indices.
-    Gathering uses fancy indexing into the price memmap (the OS page cache
-    keeps recently-touched rows hot — the matrix is only ~6 GB).  News is
-    looked up from a small in-RAM table.
+    Gathering uses fancy indexing into the price matrix (in-RAM by default;
+    set ``load_price_in_ram=False`` to fall back to memmap on tight hosts).
+    News is looked up from a small in-RAM table.
 
     Two prefetch threads stay one chunk ahead of training so GPU never waits
-    on disk.
+    on data prep.  When ``pin_memory=True`` the gathered tensors land in
+    page-locked host memory, letting ``.to(device, non_blocking=True)`` in the
+    train loop overlap H2D copy with GPU compute.
 
-    Peak RAM ≈ 3 × chunk_samples × (seq_len × n_feat + news_window × 768) × 4
-    plus the (D, 768) news table (~10 MB).
+    Peak RAM at default settings (chunk_samples=100K, batch=2048):
+        ~6 GB price matrix in RAM + ~3 × 3.4 GB chunks ≈ 16 GB.
     """
 
     def __init__(
         self,
-        cache_dir:       str,
-        split:           str           = 'train',
-        batch_size:      int           = 1024,
-        chunk_samples:   int           = 50_000,
-        seed:            int           = 42,
-        news_cache_path: Optional[str] = None,
-        news_window:     Optional[int] = None,
+        cache_dir:         str,
+        split:             str           = 'train',
+        batch_size:        int           = 2048,
+        chunk_samples:     int           = 100_000,
+        seed:              int           = 42,
+        news_cache_path:   Optional[str] = None,
+        news_window:       Optional[int] = None,
+        load_price_in_ram: bool          = True,
+        pin_memory:        bool          = False,
     ):
         self.cache_dir     = cache_dir
         self.split         = split
         self.batch_size    = batch_size
         self.chunk_samples = chunk_samples
         self._seed         = seed
+        self._pin_memory   = bool(pin_memory)
 
         with open(os.path.join(cache_dir, 'metadata.json')) as f:
             meta = json.load(f)
@@ -234,10 +249,11 @@ class MultimodalChunkedLoader:
         self._news_per_date = _load_news_per_date(news_path, trading_calendar)
         self._news_dim      = self._news_per_date.shape[1]
 
-        # Read-only memmap (numpy memmap is thread-safe for reads)
-        self._price_mm = np.load(
-            os.path.join(cache_dir, 'price_matrix.npy'), mmap_mode='r',
-        )
+        # Either in-RAM ndarray or read-only memmap.  Both support fancy
+        # indexing; numpy memmap reads are thread-safe.
+        if load_price_in_ram:
+            print(f"[MultimodalChunkedLoader] loading price_matrix into RAM ...")
+        self._price = _open_price(cache_dir, load_price_in_ram)
 
     def __len__(self) -> int:
         """Number of complete batches per epoch."""
@@ -253,6 +269,11 @@ class MultimodalChunkedLoader:
 
         Built so consecutive batch-of-bs slices of the returned tensors are
         already in shuffled order — the caller just splits along dim 0.
+
+        When ``self._pin_memory`` is True, the chunk tensors are placed in
+        page-locked host memory so subsequent ``.to(device, non_blocking=True)``
+        per-batch transfers can overlap with GPU compute.  Slicing a pinned
+        tensor returns a view that is still pinned.
         """
         L = self.seq_len
         n = len(indices)
@@ -261,7 +282,7 @@ class MultimodalChunkedLoader:
         starts = ends - L + 1
         # row_idx[i, t] = starts[i] + t
         row_idx = (starts[:, None] + np.arange(L, dtype=np.int64)[None, :]).ravel()
-        prices  = np.asarray(self._price_mm[row_idx]).reshape(n, L, self.n_features)
+        prices  = np.asarray(self._price[row_idx]).reshape(n, L, self.n_features)
 
         date_idx = self._sample_date_idx[indices].astype(np.int64)
         W        = self.news_window
@@ -274,11 +295,16 @@ class MultimodalChunkedLoader:
 
         labels = self._sample_labels[indices].astype(np.int64)
 
-        return (
-            torch.from_numpy(np.ascontiguousarray(prices)),
-            torch.from_numpy(news),
-            torch.from_numpy(labels),
-        )
+        prices_t = torch.from_numpy(np.ascontiguousarray(prices))
+        news_t   = torch.from_numpy(news)
+        labels_t = torch.from_numpy(labels)
+
+        if self._pin_memory:
+            prices_t = prices_t.pin_memory()
+            news_t   = news_t.pin_memory()
+            labels_t = labels_t.pin_memory()
+
+        return prices_t, news_t, labels_t
 
     def _yield_batches(
         self, chunk: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -348,18 +374,20 @@ class Phase2Dataset(Dataset):
 
     def __init__(
         self,
-        cache_dir:        str,
-        token_cache:      Dict[str, Dict[str, np.ndarray]],
-        trading_calendar: List[str],
-        split:            str            = 'train',
-        news_window:      int            = 3,
-        max_samples:      Optional[int]  = None,
-        random_seed:      int            = 42,
+        cache_dir:         str,
+        token_cache:       Dict[str, Dict[str, np.ndarray]],
+        trading_calendar:  List[str],
+        split:             str            = 'train',
+        news_window:       int            = 3,
+        max_samples:       Optional[int]  = None,
+        random_seed:       int            = 42,
+        load_price_in_ram: bool           = False,
     ):
-        self.cache_dir        = cache_dir
-        self.split            = split
-        self.news_window      = news_window
-        self.trading_calendar = list(trading_calendar)
+        self.cache_dir          = cache_dir
+        self.split              = split
+        self.news_window        = news_window
+        self.trading_calendar   = list(trading_calendar)
+        self._load_price_in_ram = bool(load_price_in_ram)
 
         with open(os.path.join(cache_dir, 'metadata.json')) as f:
             meta = json.load(f)
@@ -402,17 +430,15 @@ class Phase2Dataset(Dataset):
         self._A           = sample_entry['input_ids'].shape[0] if sample_entry else 16
         self._L           = sample_entry['input_ids'].shape[1] if sample_entry else 128
 
-        self._price_mm = None
+        self._price = None
         self._open_memmaps()
 
     def _open_memmaps(self):
-        self._price_mm = np.load(
-            os.path.join(self.cache_dir, 'price_matrix.npy'), mmap_mode='r',
-        )
+        self._price = _open_price(self.cache_dir, self._load_price_in_ram)
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state['_price_mm'] = None
+        state['_price'] = None
         return state
 
     def __setstate__(self, state):
@@ -432,7 +458,7 @@ class Phase2Dataset(Dataset):
         label        = int(self._sample_labels[gi])
 
         L     = self.seq_len
-        price = np.array(self._price_mm[end - L + 1: end + 1], dtype=np.float32)
+        price = np.array(self._price[end - L + 1: end + 1], dtype=np.float32)
 
         W, A, Lt  = self.news_window, self._A, self._L
         ids_win   = np.zeros((W, A, Lt), dtype=np.int32)
@@ -484,11 +510,15 @@ def create_phase2_dataloaders(
     win         = config.get('news_window', 3)
     max_samples = config.get('phase2_max_samples')
     seed        = config.get('random_seed', 42)
+    in_ram      = config.get('load_price_in_ram', False)
 
     train_ds = Phase2Dataset(cache_dir, token_cache, trading_calendar,
-                             'train', win, max_samples=max_samples, random_seed=seed)
-    val_ds   = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'val',  win)
-    test_ds  = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'test', win)
+                             'train', win, max_samples=max_samples,
+                             random_seed=seed, load_price_in_ram=in_ram)
+    val_ds   = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'val',  win,
+                             load_price_in_ram=in_ram)
+    test_ds  = Phase2Dataset(cache_dir, token_cache, trading_calendar, 'test', win,
+                             load_price_in_ram=in_ram)
 
     train_loader = DataLoader(train_ds, batch_size=batch_sz, shuffle=True,
                               num_workers=0, pin_memory=pin)
@@ -520,10 +550,12 @@ def create_val_test_dataloaders(
     batch_sz = config.get('batch_size', 1024)
     news_cp  = config.get('news_cache_path')
     win      = config.get('news_window')
+    in_ram   = config.get('load_price_in_ram', False)
 
     def _make(split: str) -> DataLoader:
         ds = MultimodalStockDataset(
             cache_dir, split=split, news_cache_path=news_cp, news_window=win,
+            load_price_in_ram=in_ram,
         )
         return DataLoader(ds, batch_size=batch_sz, shuffle=False,
                           num_workers=0, pin_memory=pin)

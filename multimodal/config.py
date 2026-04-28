@@ -90,15 +90,28 @@ MULTIMODAL_CONFIG = {
     'dropout':           0.1,
 
     # Phase 1 batch — frozen BERT, no BERT memory pressure.
-    # 1024 samples × (30×106 price + 3×768 news) ≈ 22 MB GPU; very fast.
-    # Reduces Phase 1 steps from 31k→3.9k per epoch → ~8× fewer kernel launches.
-    'batch_size':         1024,
+    # Bumped from 1024 → 2048 to better feed the 5090.  At d_model=256, 4
+    # transformer layers, 213 features, the model is tiny relative to the GPU
+    # and the previous batch left it 30–40 % utilized.
+    'batch_size':         2048,
 
     # MultimodalChunkedLoader chunk size for Phase 1 training.
-    # Each chunk is bulk-read sequentially into RAM (no random seeks).
-    # Peak RAM ≈ 3 × chunk_samples × (30×125 + 3×768) × 4 bytes
-    # chunk_samples=50_000 → 3 × 1.2 GB ≈ 3.6 GB peak.  Reduce if RAM is tight.
-    'chunk_samples':      50_000,
+    # 100K × (30 × 213 + 3 × 768) × 4 ≈ 3.4 GB per chunk; depth-2 prefetch
+    # holds at most 3 chunks → ~10 GB peak from chunks, plus ~6 GB for the
+    # in-RAM price_matrix below.  Comfortable on a 64 GB host.
+    'chunk_samples':      100_000,
+
+    # Hold the entire (T_total, F) price matrix in RAM instead of memmap.
+    # ~6 GB for the full dataset.  Eliminates the OS-page-cache thrashing that
+    # makes random fancy-indexing on a 6 GB memmap slow, and is the single
+    # biggest GPU-utilization win for this pipeline.  Set False if the host
+    # has < 32 GB RAM.
+    'load_price_in_ram':  True,
+
+    # Pin host memory of gathered chunks so .to(device, non_blocking=True) can
+    # overlap H2D copy with GPU compute.  'auto' enables it whenever device
+    # starts with 'cuda'; False/True override.
+    'pin_memory':         'auto',
 
     # LoRA: fine-tune only adapter matrices (~295K params) instead of full BERT (110M).
     # Adam optimizer states: ~3 MB vs ~880 MB → frees ~877 MB for larger batches.
@@ -121,12 +134,14 @@ MULTIMODAL_CONFIG = {
     # 30k samples → 938 steps → ~2h/epoch (practical for 20-epoch training).
     # Increase once you know the full-dataset step time from the progress bar.
     'phase2_max_samples':  30_000,
-    # CE + label_smoothing matches the dl/ pipeline's hard-won lesson — focal
-    # loss with class weights amplified imbalance enough to cause temperature
-    # explosion on the full dataset (T=127) and very volatile val metrics.
+    # CE + label_smoothing matches the dl/ pipeline's hard-won lesson.  Class
+    # weights stay OFF: with a 10-class label distribution and ~30× imbalance,
+    # inverse-frequency weighting collapses the model onto the rarest class
+    # (val_acc → 1 %, T → 127 in dl/'s prior calibration).  Label smoothing
+    # alone is the right amount of regularisation.
     'loss_type':         'ce',
     'label_smoothing':   0.1,
-    'use_class_weights': True,
+    'use_class_weights': False,
     'use_amp':           True,
 
     # Phase 1 uses MultimodalChunkedLoader (background thread, no workers).

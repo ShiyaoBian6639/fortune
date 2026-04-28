@@ -229,14 +229,23 @@ def run_train(config: dict, phase: int = 1, fresh: bool = False):
 
         # MultimodalChunkedLoader for train: gathers chunks of samples from
         # the compact price_matrix + per-day news table, depth-2 prefetched.
+        # ``load_price_in_ram`` keeps the (T_total, F) matrix in host RAM so
+        # fancy-index gathers don't fault into the page cache on every chunk.
+        # ``pin_memory='auto'`` resolves to True on CUDA so non-blocking H2D
+        # copies can overlap with compute.
+        pin_cfg = config.get('pin_memory', 'auto')
+        if pin_cfg == 'auto':
+            pin_cfg = device.startswith('cuda')
         train_loader = MultimodalChunkedLoader(
             cache_dir,
-            split           = 'train',
-            batch_size      = config.get('batch_size', 1024),
-            chunk_samples   = config.get('chunk_samples', 50_000),
-            seed            = config.get('random_seed', 42),
-            news_cache_path = config.get('news_cache_path'),
-            news_window     = config.get('news_window'),
+            split             = 'train',
+            batch_size        = config.get('batch_size', 1024),
+            chunk_samples     = config.get('chunk_samples', 100_000),
+            seed              = config.get('random_seed', 42),
+            news_cache_path   = config.get('news_cache_path'),
+            news_window       = config.get('news_window'),
+            load_price_in_ram = config.get('load_price_in_ram', True),
+            pin_memory        = bool(pin_cfg),
         )
         val_loader, _ = create_val_test_dataloaders(cache_dir, config, splits=('val',))
         print(f"[dataset] Train: {train_loader.n_samples:,}  Val: {len(val_loader.dataset):,}"
