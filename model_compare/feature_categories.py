@@ -30,6 +30,20 @@ STATIC_FEATURES = {
 
 
 # ─── Known-future features (calendar; same value at past and future steps) ──
+# CRITICAL: every entry here MUST be deterministically computable AT TIME T
+# for the future steps t+1..t+H, with NO dependence on close(t+h) for h ≥ 1.
+# Otherwise the TFT decoder receives the target directly and learns a perfect
+# trivial mapping → Val IC ≫ baseline (data leak).
+#
+# Examples of safe known-future:
+#   - calendar features (dow, month, quarter, ...)
+#   - is_holiday flags (announced in advance)
+#   - days_to_holiday (computable from the calendar)
+#
+# Examples that LOOK known-future but actually leak:
+#   - up_limit_ratio = (up_limit(t+h) - close(t+h)) / close(t+h)
+#     up_limit(t+h) is known at t (= prev_close × 1.1) but close(t+h) is the
+#     prediction target itself. ❌ EXCLUDED.
 KNOWN_FUTURE_FEATURES = {
     'dow',            # day of week
     'dom',            # day of month
@@ -39,10 +53,6 @@ KNOWN_FUTURE_FEATURES = {
     'is_quarter_end', 'is_year_end',
     'is_first_dow',   'is_last_dow',
     'days_to_holiday',
-    # Limit prices: previous close is always known by t, so the limit prices
-    # for t+1 are also known the moment we know close(t). Reasonable to treat
-    # as "known future" for our 1-day-ahead pipeline.
-    'up_limit_ratio', 'down_limit_ratio',
 }
 
 

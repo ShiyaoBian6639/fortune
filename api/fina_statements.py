@@ -4,26 +4,45 @@ Financial Statements Data Acquisition from Tushare Pro
 - balancesheet: Balance sheet
 - cashflow: Cash flow statement
 - Saves one file per stock: stock_data/fina_statements/{statement_type}/{ts_code}.csv
-- Incremental: only fetches reports newer than last end_date
+
+Update strategy
+---------------
+Tushare's ``income``/``balancesheet``/``cashflow`` endpoints accept a
+``period`` parameter that returns one row per filing company in a single
+response.  Calling them per-stock (5201 stocks × 3 statements = 15,603 calls)
+is what made earlier runs take hours; calling them per-period (~40 periods ×
+3 statements = ~120 calls) finishes in minutes for the same dataset.
+
+The bulk path:
+    1. Generate all quarterly periods YYYY{0331,0630,0930,1231} from
+       START_DATE.year to today.
+    2. For each (statement_type, period): call ``method(period=period)``,
+       paginate via offset until exhausted.
+    3. Group rows by ts_code in memory.
+    4. After all periods are fetched, merge each ts_code's rows with its
+       existing per-stock CSV (dedup on (ts_code, end_date, report_type)),
+       sort by end_date, and write once.
+
+The single-stock path (``run('stock', ts_code=...)``) is preserved for retry
+or one-off updates and uses the original per-stock fetch.
 
 Usage:
     from api.fina_statements import run
 
-    run()                              # update all stocks for all statements
-    run('update')                      # same as above
-    run('income')                      # update income statements only
-    run('balancesheet')                # update balance sheets only
-    run('cashflow')                    # update cash flow only
-    run('status')                      # show coverage summary
-    run('stock', ts_code='000001.SZ')  # single stock
+    run()                              # bulk update all statements (fast)
+    run('income')                      # bulk update income statements only
+    run('balancesheet')
+    run('cashflow')
+    run('stock', ts_code='000001.SZ')  # per-stock update for one code
+    run('status')                      # coverage summary
 """
 
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 import tushare as ts
@@ -36,9 +55,10 @@ STOCK_LIST_FILE = Path('./stock_data/stock_list.csv')
 START_DATE      = '20170101'
 
 # Statement types and their API methods + fields
-STATEMENT_TYPES = {
+STATEMENT_TYPES: Dict[str, dict] = {
     'income': {
         'method': 'income',
+        'bulk_kwarg': 'period',   # name of the period-style parameter on the API
         'fields': [
             'ts_code', 'ann_date', 'f_ann_date', 'end_date', 'report_type', 'comp_type',
             'end_type', 'basic_eps', 'diluted_eps', 'total_revenue', 'revenue',
@@ -65,6 +85,7 @@ STATEMENT_TYPES = {
     },
     'balancesheet': {
         'method': 'balancesheet',
+        'bulk_kwarg': 'period',
         'fields': [
             'ts_code', 'ann_date', 'f_ann_date', 'end_date', 'report_type', 'comp_type',
             'end_type', 'total_share', 'cap_rese', 'undistr_porfit', 'surplus_rese',
@@ -108,6 +129,7 @@ STATEMENT_TYPES = {
     },
     'cashflow': {
         'method': 'cashflow',
+        'bulk_kwarg': 'period',
         'fields': [
             'ts_code', 'ann_date', 'f_ann_date', 'end_date', 'report_type', 'comp_type',
             'end_type', 'net_profit', 'finan_exp', 'c_fr_sale_sg', 'recp_tax_rends',
@@ -140,17 +162,19 @@ STATEMENT_TYPES = {
     },
 }
 
-# Rate limiting: financial APIs are stricter
-WORKERS       = 4
-CALLS_PER_SEC = 2.0  # Conservative for financial statements
+# Rate limiting: shared limiter, conservative default that's easy to bump up if
+# your Tushare points-tier allows more.  At 5/s, the bulk path completes 40
+# periods in ~8 s per statement (3 statements ≈ 30 s total).
+CALLS_PER_SEC = 5.0
 MAX_RETRIES   = 3
 RETRY_DELAY   = 2
+PAGE_SIZE     = 6000   # most fina endpoints cap a single response near 5000-6000 rows
 
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
 
 class _RateLimiter:
-    def __init__(self, rate):
+    def __init__(self, rate: float):
         self._interval = 1.0 / rate
         self._lock     = threading.Lock()
         self._last     = 0.0
@@ -181,6 +205,7 @@ def _get_pro():
 
 
 def _fetch(func, *args, **kwargs):
+    """Rate-limited API call with retries on transient errors."""
     for attempt in range(MAX_RETRIES):
         _limiter.acquire()
         try:
@@ -201,35 +226,63 @@ def _fetch(func, *args, **kwargs):
     return None
 
 
-# ─── Checkpoint helpers ───────────────────────────────────────────────────────
+# ─── Period helpers ──────────────────────────────────────────────────────────
 
-def _load_ckpt(stmt_type: str):
-    ckpt_file = DATA_DIR / stmt_type / '_checkpoint.json'
-    if ckpt_file.exists():
-        try:
-            data = json.loads(ckpt_file.read_text(encoding='utf-8'))
-            return set(data.get('completed', [])), set(data.get('failed', []))
-        except Exception:
-            pass
-    return set(), set()
-
-
-def _save_ckpt(stmt_type: str, completed, failed):
-    ckpt_file = DATA_DIR / stmt_type / '_checkpoint.json'
-    ckpt_file.write_text(
-        json.dumps({'completed': sorted(completed), 'failed': sorted(failed)}, indent=2),
-        encoding='utf-8'
-    )
+def _generate_periods(start_year: int = 2017, end_year: Optional[int] = None) -> List[str]:
+    """Quarterly period strings ('YYYYMMDD' for 0331/0630/0930/1231)."""
+    if end_year is None:
+        end_year = datetime.now().year
+    out: List[str] = []
+    for y in range(start_year, end_year + 1):
+        for q in ('0331', '0630', '0930', '1231'):
+            out.append(f"{y}{q}")
+    return out
 
 
-# ─── Per-stock helpers ────────────────────────────────────────────────────────
+def _fetch_period_bulk(stmt_type: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Bulk-fetch one period across all stocks, paginating with offset until the
+    server returns fewer than PAGE_SIZE rows.
+
+    Returns an empty DataFrame for periods where no company filed.
+    Returns None if the API call failed.
+    """
+    cfg    = STATEMENT_TYPES[stmt_type]
+    pro    = _get_pro()
+    method = getattr(pro, cfg['method'])
+    bulk_k = cfg.get('bulk_kwarg', 'period')
+
+    pages: List[pd.DataFrame] = []
+    offset = 0
+    while True:
+        kwargs = {bulk_k: period, 'offset': offset, 'limit': PAGE_SIZE}
+        df = _fetch(method, **kwargs)
+        if df is None:
+            return None
+        if df.empty:
+            break
+        pages.append(df)
+        if len(df) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    if not pages:
+        return pd.DataFrame()
+    return pd.concat(pages, ignore_index=True)
+
+
+# ─── Per-stock CSV helpers ───────────────────────────────────────────────────
 
 def _setup(stmt_type: str):
     (DATA_DIR / stmt_type).mkdir(parents=True, exist_ok=True)
 
 
+def _stock_csv(stmt_type: str, ts_code: str) -> Path:
+    return DATA_DIR / stmt_type / f"{ts_code.replace('.', '_')}.csv"
+
+
 def _last_end_date(stmt_type: str, ts_code: str) -> Optional[str]:
-    fp = DATA_DIR / stmt_type / f"{ts_code.replace('.', '_')}.csv"
+    fp = _stock_csv(stmt_type, ts_code)
     if not fp.exists():
         return None
     try:
@@ -240,6 +293,109 @@ def _last_end_date(stmt_type: str, ts_code: str) -> Optional[str]:
     except Exception:
         return None
 
+
+def _merge_into_csv(stmt_type: str, ts_code: str, new_rows: pd.DataFrame) -> int:
+    """
+    Upsert ``new_rows`` into the per-stock CSV.  Dedups on
+    (ts_code, end_date, report_type) keeping last (so amendments win), then
+    sorts by end_date and writes.  Returns the final row count.
+    """
+    cfg = STATEMENT_TYPES[stmt_type]
+    available_cols = [c for c in cfg['fields'] if c in new_rows.columns]
+    new_rows = new_rows[available_cols].copy()
+
+    fp = _stock_csv(stmt_type, ts_code)
+    if fp.exists():
+        existing = pd.read_csv(fp)
+        # Both sides may infer dtypes differently for date columns; cast
+        # everything in the dedup key to str so concat doesn't produce mixed
+        # int/str object columns that break sort_values.
+        for col in ('end_date', 'ann_date', 'f_ann_date', 'report_type'):
+            if col in existing.columns:
+                existing[col] = existing[col].astype(str)
+            if col in new_rows.columns:
+                new_rows[col] = new_rows[col].astype(str)
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+    else:
+        for col in ('end_date', 'ann_date', 'f_ann_date', 'report_type'):
+            if col in new_rows.columns:
+                new_rows[col] = new_rows[col].astype(str)
+        combined = new_rows
+
+    dedup_cols = [c for c in ('ts_code', 'end_date', 'report_type') if c in combined.columns]
+    if dedup_cols:
+        combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+    if 'end_date' in combined.columns:
+        combined = combined.sort_values('end_date')
+
+    combined.to_csv(fp, index=False, encoding='utf-8-sig')
+    return len(combined)
+
+
+# ─── Bulk update (the fast path) ─────────────────────────────────────────────
+
+def update_statement_bulk(stmt_type: str, since_year: int = 2017,
+                          end_year: Optional[int] = None) -> None:
+    """
+    Period-bulk update for one statement type.  Fetches all configured periods
+    once, accumulates rows in memory grouped by ts_code, then merges into
+    per-stock CSVs at the end (one disk write per stock).
+    """
+    _setup(stmt_type)
+    periods = _generate_periods(since_year, end_year)
+
+    print(f"[{stmt_type}] bulk fetch over {len(periods)} periods "
+          f"({periods[0]} → {periods[-1]}) ...")
+
+    # accum[ts_code] = list of DataFrames to merge at the end
+    accum: Dict[str, List[pd.DataFrame]] = {}
+    fetched_periods   = 0
+    fetched_rows      = 0
+    failed_periods: List[str] = []
+
+    for p in periods:
+        df = _fetch_period_bulk(stmt_type, p)
+        if df is None:
+            failed_periods.append(p)
+            print(f"  [{stmt_type}] {p}: FAILED")
+            continue
+        fetched_periods += 1
+        if df.empty:
+            continue
+        fetched_rows += len(df)
+        if 'ts_code' not in df.columns:
+            print(f"  [{stmt_type}] {p}: response missing ts_code column — skipped")
+            continue
+        for ts_code, grp in df.groupby('ts_code', sort=False):
+            accum.setdefault(str(ts_code), []).append(grp)
+
+    print(f"[{stmt_type}] fetched {fetched_periods}/{len(periods)} periods, "
+          f"{fetched_rows:,} rows across {len(accum):,} stocks")
+    if failed_periods:
+        print(f"  WARNING: {len(failed_periods)} periods failed: {failed_periods[:5]}"
+              + (" ..." if len(failed_periods) > 5 else ""))
+
+    # ── Merge per-stock writes ─────────────────────────────────────────────
+    merged = 0
+    for ts_code, frames in accum.items():
+        new_rows = pd.concat(frames, ignore_index=True)
+        try:
+            _merge_into_csv(stmt_type, ts_code, new_rows)
+            merged += 1
+        except Exception as e:
+            print(f"  [{stmt_type}] merge {ts_code} failed: {type(e).__name__}: {e}")
+
+    print(f"[{stmt_type}] wrote {merged:,} stock CSVs.")
+
+
+def update_all_statements_bulk(since_year: int = 2017,
+                               end_year: Optional[int] = None) -> None:
+    """Run bulk update for every statement type."""
+    for stmt_type in STATEMENT_TYPES:
+        update_statement_bulk(stmt_type, since_year=since_year, end_year=end_year)
+
+
+# ─── Per-stock fallback (single 'stock' action) ──────────────────────────────
 
 def _load_stock_list() -> List[str]:
     if STOCK_LIST_FILE.exists():
@@ -254,7 +410,6 @@ def _load_stock_list() -> List[str]:
                         c = c + ('.SH' if c.startswith('6') else '.SZ')
                     result.append(c)
                 return result
-    # Fallback: scan sh/ and sz/ directories
     codes = []
     for d, suffix in [('./stock_data/sh', 'SH'), ('./stock_data/sz', 'SZ')]:
         p = Path(d)
@@ -264,128 +419,39 @@ def _load_stock_list() -> List[str]:
 
 
 def _download_one(stmt_type: str, ts_code: str) -> tuple:
-    """Download statement for a single stock. Returns (ts_code, status)."""
-    stmt_cfg = STATEMENT_TYPES[stmt_type]
-    fp       = DATA_DIR / stmt_type / f"{ts_code.replace('.', '_')}.csv"
-    last     = _last_end_date(stmt_type, ts_code)
-
-    # Period filter for incremental updates
+    """Per-stock fetch (kept for the 'stock' action)."""
+    cfg    = STATEMENT_TYPES[stmt_type]
+    pro    = _get_pro()
+    method = getattr(pro, cfg['method'])
+    last   = _last_end_date(stmt_type, ts_code)
     period_start = last if last else START_DATE
 
-    pro = _get_pro()
-    method = getattr(pro, stmt_cfg['method'])
-
-    # Try fetching with period filter
-    df = _fetch(
-        method,
-        ts_code=ts_code,
-        start_date=period_start,
-    )
-
+    df = _fetch(method, ts_code=ts_code, start_date=period_start)
     if df is None:
         return ts_code, 'error'
     if df.empty:
         return ts_code, 'no_new_data'
 
-    # Filter to available columns only
-    available_cols = [c for c in stmt_cfg['fields'] if c in df.columns]
-    df = df[available_cols].copy()
-    df = df.sort_values('end_date')
-
-    if fp.exists() and last is not None:
-        existing = pd.read_csv(fp)
-        # Normalize end_date
-        if 'end_date' in existing.columns and pd.api.types.is_numeric_dtype(existing['end_date']):
-            existing['end_date'] = existing['end_date'].apply(
-                lambda x: str(int(x)) if pd.notna(x) else x)
-        df = pd.concat([existing, df], ignore_index=True)
-        df = df.drop_duplicates(subset=['ts_code', 'end_date', 'report_type'], keep='last')
-        df = df.sort_values('end_date')
-
-    df.to_csv(fp, index=False, encoding='utf-8-sig')
-    return ts_code, f'+{len(df)} rows'
+    n = _merge_into_csv(stmt_type, ts_code, df)
+    return ts_code, f'+{n} rows'
 
 
-# ─── Update functions ─────────────────────────────────────────────────────────
-
-def update_statement(stmt_type: str, batch: Optional[int] = None, retry_only: bool = False):
-    """Update a single statement type for all stocks."""
-    _setup(stmt_type)
-    all_stocks = _load_stock_list()
-    completed, failed = _load_ckpt(stmt_type)
-
-    if retry_only:
-        todo = [c for c in all_stocks if c in failed]
-        print(f"[{stmt_type}] Retrying {len(todo)} previously-failed stocks ...")
-    else:
-        todo = all_stocks
-        print(f"[{stmt_type}] {len(all_stocks)} total (incremental per end_date) ...")
-
-    if batch:
-        todo = todo[:batch]
-        print(f"  (batch limit: processing first {len(todo)})")
-
-    if not todo:
-        print("Nothing to do.")
-        return
-
-    ckpt_lock  = threading.Lock()
-    counters   = {'ok': 0, 'err': 0, 'done': 0}
-    total      = len(todo)
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(_download_one, stmt_type, code): code for code in todo}
-        for fut in as_completed(futures):
-            code = futures[fut]
-            try:
-                _, st = fut.result()
-                is_err = (st == 'error')
-            except Exception as exc:
-                st     = f'exception: {exc}'
-                is_err = True
-
-            with ckpt_lock:
-                counters['done'] += 1
-                if is_err:
-                    counters['err'] += 1
-                    failed.add(code)
-                    completed.discard(code)
-                else:
-                    counters['ok'] += 1
-                    completed.add(code)
-                    failed.discard(code)
-                if counters['done'] % 50 == 0:
-                    _save_ckpt(stmt_type, completed, failed)
-
-            if counters['done'] % 100 == 0 or is_err:
-                print(f"  [{counters['done']}/{total}] {code}: {st}")
-
-    _save_ckpt(stmt_type, completed, failed)
-    print(f"\n[{stmt_type}] Done. ok={counters['ok']} errors={counters['err']}")
-
-
-def update_all_statements(batch: Optional[int] = None):
-    """Update all statement types for all stocks."""
-    for stmt_type in STATEMENT_TYPES:
-        update_statement(stmt_type, batch=batch)
-
+# ─── Status ──────────────────────────────────────────────────────────────────
 
 def status():
-    """Print coverage summary for all statement types."""
     for stmt_type in STATEMENT_TYPES:
         stmt_dir = DATA_DIR / stmt_type
         if not stmt_dir.exists():
             print(f"[{stmt_type}] Not downloaded yet")
             continue
         files = list(stmt_dir.glob('[!_]*.csv'))
-        completed, failed = _load_ckpt(stmt_type)
         print(f"[{stmt_type}] {len(files)} stock files")
-        print(f"  Checkpoint: {len(completed)} completed, {len(failed)} failed")
         if files:
             for fp in sorted(files)[:2]:
                 try:
                     df = pd.read_csv(fp, usecols=['end_date'])
-                    print(f"  {fp.stem}: {df['end_date'].min()} -> {df['end_date'].max()} ({len(df)} rows)")
+                    print(f"  {fp.stem}: {df['end_date'].min()} -> "
+                          f"{df['end_date'].max()} ({len(df)} rows)")
                 except Exception:
                     pass
 
@@ -394,46 +460,45 @@ def status():
 
 def run(action: str = 'update', **kwargs):
     """
-    Entry point for financial statements operations.
-
     Actions:
-        'update'       - update all statement types for all stocks
-        'income'       - update income statements only
-        'balancesheet' - update balance sheets only
-        'cashflow'     - update cash flow statements only
-        'retry'        - re-attempt failed stocks for all types
-        'stock'        - update single stock (requires ts_code kwarg)
-        'status'       - show coverage summary
+        'update'        - bulk update all statement types
+        'income'        - bulk update income only
+        'balancesheet'  - bulk update balancesheet only
+        'cashflow'      - bulk update cashflow only
+        'stock'         - per-stock update (requires ts_code)
+        'status'        - coverage summary
 
     Keyword args:
-        ts_code  (str) - stock code for 'stock' action
-        batch    (int) - max stocks to process
+        ts_code     (str) - stock code for 'stock' action
+        since_year  (int) - first year to fetch (default 2017)
+        end_year    (int) - last year to fetch (default current year)
     """
+    since = int(kwargs.get('since_year', 2017))
+    end_y = kwargs.get('end_year')
+    end_y = int(end_y) if end_y is not None else None
+
     if action == 'update':
-        update_all_statements(batch=kwargs.get('batch'))
+        update_all_statements_bulk(since_year=since, end_year=end_y)
 
     elif action in STATEMENT_TYPES:
-        update_statement(action, batch=kwargs.get('batch'))
-
-    elif action == 'retry':
-        for stmt_type in STATEMENT_TYPES:
-            update_statement(stmt_type, batch=kwargs.get('batch'), retry_only=True)
+        update_statement_bulk(action, since_year=since, end_year=end_y)
 
     elif action == 'stock':
         ts_code = kwargs.get('ts_code')
         if not ts_code:
             print("Error: ts_code required for 'stock' action")
-        else:
-            for stmt_type in STATEMENT_TYPES:
-                _setup(stmt_type)
-                code, st = _download_one(stmt_type, ts_code)
-                print(f"[{stmt_type}] {code}: {st}")
+            return
+        for stmt_type in STATEMENT_TYPES:
+            _setup(stmt_type)
+            code, st = _download_one(stmt_type, ts_code)
+            print(f"[{stmt_type}] {code}: {st}")
 
     elif action == 'status':
         status()
 
     else:
-        print(f"Unknown action: {action!r}. Valid: update | income | balancesheet | cashflow | retry | stock | status")
+        print(f"Unknown action: {action!r}. "
+              "Valid: update | income | balancesheet | cashflow | stock | status")
 
 
 if __name__ == '__main__':

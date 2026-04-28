@@ -9,24 +9,34 @@ Financial Extras Data Acquisition from Tushare Pro
 
 Storage:
   - Per-stock data: stock_data/fina_extras/{data_type}/{ts_code}.csv
-  - disclosure_date is per-stock annual schedule
+
+Update strategy
+---------------
+Tushare's fina-extras endpoints all support a period-style bulk parameter
+(``period`` for forecast/express/fina_audit/fina_mainbz, ``end_date`` for
+disclosure_date and dividend).  Calling them per-stock — 5201 stocks × 6
+endpoints = 31,206 calls — was the source of the multi-hour update times.
+The bulk path makes one call per (endpoint, period) instead, then fans the
+response out to per-stock CSVs.
+
+For 9 years × 4 quarters × 6 endpoints ≈ 216 calls vs 31,206 — roughly
+145× fewer requests.
 
 Usage:
     from api.fina_extras import run
 
-    run()                              # update all types
-    run('update')                      # same as above
-    run('forecast')                    # update forecast only
-    run('dividend')                    # update dividend only
-    run('status')                      # show coverage summary
+    run()                              # bulk update everything (default)
+    run('forecast')                    # bulk update one type
+    run('stock', ts_code='000001.SZ')  # per-stock update for one code
+    run('status')                      # coverage summary
 """
 
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import tushare as ts
@@ -38,12 +48,18 @@ DATA_DIR        = Path('./stock_data/fina_extras')
 STOCK_LIST_FILE = Path('./stock_data/stock_list.csv')
 START_DATE      = '20170101'
 
-# Data types and their configurations
-DATA_TYPES = {
+# Per-data-type config:
+#   method      : Tushare API method name on the Pro client
+#   bulk_kwarg  : period-style parameter accepted by the bulk endpoint
+#   dedup_cols  : keys for dedup when merging into existing per-stock CSV
+#   date_col    : primary date column (used for legacy per-stock incremental)
+#   fields      : kept response columns
+DATA_TYPES: Dict[str, dict] = {
     'forecast': {
-        'method': 'forecast',
+        'method':     'forecast',
+        'bulk_kwarg': 'period',
         'dedup_cols': ['ts_code', 'ann_date', 'end_date'],
-        'date_col': 'ann_date',
+        'date_col':   'ann_date',
         'fields': [
             'ts_code', 'ann_date', 'end_date', 'type', 'p_change_min', 'p_change_max',
             'net_profit_min', 'net_profit_max', 'last_parent_net', 'first_ann_date',
@@ -51,9 +67,10 @@ DATA_TYPES = {
         ],
     },
     'express': {
-        'method': 'express',
+        'method':     'express',
+        'bulk_kwarg': 'period',
         'dedup_cols': ['ts_code', 'ann_date', 'end_date'],
-        'date_col': 'ann_date',
+        'date_col':   'ann_date',
         'fields': [
             'ts_code', 'ann_date', 'end_date', 'revenue', 'operate_profit', 'total_profit',
             'n_income', 'total_assets', 'total_hldr_eqy_exc_min_int', 'diluted_eps',
@@ -65,9 +82,13 @@ DATA_TYPES = {
         ],
     },
     'dividend': {
-        'method': 'dividend',
+        'method':     'dividend',
+        # ``dividend`` accepts ``end_date`` for period-style bulk (year-end of
+        # the dividend year).  Dividends are usually annual so pulling 0331,
+        # 0630, 0930, 1231 covers interim and final distributions.
+        'bulk_kwarg': 'end_date',
         'dedup_cols': ['ts_code', 'end_date', 'div_proc'],
-        'date_col': 'ann_date',
+        'date_col':   'ann_date',
         'fields': [
             'ts_code', 'end_date', 'ann_date', 'div_proc', 'stk_div', 'stk_bo_rate',
             'stk_co_rate', 'cash_div', 'cash_div_tax', 'record_date', 'ex_date',
@@ -75,43 +96,46 @@ DATA_TYPES = {
         ],
     },
     'fina_audit': {
-        'method': 'fina_audit',
+        'method':     'fina_audit',
+        'bulk_kwarg': 'period',
         'dedup_cols': ['ts_code', 'ann_date', 'end_date'],
-        'date_col': 'ann_date',
+        'date_col':   'ann_date',
         'fields': [
             'ts_code', 'ann_date', 'end_date', 'audit_result', 'audit_fees',
             'audit_agency', 'audit_sign',
         ],
     },
     'fina_mainbz': {
-        'method': 'fina_mainbz',
+        'method':     'fina_mainbz',
+        'bulk_kwarg': 'period',
         'dedup_cols': ['ts_code', 'end_date', 'bz_item'],
-        'date_col': 'end_date',
+        'date_col':   'end_date',
         'fields': [
             'ts_code', 'end_date', 'bz_item', 'bz_sales', 'bz_profit', 'bz_cost',
             'curr_type', 'update_flag',
         ],
     },
     'disclosure_date': {
-        'method': 'disclosure_date',
+        'method':     'disclosure_date',
+        'bulk_kwarg': 'end_date',
         'dedup_cols': ['ts_code', 'end_date'],
-        'date_col': 'ann_date',
+        'date_col':   'ann_date',
         'fields': [
             'ts_code', 'ann_date', 'end_date', 'pre_date', 'actual_date', 'modify_date',
         ],
     },
 }
 
-WORKERS       = 4
-CALLS_PER_SEC = 2.0
+CALLS_PER_SEC = 5.0    # bumped from the original 2.0 — easy to tune down if needed
 MAX_RETRIES   = 3
 RETRY_DELAY   = 2
+PAGE_SIZE     = 6000
 
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
 
 class _RateLimiter:
-    def __init__(self, rate):
+    def __init__(self, rate: float):
         self._interval = 1.0 / rate
         self._lock     = threading.Lock()
         self._last     = 0.0
@@ -162,35 +186,56 @@ def _fetch(func, *args, **kwargs):
     return None
 
 
-# ─── Checkpoint helpers ───────────────────────────────────────────────────────
+# ─── Period helpers ──────────────────────────────────────────────────────────
 
-def _load_ckpt(data_type: str):
-    ckpt_file = DATA_DIR / data_type / '_checkpoint.json'
-    if ckpt_file.exists():
-        try:
-            data = json.loads(ckpt_file.read_text(encoding='utf-8'))
-            return set(data.get('completed', [])), set(data.get('failed', []))
-        except Exception:
-            pass
-    return set(), set()
-
-
-def _save_ckpt(data_type: str, completed, failed):
-    ckpt_file = DATA_DIR / data_type / '_checkpoint.json'
-    ckpt_file.write_text(
-        json.dumps({'completed': sorted(completed), 'failed': sorted(failed)}, indent=2),
-        encoding='utf-8'
-    )
+def _generate_periods(start_year: int = 2017, end_year: Optional[int] = None) -> List[str]:
+    if end_year is None:
+        end_year = datetime.now().year
+    out: List[str] = []
+    for y in range(start_year, end_year + 1):
+        for q in ('0331', '0630', '0930', '1231'):
+            out.append(f"{y}{q}")
+    return out
 
 
-# ─── Per-stock helpers ────────────────────────────────────────────────────────
+def _fetch_period_bulk(data_type: str, period: str) -> Optional[pd.DataFrame]:
+    """Bulk-fetch one period across all stocks, paginating via offset."""
+    cfg    = DATA_TYPES[data_type]
+    pro    = _get_pro()
+    method = getattr(pro, cfg['method'])
+    bulk_k = cfg['bulk_kwarg']
+
+    pages: List[pd.DataFrame] = []
+    offset = 0
+    while True:
+        kwargs = {bulk_k: period, 'offset': offset, 'limit': PAGE_SIZE}
+        df = _fetch(method, **kwargs)
+        if df is None:
+            return None
+        if df.empty:
+            break
+        pages.append(df)
+        if len(df) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    if not pages:
+        return pd.DataFrame()
+    return pd.concat(pages, ignore_index=True)
+
+
+# ─── Per-stock CSV helpers ───────────────────────────────────────────────────
 
 def _setup(data_type: str):
     (DATA_DIR / data_type).mkdir(parents=True, exist_ok=True)
 
 
+def _stock_csv(data_type: str, ts_code: str) -> Path:
+    return DATA_DIR / data_type / f"{ts_code.replace('.', '_')}.csv"
+
+
 def _last_date(data_type: str, ts_code: str, col: str) -> Optional[str]:
-    fp = DATA_DIR / data_type / f"{ts_code.replace('.', '_')}.csv"
+    fp = _stock_csv(data_type, ts_code)
     if not fp.exists():
         return None
     try:
@@ -201,6 +246,100 @@ def _last_date(data_type: str, ts_code: str, col: str) -> Optional[str]:
     except Exception:
         return None
 
+
+def _merge_into_csv(data_type: str, ts_code: str, new_rows: pd.DataFrame) -> int:
+    """Upsert ``new_rows`` into the per-stock CSV using configured dedup keys."""
+    cfg            = DATA_TYPES[data_type]
+    available_cols = [c for c in cfg['fields'] if c in new_rows.columns]
+    new_rows       = new_rows[available_cols].copy()
+
+    fp = _stock_csv(data_type, ts_code)
+    str_cols = set(cfg['dedup_cols']) | {cfg['date_col']}
+
+    if fp.exists():
+        existing = pd.read_csv(fp)
+        for col in str_cols:
+            if col in existing.columns:
+                existing[col] = existing[col].astype(str)
+            if col in new_rows.columns:
+                new_rows[col] = new_rows[col].astype(str)
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+    else:
+        for col in str_cols:
+            if col in new_rows.columns:
+                new_rows[col] = new_rows[col].astype(str)
+        combined = new_rows
+
+    dedup_cols = [c for c in cfg['dedup_cols'] if c in combined.columns]
+    if dedup_cols:
+        combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+
+    sort_col = cfg['date_col'] if cfg['date_col'] in combined.columns else (
+        'end_date' if 'end_date' in combined.columns else None
+    )
+    if sort_col:
+        combined[sort_col] = combined[sort_col].astype(str)
+        combined = combined.sort_values(sort_col)
+
+    combined.to_csv(fp, index=False, encoding='utf-8-sig')
+    return len(combined)
+
+
+# ─── Bulk update ─────────────────────────────────────────────────────────────
+
+def update_data_type_bulk(data_type: str, since_year: int = 2017,
+                          end_year: Optional[int] = None) -> None:
+    """Period-bulk update for one data type."""
+    _setup(data_type)
+    periods = _generate_periods(since_year, end_year)
+    print(f"[{data_type}] bulk fetch over {len(periods)} periods "
+          f"({periods[0]} → {periods[-1]}) ...")
+
+    accum: Dict[str, List[pd.DataFrame]] = {}
+    fetched_periods   = 0
+    fetched_rows      = 0
+    failed_periods: List[str] = []
+
+    for p in periods:
+        df = _fetch_period_bulk(data_type, p)
+        if df is None:
+            failed_periods.append(p)
+            print(f"  [{data_type}] {p}: FAILED")
+            continue
+        fetched_periods += 1
+        if df.empty:
+            continue
+        fetched_rows += len(df)
+        if 'ts_code' not in df.columns:
+            print(f"  [{data_type}] {p}: response missing ts_code column — skipped")
+            continue
+        for ts_code, grp in df.groupby('ts_code', sort=False):
+            accum.setdefault(str(ts_code), []).append(grp)
+
+    print(f"[{data_type}] fetched {fetched_periods}/{len(periods)} periods, "
+          f"{fetched_rows:,} rows across {len(accum):,} stocks")
+    if failed_periods:
+        print(f"  WARNING: {len(failed_periods)} periods failed: {failed_periods[:5]}"
+              + (" ..." if len(failed_periods) > 5 else ""))
+
+    merged = 0
+    for ts_code, frames in accum.items():
+        new_rows = pd.concat(frames, ignore_index=True)
+        try:
+            _merge_into_csv(data_type, ts_code, new_rows)
+            merged += 1
+        except Exception as e:
+            print(f"  [{data_type}] merge {ts_code} failed: {type(e).__name__}: {e}")
+
+    print(f"[{data_type}] wrote {merged:,} stock CSVs.")
+
+
+def update_all_bulk(since_year: int = 2017, end_year: Optional[int] = None) -> None:
+    for data_type in DATA_TYPES:
+        update_data_type_bulk(data_type, since_year=since_year, end_year=end_year)
+
+
+# ─── Per-stock fallback (single 'stock' action) ──────────────────────────────
 
 def _load_stock_list() -> List[str]:
     if STOCK_LIST_FILE.exists():
@@ -224,173 +363,84 @@ def _load_stock_list() -> List[str]:
 
 
 def _download_one(data_type: str, ts_code: str) -> tuple:
-    """Download data for a single stock. Returns (ts_code, status)."""
-    cfg      = DATA_TYPES[data_type]
-    fp       = DATA_DIR / data_type / f"{ts_code.replace('.', '_')}.csv"
-    last     = _last_date(data_type, ts_code, cfg['date_col'])
-
-    pro = _get_pro()
+    """Per-stock fetch (kept for single-stock retry)."""
+    cfg    = DATA_TYPES[data_type]
+    pro    = _get_pro()
     method = getattr(pro, cfg['method'])
+    last   = _last_date(data_type, ts_code, cfg['date_col'])
 
-    # Call API
     kwargs = {'ts_code': ts_code}
     if last and data_type not in ('disclosure_date',):
         kwargs['start_date'] = last
 
     df = _fetch(method, **kwargs)
-
     if df is None:
         return ts_code, 'error'
     if df.empty:
         return ts_code, 'no_data'
 
-    # Filter to available columns
-    available_cols = [c for c in cfg['fields'] if c in df.columns]
-    df = df[available_cols].copy()
-
-    if fp.exists() and last is not None:
-        existing = pd.read_csv(fp)
-        df = pd.concat([existing, df], ignore_index=True)
-        # Normalise dedup/sort columns to str — pandas infers date columns
-        # (e.g. ann_date) from existing CSVs as int64, while tushare returns
-        # them as str. After concat the column is `object` dtype with MIXED
-        # int + str values, which breaks sort_values's `<` comparison. Cast
-        # unconditionally — `object` dtype alone is not a safety signal.
-        for col in set(list(cfg['dedup_cols']) + [cfg['date_col']]):
-            if col in df.columns:
-                df[col] = df[col].astype(str)
-        df = df.drop_duplicates(subset=cfg['dedup_cols'], keep='last')
-
-    sort_col = cfg['date_col'] if cfg['date_col'] in df.columns else df.columns[0]
-    df[sort_col] = df[sort_col].astype(str)
-    df = df.sort_values(sort_col)
-    df.to_csv(fp, index=False, encoding='utf-8-sig')
-    return ts_code, f'+{len(df)} rows'
+    n = _merge_into_csv(data_type, ts_code, df)
+    return ts_code, f'+{n} rows'
 
 
-# ─── Update functions ─────────────────────────────────────────────────────────
-
-def update_data_type(data_type: str, batch: Optional[int] = None, retry_only: bool = False):
-    """Update a single data type for all stocks."""
-    _setup(data_type)
-    all_stocks = _load_stock_list()
-    completed, failed = _load_ckpt(data_type)
-
-    if retry_only:
-        todo = [c for c in all_stocks if c in failed]
-        print(f"[{data_type}] Retrying {len(todo)} previously-failed stocks ...")
-    else:
-        todo = all_stocks
-        print(f"[{data_type}] {len(all_stocks)} total stocks ...")
-
-    if batch:
-        todo = todo[:batch]
-        print(f"  (batch limit: processing first {len(todo)})")
-
-    if not todo:
-        print("Nothing to do.")
-        return
-
-    ckpt_lock  = threading.Lock()
-    counters   = {'ok': 0, 'err': 0, 'done': 0}
-    total      = len(todo)
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(_download_one, data_type, code): code for code in todo}
-        for fut in as_completed(futures):
-            code = futures[fut]
-            try:
-                _, st = fut.result()
-                is_err = (st == 'error')
-            except Exception as exc:
-                st     = f'exception: {exc}'
-                is_err = True
-
-            with ckpt_lock:
-                counters['done'] += 1
-                if is_err:
-                    counters['err'] += 1
-                    failed.add(code)
-                    completed.discard(code)
-                else:
-                    counters['ok'] += 1
-                    completed.add(code)
-                    failed.discard(code)
-                if counters['done'] % 50 == 0:
-                    _save_ckpt(data_type, completed, failed)
-
-            if counters['done'] % 100 == 0 or is_err:
-                print(f"  [{counters['done']}/{total}] {code}: {st}")
-
-    _save_ckpt(data_type, completed, failed)
-    print(f"\n[{data_type}] Done. ok={counters['ok']} errors={counters['err']}")
-
-
-def update_all(batch: Optional[int] = None):
-    """Update all data types for all stocks."""
-    for data_type in DATA_TYPES:
-        update_data_type(data_type, batch=batch)
-
+# ─── Status ──────────────────────────────────────────────────────────────────
 
 def status():
-    """Print coverage summary for all data types."""
     for data_type in DATA_TYPES:
         data_dir = DATA_DIR / data_type
         if not data_dir.exists():
             print(f"[{data_type}] Not downloaded yet")
             continue
         files = list(data_dir.glob('[!_]*.csv'))
-        completed, failed = _load_ckpt(data_type)
         print(f"[{data_type}] {len(files)} stock files")
-        print(f"  Checkpoint: {len(completed)} completed, {len(failed)} failed")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def run(action: str = 'update', **kwargs):
     """
-    Entry point for financial extras operations.
-
     Actions:
-        'update'          - update all data types
-        'forecast'        - earnings forecast
-        'express'         - express earnings
-        'dividend'        - dividend distribution
-        'fina_audit'      - audit opinions
-        'fina_mainbz'     - main business composition
-        'disclosure_date' - disclosure schedule
-        'retry'           - retry failed stocks
-        'status'          - show coverage summary
+        'update'          - bulk update all data types
+        'forecast'        - bulk update earnings forecast only
+        'express'         - bulk update express earnings only
+        'dividend'        - bulk update dividend distribution only
+        'fina_audit'      - bulk update audit opinions only
+        'fina_mainbz'     - bulk update main business composition only
+        'disclosure_date' - bulk update disclosure schedule only
+        'stock'           - per-stock update across all types (requires ts_code)
+        'status'          - coverage summary
 
     Keyword args:
-        ts_code  (str) - stock code for single stock
-        batch    (int) - max stocks to process
+        ts_code     (str) - stock code for 'stock' action
+        since_year  (int) - first year to fetch (default 2017)
+        end_year    (int) - last year to fetch (default current year)
     """
+    since = int(kwargs.get('since_year', 2017))
+    end_y = kwargs.get('end_year')
+    end_y = int(end_y) if end_y is not None else None
+
     if action == 'update':
-        update_all(batch=kwargs.get('batch'))
+        update_all_bulk(since_year=since, end_year=end_y)
 
     elif action in DATA_TYPES:
-        update_data_type(action, batch=kwargs.get('batch'))
-
-    elif action == 'retry':
-        for data_type in DATA_TYPES:
-            update_data_type(data_type, batch=kwargs.get('batch'), retry_only=True)
+        update_data_type_bulk(action, since_year=since, end_year=end_y)
 
     elif action == 'stock':
         ts_code = kwargs.get('ts_code')
         if not ts_code:
-            print("Error: ts_code required")
-        else:
-            for data_type in DATA_TYPES:
-                _setup(data_type)
-                code, st = _download_one(data_type, ts_code)
-                print(f"[{data_type}] {code}: {st}")
+            print("Error: ts_code required for 'stock' action")
+            return
+        for data_type in DATA_TYPES:
+            _setup(data_type)
+            code, st = _download_one(data_type, ts_code)
+            print(f"[{data_type}] {code}: {st}")
 
     elif action == 'status':
         status()
 
     else:
-        print(f"Unknown action: {action!r}")
+        valid = 'update | ' + ' | '.join(DATA_TYPES) + ' | stock | status'
+        print(f"Unknown action: {action!r}.  Valid: {valid}")
 
 
 if __name__ == '__main__':
