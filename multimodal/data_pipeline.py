@@ -1,21 +1,49 @@
 """
-Data pipeline: align price/technical sequences with daily news embeddings.
+Compact-cache data pipeline for the multimodal stock prediction package.
 
-Produces disk-based numpy arrays for fast DataLoader access:
-    {cache_dir}/price_sequences.npy   (N, 30, 106)  float32
-    {cache_dir}/news_sequences.npy    (N,  3, 768)  float32
-    {cache_dir}/labels.npy            (N,)           int64
-    {cache_dir}/dates.npy             (N,)           '<U8' str  (YYYYMMDD)
+Storage strategy
+----------------
+Earlier versions materialised per-sample arrays of shape ``(N, 30, F)`` for
+price and ``(N, 3, 768)`` for news.  With ~7.7 M samples that consumed
+hundreds of GB on disk despite massive redundancy: news vectors are
+market-wide (identical across stocks for the same date) and price windows
+overlap by 29 of 30 rows between consecutive samples.
 
-After build_aligned_dataset(), call split_and_normalize() to produce:
-    {cache_dir}/{split}_price.npy
-    {cache_dir}/{split}_news.npy
-    {cache_dir}/{split}_labels.npy
-    {cache_dir}/price_scaler.npz      (mean + scale for StandardScaler)
-    {cache_dir}/metadata.json
+This module instead stores **one row per (stock, date) pair** plus a tiny
+per-sample index that points into that matrix.  Slicing recovers the 30-day
+window at __getitem__ time.  News embeddings are stored once per date and
+looked up via a per-sample ``date_idx``.
 
-Time-based split is mandatory: news is market-wide and temporally correlated,
-so random splitting would allow future macro-events to leak into training.
+Output files (in ``cache_dir``):
+
+    price_matrix.npy      (T_total, F)  float32  — concatenated per-stock daily
+                                                   features, normalised in place
+    price_date_idx.npy    (T_total,)    int32    — date_idx per row (used to
+                                                   pick training rows for the
+                                                   StandardScaler fit)
+    price_scaler.npz                              — mean + scale (per-feature)
+    stock_offsets.npy     (S+1,)        int64    — cumulative row counts;
+                                                   stock k owns rows
+                                                   [stock_offsets[k] :
+                                                    stock_offsets[k+1])
+    stock_codes.npy       (S,)          str      — ts_code per stock, parallel
+                                                   to stock_offsets
+    sample_end.npy        (N,)          int32    — last row (inclusive) of the
+                                                   30-day window for each
+                                                   sample, in price_matrix
+    sample_date_idx.npy   (N,)          int32    — index into trading_calendar
+    sample_labels.npy     (N,)          int32    — bucket label
+    trading_calendar.npy  (D,)          str      — sorted YYYYMMDD calendar
+                                                   used for date_idx semantics
+    metadata.json                                 — n_features, sequence_length,
+                                                   forward_window, news_window,
+                                                   splits[ {start,end,
+                                                   date_start,date_end,
+                                                   class_counts,n_samples} ],
+                                                   news_cache_path,
+                                                   token_cache_path
+
+Sample arrays are sorted by ``date_idx`` so split = contiguous slice.
 """
 
 from __future__ import annotations
@@ -30,7 +58,6 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-# ── Reuse from dl/ ────────────────────────────────────────────────────────────
 from dl.data_processing import (
     calculate_technical_features,
     merge_daily_basic,
@@ -50,18 +77,14 @@ from .config import (
 # ─── Label assignment ─────────────────────────────────────────────────────────
 
 def pct_to_label(pct_change: float) -> int:
-    """Map a forward return percentage to a bucket label index.
-
-    Uses MM_CLASS_BUCKETS (10 buckets, same as dl/CHANGE_BUCKETS).
-    Formula: pct = (max(high[t:t+5]) - close[t-1]) / close[t-1] * 100
-    """
+    """Map a forward return percentage to a bucket label index."""
     for i, (lo, hi, _) in enumerate(MM_CLASS_BUCKETS):
         if lo <= pct_change < hi:
             return i
-    return MM_NUM_CLASSES - 1   # fallback to last bucket
+    return MM_NUM_CLASSES - 1
 
 
-# ─── News window lookup ───────────────────────────────────────────────────────
+# ─── News window lookup (used by run_predict) ────────────────────────────────
 
 def load_news_window(
     date_str:         str,
@@ -70,20 +93,7 @@ def load_news_window(
     trading_calendar: List[str],
     _cal_index:       Optional[Dict[str, int]] = None,
 ) -> np.ndarray:
-    """
-    Return (window, 768) float32 — one embedding per trading day in the window.
-
-    The window covers the `window` trading days ending on date_str inclusive:
-      [T-(window-1), ..., T-1, T]
-
-    Walk back through `trading_calendar` (sorted YYYYMMDD strings) to find
-    previous trading days — this correctly skips weekends and holidays.
-
-    Missing days (no cache entry) → zero vector of shape (768,).
-
-    Pass `_cal_index` (a pre-built {date: position} dict) for O(1) lookup
-    instead of O(N) list.index() — critical when called millions of times.
-    """
+    """Return (window, 768) float32 — embeddings for the trailing trading days."""
     if _cal_index is not None:
         idx = _cal_index.get(date_str, -1)
         if idx == -1:
@@ -96,125 +106,112 @@ def load_news_window(
 
     vecs = []
     zero = np.zeros(768, dtype=np.float32)
-    for offset in range(window - 1, -1, -1):   # window-1, window-2, ..., 0
+    for offset in range(window - 1, -1, -1):
         cal_idx = idx - offset
         if cal_idx < 0:
             vecs.append(zero)
         else:
             day = trading_calendar[cal_idx]
             vecs.append(daily_news_cache.get(day, zero))
+    return np.stack(vecs).astype(np.float32)
 
-    return np.stack(vecs).astype(np.float32)   # (window, 768)
 
+# ─── Per-stock feature builder ────────────────────────────────────────────────
 
-# ─── Per-stock sequence builder ───────────────────────────────────────────────
-
-def build_stock_sequences(
-    stock_file:    str,
-    config:        dict,
-    daily_basic:   Optional[pd.DataFrame] = None,
-    _prefiltered:  bool = False,
-) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _build_stock_features(
+    stock_file:   str,
+    config:       dict,
+    cal_index:    Dict[str, int],
+    daily_basic:  Optional[pd.DataFrame] = None,
+    _prefiltered: bool = False,
+) -> Optional[Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]]:
     """
-    Load one stock CSV, compute 106 features, create 30-day sequences.
+    Process one stock CSV and return:
 
-    Args:
-        daily_basic:  Pre-loaded daily basic DataFrame.  When ``_prefiltered``
-                      is True, ``daily_basic`` already contains only rows for
-                      this stock (ts_code filter already applied by the caller),
-                      so ``merge_daily_basic`` is called with ``ts_code=None``
-                      to skip the O(9.8M) scan.
-        _prefiltered: Set True when the caller passes a pre-grouped per-stock
-                      slice of daily_basic (avoids redundant full-table scan).
+        features    : (T_stock, F)  float32   — daily feature matrix
+        date_idx    : (T_stock,)    int32     — index into trading_calendar per row
+        samples     : list of (rel_end_row, date_idx, label)
+                      — one entry per emittable training sample
 
-    Returns:
-        sequences  : (N, 30, 106) float32
-        labels     : (N,)          int64
-        date_strs  : (N,)          str — trade_date of the LAST day in each seq
+    ``rel_end_row`` is the row index *within this stock* (0-based) of the last
+    day in a 30-day window.  The caller adds the stock's ``stock_offset`` to
+    convert it to an absolute row in ``price_matrix``.
 
-    Returns None if the stock has insufficient data.
+    Returns ``None`` if the stock has insufficient data after dropna +
+    news-window filtering.
     """
-    seq_len     = config.get('sequence_length', 30)
-    fwd_window  = config.get('forward_window',   5)
-    news_start  = config.get('news_start_date',  NEWS_START_DATE)
-    news_end    = config.get('news_end_date',    NEWS_END_DATE)
-    news_only   = config.get('news_only_mode',   True)
+    seq_len    = config.get('sequence_length', 30)
+    fwd_window = config.get('forward_window',   5)
+    news_start = config.get('news_start_date',  NEWS_START_DATE)
+    news_end   = config.get('news_end_date',    NEWS_END_DATE)
+    news_only  = config.get('news_only_mode',   True)
+    min_pts    = config.get('min_data_points',  100)
 
     try:
         df = pd.read_csv(stock_file)
     except Exception:
         return None
 
-    if len(df) < config.get('min_data_points', 100):
+    if len(df) < min_pts:
         return None
 
-    # Normalise date column
     df['trade_date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d')
     df = df.sort_values('trade_date').reset_index(drop=True)
-
     ts_code = os.path.basename(stock_file).replace('.csv', '')
 
-    # Merge pre-loaded daily fundamental metrics
     if daily_basic is not None and not daily_basic.empty:
         try:
-            # When _prefiltered=True the caller already extracted the per-stock
-            # slice — pass ts_code=None to skip the O(9.8M) scan inside merge.
             df = merge_daily_basic(df, daily_basic, ts_code if not _prefiltered else None)
         except Exception:
-            pass   # continue without fundamentals
+            pass
 
-    # Compute 106 technical features (reuse dl/ pipeline)
     try:
         df = calculate_technical_features(df)
     except Exception:
         return None
 
-    # Fill any FEATURE_COLUMNS that are still absent (e.g. daily_basic merge
-    # failed) with 0 so dropna doesn't raise KeyError.
+    # Add any missing FEATURE_COLUMNS as zero — assemble in one concat to avoid
+    # the pandas "highly fragmented" PerformanceWarning that the old per-column
+    # ``df[missing_cols] = 0.0`` triggered for hundreds of inserts.
     missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing_cols:
-        df[missing_cols] = 0.0
+        zeros = pd.DataFrame(
+            0.0, index=df.index, columns=missing_cols, dtype=np.float32
+        )
+        df = pd.concat([df, zeros], axis=1)
 
-    df = df.dropna(subset=FEATURE_COLUMNS)
+    df = df.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
     if len(df) < seq_len + fwd_window:
         return None
 
-    features = df[FEATURE_COLUMNS].values.astype(np.float32)
-    closes   = df['close'].values.astype(np.float64)
-    highs    = df['high'].values.astype(np.float64)
+    features  = df[FEATURE_COLUMNS].values.astype(np.float32)
+    closes    = df['close'].values.astype(np.float64)
+    highs     = df['high'].values.astype(np.float64)
+    date_strs = df['trade_date'].dt.strftime('%Y%m%d').values
 
-    # Build YYYYMMDD string column for news lookup
-    df['date_str'] = df['trade_date'].dt.strftime('%Y%m%d')
+    date_idx_arr = np.fromiter(
+        (cal_index.get(d, -1) for d in date_strs),
+        count=len(date_strs), dtype=np.int32,
+    )
 
-    sequences  = []
-    labels     = []
-    date_strs  = []
-
-    valid_end = len(df) - fwd_window  # last index we can label
-
-    for i in range(seq_len, valid_end + 1):
-        date_str = df['date_str'].iloc[i - 1]   # last day of the window
-
-        # Optionally restrict to news-covered dates
-        if news_only and not (news_start <= date_str <= news_end):
+    samples: List[Tuple[int, int, int]] = []
+    T = len(features)
+    # End-of-window position is inclusive: window = features[end-seq_len+1 : end+1]
+    # Forward returns use highs[end+1 : end+1+fwd_window] vs closes[end].
+    for end in range(seq_len - 1, T - fwd_window):
+        ds = date_strs[end]
+        if news_only and not (news_start <= ds <= news_end):
             continue
+        d_idx = int(date_idx_arr[end])
+        if d_idx < 0:
+            continue
+        pct = 100.0 * (highs[end + 1: end + 1 + fwd_window].max() - closes[end]) / closes[end]
+        samples.append((end, d_idx, pct_to_label(float(pct))))
 
-        seq = features[i - seq_len: i]           # (30, 106)
-        pct = 100.0 * (highs[i: i + fwd_window].max() - closes[i - 1]) / closes[i - 1]
-        lbl = pct_to_label(float(pct))
-
-        sequences.append(seq)
-        labels.append(lbl)
-        date_strs.append(date_str)
-
-    if not sequences:
+    if not samples:
         return None
 
-    return (
-        np.array(sequences,  dtype=np.float32),
-        np.array(labels,     dtype=np.int64),
-        np.array(date_strs,  dtype='<U8'),
-    )
+    return features, date_idx_arr, samples
 
 
 # ─── Dataset builder ──────────────────────────────────────────────────────────
@@ -228,177 +225,200 @@ def build_aligned_dataset(
     trading_calendar: Optional[List[str]] = None,
 ) -> None:
     """
-    Process all stocks, attach news windows, write sorted arrays to disk.
+    Build the compact cache (see module docstring).
 
-    Memory-efficient two-pass implementation — avoids loading all ~5M+ samples
-    into RAM simultaneously (would require ~126 GB for price + news arrays).
-
-    Pass 1 — count valid samples per stock; no large arrays kept in memory.
-    Pass 2 — write price/news sequences directly to pre-allocated memory-mapped
-              .npy files on disk, one stock at a time.
-    Sort   — labels and dates (~230 MB) are sorted in RAM; price and news
-              (~126 GB) are sorted via chunked memmap I/O so only ~600 MB
-              is in RAM at any point during the sort.
-
-    Output files (sorted by date):
-        price_sequences.npy  (N, seq_len, n_feat)  float32  — memmap-friendly
-        news_sequences.npy   (N, news_window, 768)  float32  — memmap-friendly
-        labels.npy           (N,)                   int64
-        dates.npy            (N,)                   '<U8' str (YYYYMMDD)
+    Disk usage at peak: roughly ``T_total × F × 4`` bytes for the price matrix
+    (≈6 GB for the full dataset).  All other arrays are tiny (<200 MB combined).
     """
     os.makedirs(output_cache_dir, exist_ok=True)
 
-    news_window = config.get('news_window', NEWS_WINDOW)
-    seq_len     = config.get('sequence_length', 30)
-    n_feat      = len(FEATURE_COLUMNS)
+    # Reclaim disk from the previous (per-sample-array) cache layout if the
+    # user is re-running after the storage refactor.  Each of these old files
+    # could be tens or hundreds of GB on a full-dataset run.
+    _OLD_FORMAT_FILES = (
+        'price_sequences.npy', 'news_sequences.npy',
+        '_raw_price.npy',      '_raw_news.npy',
+        'train_price.npy', 'train_news.npy', 'train_labels.npy', 'train_dates.npy',
+        'val_price.npy',   'val_news.npy',   'val_labels.npy',   'val_dates.npy',
+        'test_price.npy',  'test_news.npy',  'test_labels.npy',  'test_dates.npy',
+        'labels.npy',      'dates.npy',
+    )
+    for fname in _OLD_FORMAT_FILES:
+        p = os.path.join(output_cache_dir, fname)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                print(f"[data_pipeline] removed legacy cache file {fname}")
+            except Exception as e:
+                print(f"[data_pipeline] could not remove legacy {fname}: {e}")
+
+    seq_len = config.get('sequence_length', 30)
+    n_feat  = len(FEATURE_COLUMNS)
 
     if trading_calendar is None:
         trading_calendar = sorted(daily_news_cache.keys())
     cal_index: Dict[str, int] = {d: i for i, d in enumerate(trading_calendar)}
 
-    # Load daily_basic once, then pre-group by ts_code for O(1) per-stock lookup.
-    # Without pre-grouping, merge_daily_basic scans all 9.8M rows per stock —
-    # that's 9.8M × 3752 = 36.7B row comparisons for the full dataset.
-    daily_basic_df: Optional[pd.DataFrame] = None
+    # ── Load daily_basic (optional) ──────────────────────────────────────────
     daily_basic_by_ts: Dict[str, pd.DataFrame] = {}
     if daily_basic_dir and os.path.isdir(daily_basic_dir):
         try:
-            daily_basic_df = load_daily_basic_data(daily_basic_dir)
-            if daily_basic_df is not None and not daily_basic_df.empty:
+            db = load_daily_basic_data(daily_basic_dir)
+            if db is not None and not db.empty:
                 print("[data_pipeline] Pre-grouping daily_basic by ts_code ...")
                 daily_basic_by_ts = {
                     code: grp.reset_index(drop=True)
-                    for code, grp in daily_basic_df.groupby('ts_code', sort=False)
+                    for code, grp in db.groupby('ts_code', sort=False)
                 }
-                del daily_basic_df   # free 9.8M-row DataFrame; dict is enough
+                del db
         except Exception as e:
             print(f"[data_pipeline] Warning: could not load daily_basic: {e}")
 
-    # ── Fast upper-bound estimation for memmap pre-allocation ────────────────
-    # Count CSV lines (no parsing) to get a cheap upper bound on total samples.
-    # Actual sample count is lower (NaN drops, news_only filter, etc.); we
-    # trim the memmaps to the real cursor position after the single full pass.
+    # ── Estimate upper bound on price_matrix rows ───────────────────────────
+    # Sum CSV row counts (no parse).  Real T_total is lower (NaN drops) but
+    # this gives a safe pre-allocation size that we trim later.
     print(f"[data_pipeline] Estimating dataset size ({len(stock_files)} stocks) ...")
-    seq_len_cfg   = config.get('sequence_length', 30)
-    fwd_win_cfg   = config.get('forward_window',   5)
-    min_pts_cfg   = config.get('min_data_points', 100)
-    max_N = 0
+    min_pts = config.get('min_data_points', 100)
+    upper_T = 0
     for sf in stock_files:
         try:
             with open(sf, 'r', errors='ignore') as fh:
-                rows = sum(1 for _ in fh) - 1   # subtract header
-            if rows >= min_pts_cfg:
-                max_N += max(0, rows - seq_len_cfg - fwd_win_cfg)
+                rows = sum(1 for _ in fh) - 1
+            if rows >= min_pts:
+                upper_T += rows
         except Exception:
             pass
-    max_N = int(max_N * 1.05)   # 5% safety margin
-    if max_N == 0:
-        print("[data_pipeline] No estimable samples. Aborting.")
+    upper_T = int(upper_T * 1.05)
+    if upper_T == 0:
+        print("[data_pipeline] No estimable data. Aborting.")
         return
-    print(f"[data_pipeline] Pre-allocated size: {max_N:,} samples (upper bound)")
+    est_gb = upper_T * n_feat * 4 / 1e9
+    print(f"[data_pipeline] Pre-allocating price matrix: "
+          f"{upper_T:,} rows × {n_feat} features ≈ {est_gb:.1f} GB")
 
-    # ── Allocate memory-mapped temp files ────────────────────────────────────
-    raw_price_path = os.path.join(output_cache_dir, '_raw_price.npy')
-    raw_news_path  = os.path.join(output_cache_dir, '_raw_news.npy')
-
+    raw_price_path = os.path.join(output_cache_dir, '_price_matrix_raw.npy')
     price_mm = np.lib.format.open_memmap(
-        raw_price_path, mode='w+', dtype=np.float32,
-        shape=(max_N, seq_len, n_feat),
+        raw_price_path, mode='w+', dtype=np.float32, shape=(upper_T, n_feat),
     )
-    news_mm  = np.lib.format.open_memmap(
-        raw_news_path,  mode='w+', dtype=np.float32,
-        shape=(max_N, news_window, 768),
-    )
+    price_date_idx_buf = np.zeros(upper_T, dtype=np.int32)
 
-    # ── Single pass: build sequences and write to memmaps ───────────────────
-    print(f"[data_pipeline] Building sequences and writing to disk ...")
-    all_labels: List[np.ndarray] = []
-    all_dates:  List[np.ndarray] = []
-    cursor    = 0
-    ok        = 0
-    skipped   = 0
+    # ── Build per-stock features and samples ────────────────────────────────
+    print(f"[data_pipeline] Building per-stock features and samples ...")
+    stock_codes_kept: List[str] = []
+    stock_offsets:    List[int] = [0]
+    sample_end_buf:        List[int] = []
+    sample_date_idx_buf:   List[int] = []
+    sample_label_buf:      List[int] = []
 
+    cursor   = 0
+    skipped  = 0
     for sf in tqdm(stock_files, desc='  building', unit='stock', leave=False):
         ts_code   = os.path.basename(sf).replace('.csv', '')
-        stk_basic = daily_basic_by_ts.get(ts_code)   # O(1) dict lookup
+        stk_basic = daily_basic_by_ts.get(ts_code)
 
-        result = build_stock_sequences(
-            sf, config,
-            daily_basic=stk_basic,
-            _prefiltered=(stk_basic is not None),
+        result = _build_stock_features(
+            sf, config, cal_index,
+            daily_basic=stk_basic, _prefiltered=(stk_basic is not None),
         )
         if result is None:
             skipped += 1
             continue
-        seqs, lbls, dates = result
-        n = len(lbls)
+        features, date_idx_arr, samples = result
+        T_stock = len(features)
 
-        news_windows = np.stack([
-            load_news_window(d, daily_news_cache, news_window, trading_calendar, cal_index)
-            for d in dates
-        ]).astype(np.float32)
+        if cursor + T_stock > upper_T:
+            print(f"[data_pipeline] WARNING: upper bound exceeded at {ts_code}; skipping")
+            skipped += 1
+            continue
 
-        price_mm[cursor:cursor + n] = seqs
-        news_mm[cursor:cursor + n]  = news_windows
-        all_labels.append(lbls)
-        all_dates.append(dates)
-        cursor += n
-        ok     += 1
+        price_mm[cursor: cursor + T_stock] = features
+        price_date_idx_buf[cursor: cursor + T_stock] = date_idx_arr
 
-    price_mm.flush(); del price_mm
-    news_mm.flush();  del news_mm
+        for rel_end, d_idx, lbl in samples:
+            sample_end_buf.append(cursor + rel_end)
+            sample_date_idx_buf.append(d_idx)
+            sample_label_buf.append(lbl)
 
-    print(f"[data_pipeline] {ok} stocks OK, {skipped} skipped → {cursor:,} total samples")
+        cursor += T_stock
+        stock_codes_kept.append(ts_code)
+        stock_offsets.append(cursor)
 
-    labels_arr = np.concatenate(all_labels)   # (cursor,)  ~46 MB
-    dates_arr  = np.concatenate(all_dates)    # (cursor,)  ~185 MB
-    del all_labels, all_dates
+    price_mm.flush()
+    del price_mm
 
-    # ── Sort by date ─────────────────────────────────────────────────────────
-    # labels and dates fit in RAM → sort directly.
-    # price and news are sorted via chunked memmap reads (~600 MB per chunk).
-    print(f"[data_pipeline] Sorting {cursor:,} samples by date ...")
-    sort_idx   = np.argsort(dates_arr, kind='stable')
-    labels_arr = labels_arr[sort_idx]
-    dates_arr  = dates_arr[sort_idx]
-
-    price_raw = np.load(raw_price_path, mmap_mode='r')
-    news_raw  = np.load(raw_news_path,  mmap_mode='r')
-
-    final_price_path = os.path.join(output_cache_dir, 'price_sequences.npy')
-    final_news_path  = os.path.join(output_cache_dir, 'news_sequences.npy')
-
-    price_out = np.lib.format.open_memmap(
-        final_price_path, mode='w+', dtype=np.float32,
-        shape=(cursor, seq_len, n_feat),
-    )
-    news_out  = np.lib.format.open_memmap(
-        final_news_path,  mode='w+', dtype=np.float32,
-        shape=(cursor, news_window, 768),
-    )
-
-    SORT_CHUNK = 10_000
-    for start in tqdm(range(0, cursor, SORT_CHUNK), desc='  sorting', unit='chunk', leave=False):
-        end = min(start + SORT_CHUNK, cursor)
-        idx = sort_idx[start:end]
-        price_out[start:end] = price_raw[idx]
-        news_out[start:end]  = news_raw[idx]
-
-    price_out.flush(); del price_out
-    news_out.flush();  del news_out
-    del price_raw, news_raw
-
-    # Remove temp files
-    for p in [raw_price_path, raw_news_path]:
+    if cursor == 0 or not sample_label_buf:
+        print("[data_pipeline] No valid samples produced.")
         try:
-            os.remove(p)
+            os.remove(raw_price_path)
         except Exception:
             pass
+        return
 
-    np.save(os.path.join(output_cache_dir, 'labels.npy'), labels_arr)
-    np.save(os.path.join(output_cache_dir, 'dates.npy'),  dates_arr)
-    print(f"[data_pipeline] Sorted arrays saved to {output_cache_dir}")
+    n_samples = len(sample_label_buf)
+    print(f"[data_pipeline] {len(stock_codes_kept)} stocks OK, {skipped} skipped → "
+          f"{cursor:,} feature rows, {n_samples:,} samples")
 
+    # ── Trim price_matrix to the actual cursor size ─────────────────────────
+    final_price_path = os.path.join(output_cache_dir, 'price_matrix.npy')
+    print(f"[data_pipeline] Trimming price matrix to {cursor:,} rows ...")
+    raw   = np.load(raw_price_path, mmap_mode='r')
+    final = np.lib.format.open_memmap(
+        final_price_path, mode='w+', dtype=np.float32, shape=(cursor, n_feat),
+    )
+    CHUNK = 200_000
+    for s in tqdm(range(0, cursor, CHUNK), desc='  trim', unit='chunk', leave=False):
+        e = min(s + CHUNK, cursor)
+        final[s:e] = raw[s:e]
+    final.flush()
+    del final
+    del raw
+    try:
+        os.remove(raw_price_path)
+    except Exception:
+        pass
+
+    # ── Sample arrays: convert to numpy + sort by date_idx ──────────────────
+    sample_end      = np.asarray(sample_end_buf,      dtype=np.int32)
+    sample_date_idx = np.asarray(sample_date_idx_buf, dtype=np.int32)
+    sample_labels   = np.asarray(sample_label_buf,    dtype=np.int32)
+
+    print(f"[data_pipeline] Sorting {n_samples:,} samples by date_idx ...")
+    sort_idx        = np.argsort(sample_date_idx, kind='stable')
+    sample_end      = sample_end[sort_idx]
+    sample_date_idx = sample_date_idx[sort_idx]
+    sample_labels   = sample_labels[sort_idx]
+
+    np.save(os.path.join(output_cache_dir, 'price_date_idx.npy'),
+            price_date_idx_buf[:cursor])
+    np.save(os.path.join(output_cache_dir, 'stock_offsets.npy'),
+            np.asarray(stock_offsets, dtype=np.int64))
+    np.save(os.path.join(output_cache_dir, 'stock_codes.npy'),
+            np.array(stock_codes_kept))
+    np.save(os.path.join(output_cache_dir, 'sample_end.npy'),      sample_end)
+    np.save(os.path.join(output_cache_dir, 'sample_date_idx.npy'), sample_date_idx)
+    np.save(os.path.join(output_cache_dir, 'sample_labels.npy'),   sample_labels)
+    np.save(os.path.join(output_cache_dir, 'trading_calendar.npy'),
+            np.array(trading_calendar))
+
+    meta = {
+        'n_features':       n_feat,
+        'sequence_length':  seq_len,
+        'forward_window':   config.get('forward_window', 5),
+        'news_window':      config.get('news_window', NEWS_WINDOW),
+        'n_total_samples':  int(n_samples),
+        'n_price_rows':     int(cursor),
+        'n_stocks':         len(stock_codes_kept),
+        'n_calendar_days':  len(trading_calendar),
+        'news_cache_path':  config.get('news_cache_path'),
+        'token_cache_path': config.get('token_cache_path'),
+    }
+    with open(os.path.join(output_cache_dir, 'metadata.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[data_pipeline] Compact cache saved → {output_cache_dir}")
+
+
+# ─── Predict-only sequence builder (unchanged contract) ──────────────────────
 
 def build_predict_sequences(
     stock_file:    str,
@@ -409,17 +429,8 @@ def build_predict_sequences(
     _prefiltered:  bool = False,
 ) -> Optional[Tuple[np.ndarray, str, str]]:
     """
-    Extract the most recent 30-day sequence for one stock (inference only).
-
-    Applies the training StandardScaler so the model sees normalized features,
-    identical to what was used during training.
-
-    Returns:
-        price_seq : (seq_len, n_feat) float32  — scaler-normalized + clipped
-        ts_code   : stock code string  (e.g. '600000.SH')
-        date_str  : YYYYMMDD of the last day in the sequence (the 'prediction date')
-
-    Returns None if the stock has insufficient data.
+    Most-recent (seq_len, n_feat) window for one stock, scaled with the
+    training StandardScaler.  Returns (price_seq, ts_code, date_str) or None.
     """
     seq_len = config.get('sequence_length', 30)
 
@@ -433,7 +444,6 @@ def build_predict_sequences(
 
     df['trade_date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d')
     df = df.sort_values('trade_date').reset_index(drop=True)
-
     ts_code = os.path.basename(stock_file).replace('.csv', '')
 
     if daily_basic is not None and not daily_basic.empty:
@@ -449,19 +459,18 @@ def build_predict_sequences(
 
     missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing_cols:
-        df[missing_cols] = 0.0
+        zeros = pd.DataFrame(0.0, index=df.index, columns=missing_cols, dtype=np.float32)
+        df = pd.concat([df, zeros], axis=1)
 
     df = df.dropna(subset=FEATURE_COLUMNS)
     if len(df) < seq_len:
         return None
 
-    # Take the last seq_len rows
     last     = df.tail(seq_len).reset_index(drop=True)
     date_str = last['trade_date'].iloc[-1].strftime('%Y%m%d')
 
-    features = last[FEATURE_COLUMNS].values.astype(np.float32)   # (seq_len, n_feat)
+    features = last[FEATURE_COLUMNS].values.astype(np.float32)
 
-    # Apply the training StandardScaler (same transform as split_and_normalize)
     n_feat = features.shape[1]
     scale  = np.where(scaler_scale == 0, 1.0, scaler_scale)
     flat   = (features.reshape(-1, n_feat) - scaler_mean) / scale
@@ -471,117 +480,113 @@ def build_predict_sequences(
     return features, ts_code, date_str
 
 
+# ─── Split + scaler (compact-cache version) ──────────────────────────────────
+
 def split_and_normalize(
     cache_dir:   str,
     train_ratio: float = 0.70,
     val_ratio:   float = 0.15,
 ) -> None:
     """
-    Time-based split + StandardScaler on price features.
+    Record split boundaries in metadata, fit StandardScaler on training-period
+    rows of ``price_matrix.npy``, and transform the matrix in place.
 
-    Memory-efficient: price and news arrays are accessed as read-only memmaps
-    (never fully loaded into RAM).  StandardScaler is fit incrementally via
-    partial_fit so the full training price array (~50 GB) is never resident.
-    Each split is written to disk in chunks via memory-mapped output files.
-
-    StandardScaler is applied to price features ONLY.
-    News embeddings (BERT outputs) are not re-scaled: BERT layer-norms
-    already centre and scale them; additional normalisation degrades quality.
+    No per-split copies are written.  The Dataset reads the master file and
+    indexes into it using the ``[start, end)`` ranges saved in metadata.
     """
-    price  = np.load(os.path.join(cache_dir, 'price_sequences.npy'), mmap_mode='r')
-    news   = np.load(os.path.join(cache_dir, 'news_sequences.npy'),  mmap_mode='r')
-    labels = np.load(os.path.join(cache_dir, 'labels.npy'))   # (N,)  ~46 MB — fine in RAM
-    dates  = np.load(os.path.join(cache_dir, 'dates.npy'))    # (N,) ~185 MB — fine in RAM
+    meta_path = os.path.join(cache_dir, 'metadata.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
 
-    N       = len(labels)
+    sample_date_idx  = np.load(os.path.join(cache_dir, 'sample_date_idx.npy'))
+    sample_labels    = np.load(os.path.join(cache_dir, 'sample_labels.npy'))
+    trading_calendar = np.load(os.path.join(cache_dir, 'trading_calendar.npy'))
+    price_date_idx   = np.load(os.path.join(cache_dir, 'price_date_idx.npy'))
+
+    N       = int(meta['n_total_samples'])
     n_train = int(N * train_ratio)
     n_val   = int(N * val_ratio)
-
-    splits = {
+    splits  = {
         'train': (0,               n_train),
         'val':   (n_train,         n_train + n_val),
         'test':  (n_train + n_val, N),
     }
 
-    # Fit StandardScaler incrementally — avoids loading full training price
-    # array (~50 GB) into RAM at once.
-    CHUNK = 50_000
-    print(f"[data_pipeline] Fitting StandardScaler on {n_train:,} training samples ...")
+    # Training-period boundary: any price row whose date_idx is strictly less
+    # than the first val sample's date_idx is "training-period".  This avoids
+    # using val/test feature distributions in the scaler fit.
+    if n_train >= N:
+        val_start_date_idx = int(sample_date_idx[-1]) + 1
+    else:
+        val_start_date_idx = int(sample_date_idx[n_train])
+
+    print(f"[data_pipeline] Fitting StandardScaler "
+          f"(rows with date_idx < {val_start_date_idx}) ...")
+    train_mask    = price_date_idx < val_start_date_idx
+    n_train_rows  = int(train_mask.sum())
+    if n_train_rows == 0:
+        raise ValueError("No training-period rows found for scaler fit.")
+    train_indices = np.where(train_mask)[0]
+
+    price = np.load(os.path.join(cache_dir, 'price_matrix.npy'), mmap_mode='r+')
+    n_rows, n_feat = price.shape
+
     scaler = StandardScaler()
-    for start in range(0, n_train, CHUNK):
-        end   = min(start + CHUNK, n_train)
-        scaler.partial_fit(np.array(price[start:end]).reshape(-1, price.shape[-1]))
+    CHUNK  = 200_000
+    for s in tqdm(range(0, n_train_rows, CHUNK), desc='  scaler fit', unit='chunk', leave=False):
+        e        = min(s + CHUNK, n_train_rows)
+        idx_chunk = train_indices[s:e]
+        rows = np.asarray(price[idx_chunk])   # gather (chunk, n_feat)
+        scaler.partial_fit(rows)
 
-    metadata: dict = {
-        'n_total':    N,
-        'seq_length': price.shape[1],
-        'n_features': price.shape[2],
-        'bert_dim':   news.shape[2],
-        'news_window': news.shape[1],
-        'splits':     {},
-    }
+    mean  = scaler.mean_.astype(np.float32)
+    scale = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
 
-    for split_name, (start, end) in splits.items():
+    # Apply scaler in place so the matrix is ready for direct __getitem__ reads.
+    print(f"[data_pipeline] Applying scaler in place to {n_rows:,} rows ...")
+    for s in tqdm(range(0, n_rows, CHUNK), desc='  normalise', unit='chunk', leave=False):
+        e     = min(s + CHUNK, n_rows)
+        chunk = np.asarray(price[s:e])
+        chunk = (chunk - mean) / scale
+        np.clip(chunk, -10.0, 10.0, out=chunk)
+        price[s:e] = chunk.astype(np.float32)
+    price.flush()
+    del price
+
+    np.savez(os.path.join(cache_dir, 'price_scaler.npz'), mean=mean, scale=scale)
+
+    # ── Per-split metadata (n_samples, date range, class_counts) ─────────────
+    splits_meta: Dict[str, dict] = {}
+    for name, (start, end) in splits.items():
         n = end - start
         if n == 0:
-            metadata['splits'][split_name] = {
-                'n_samples': 0, 'date_start': '', 'date_end': '', 'class_counts': []
+            splits_meta[name] = {
+                'n_samples':    0,
+                'start':        int(start),
+                'end':          int(end),
+                'date_start':   '',
+                'date_end':     '',
+                'class_counts': [],
             }
             continue
-
-        # Write split files as memmaps (avoids holding full split in RAM)
-        p_out  = np.lib.format.open_memmap(
-            os.path.join(cache_dir, f'{split_name}_price.npy'),
-            mode='w+', dtype=np.float32, shape=(n, price.shape[1], price.shape[2]),
-        )
-        nv_out = np.lib.format.open_memmap(
-            os.path.join(cache_dir, f'{split_name}_news.npy'),
-            mode='w+', dtype=np.float32, shape=(n, news.shape[1], news.shape[2]),
-        )
-
-        for c_start in range(0, n, CHUNK):
-            c_end  = min(c_start + CHUNK, n)
-            src_s  = start + c_start
-            src_e  = start + c_end
-
-            # np.array() copies the memmap slice into RAM for transform
-            p_chunk = np.array(price[src_s:src_e])
-            shape   = p_chunk.shape
-            p_norm  = scaler.transform(
-                p_chunk.reshape(-1, shape[-1])
-            ).reshape(shape).astype(np.float32)
-            p_norm  = np.clip(p_norm, -10.0, 10.0)
-
-            p_out[c_start:c_end]  = p_norm
-            nv_out[c_start:c_end] = news[src_s:src_e]
-
-        p_out.flush();  del p_out
-        nv_out.flush(); del nv_out
-
-        # labels and dates are already in RAM — slice and save directly
-        np.save(os.path.join(cache_dir, f'{split_name}_labels.npy'), labels[start:end])
-        np.save(os.path.join(cache_dir, f'{split_name}_dates.npy'),  dates[start:end])
-
-        class_counts = np.bincount(labels[start:end], minlength=MM_NUM_CLASSES).tolist()
-        metadata['splits'][split_name] = {
-            'n_samples':    n,
-            'date_start':   str(dates[start]),
-            'date_end':     str(dates[end - 1]),
+        labels_split = sample_labels[start:end]
+        class_counts = np.bincount(labels_split, minlength=MM_NUM_CLASSES).tolist()
+        d_start = str(trading_calendar[int(sample_date_idx[start])])
+        d_end   = str(trading_calendar[int(sample_date_idx[end - 1])])
+        splits_meta[name] = {
+            'n_samples':    int(n),
+            'start':        int(start),
+            'end':          int(end),
+            'date_start':   d_start,
+            'date_end':     d_end,
             'class_counts': class_counts,
         }
-        print(
-            f"  {split_name:5s}: {n:7,} samples  "
-            f"dates {dates[start]} → {dates[end - 1]}  "
-            f"classes {class_counts}"
-        )
+        print(f"  {name:5s}: {n:7,} samples  "
+              f"dates {d_start} → {d_end}  classes {class_counts}")
 
-    np.savez(
-        os.path.join(cache_dir, 'price_scaler.npz'),
-        mean=scaler.mean_,
-        scale=scaler.scale_,
-    )
-
-    with open(os.path.join(cache_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f, indent=2)
+    meta['splits']             = splits_meta
+    meta['val_start_date_idx'] = int(val_start_date_idx)
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
 
     print(f"[data_pipeline] Split + normalisation complete → {cache_dir}")

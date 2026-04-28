@@ -765,6 +765,72 @@ def _merge_static_features(panel: pd.DataFrame) -> pd.DataFrame:
                 if c in panel.columns:
                     panel[c] = panel[c].fillna(0).astype('float32')
 
+    # 6. News sentiment from Qwen (or any other sentiment producer): a
+    # per-(ts_code, trade_date) table with sentiment_mean / pos_share /
+    # neg_share / neu_share / n_articles / confidence_mean. Merged via
+    # merge_asof so today's row picks up the latest available sentiment.
+    # Derived features (EMAs, momentum, volume z-score, age-since-news)
+    # are computed *before* merge to keep stock-grouping efficient.
+    fp = os.path.join(os.path.dirname(base), 'news_sentiment_qwen.csv')
+    if os.path.exists(fp):
+        try:
+            sd = pd.read_csv(fp, encoding='utf-8-sig')
+            sd['trade_date'] = pd.to_datetime(sd['trade_date'], errors='coerce')
+            sd = sd.dropna(subset=['trade_date']).sort_values(['ts_code','trade_date'])
+
+            # Per-stock derived features
+            sd = sd.copy()
+            grp = sd.groupby('ts_code', sort=False)
+            sd['news_sentiment_ma5']  = grp['sentiment_mean'].transform(
+                lambda s: s.ewm(alpha=2.0/(5+1),  adjust=False).mean())
+            sd['news_sentiment_ma20'] = grp['sentiment_mean'].transform(
+                lambda s: s.ewm(alpha=2.0/(20+1), adjust=False).mean())
+            sd['news_sentiment_momentum'] = sd['news_sentiment_ma5'] - sd['news_sentiment_ma20']
+            mu_n  = grp['n_articles'].transform(lambda s: s.rolling(20, min_periods=3).mean())
+            std_n = grp['n_articles'].transform(lambda s: s.rolling(20, min_periods=3).std())
+            sd['news_volume_zscore_20d'] = ((sd['n_articles'] - mu_n) / std_n.replace(0, np.nan)).fillna(0.0)
+            sd['news_negative_burst_5d'] = grp['sentiment_neg_share'].transform(
+                lambda s: s.rolling(5, min_periods=1).mean())
+
+            news_cols = ['news_sentiment_mean', 'news_sentiment_pos_share',
+                          'news_sentiment_neg_share', 'news_sentiment_neu_share',
+                          'news_n_articles', 'news_confidence_mean',
+                          'news_sentiment_ma5', 'news_sentiment_ma20',
+                          'news_sentiment_momentum', 'news_volume_zscore_20d',
+                          'news_negative_burst_5d']
+            sd = sd.rename(columns={
+                'sentiment_mean':       'news_sentiment_mean',
+                'sentiment_pos_share':  'news_sentiment_pos_share',
+                'sentiment_neg_share':  'news_sentiment_neg_share',
+                'sentiment_neu_share':  'news_sentiment_neu_share',
+                'n_articles':           'news_n_articles',
+                'confidence_mean':      'news_confidence_mean',
+            })[['ts_code','trade_date'] + news_cols]
+
+            # merge_asof requires both left + right sorted globally by the
+            # `on` key (trade_date), then groups are matched within `by` (ts_code).
+            sd    = sd.sort_values('trade_date').reset_index(drop=True)
+            panel = panel.sort_values('trade_date').reset_index(drop=True)
+            panel = pd.merge_asof(
+                panel, sd,
+                on='trade_date', by='ts_code',
+                direction='backward', allow_exact_matches=True,
+            )
+            # Days since the most recent news article on this stock —
+            # forward-fill the news date per-stock, then subtract from trade_date.
+            panel = panel.sort_values(['ts_code','trade_date']).reset_index(drop=True)
+            had_news = panel['news_sentiment_mean'].notna() & (panel['news_n_articles'] > 0)
+            last_news_dt = panel['trade_date'].where(had_news)
+            last_news_dt = last_news_dt.groupby(panel['ts_code']).ffill()
+            age = (panel['trade_date'] - last_news_dt).dt.days
+            panel['news_age_days'] = age.clip(upper=90).fillna(90).astype('float32')
+            for c in news_cols:
+                if c in panel.columns:
+                    panel[c] = panel[c].fillna(0.0).astype('float32')
+            print(f"  news sentiment merge: {len(news_cols) + 1} columns added")
+        except Exception as e:
+            print(f"  [warn] news sentiment merge failed: {e}")
+
     # Final: ensure all numeric NaN→0 (except targets, which must keep NaN
     # so per-horizon trainers can drop the right rows).
     skip = {'ts_code', 'trade_date', 'target',

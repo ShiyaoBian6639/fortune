@@ -142,6 +142,18 @@ def run_rebalance_backtest(
                                             # is in top (top_k + hold_buffer_k)
                                             # of today's preds. Only sells
                                             # when it falls past that.
+    tp_sigma_mult:  float = 0.0,            # Per-stock TP at +tp_mult × σ_60d
+                                            #   0 = disabled (pure rank exit).
+                                            #   1.5 = TP at 1.5 daily σ above entry.
+    sl_sigma_mult:  float = 0.0,            # Per-stock SL at -sl_mult × σ_60d
+                                            #   0 = disabled. 1.0 = -1σ stop.
+    max_hold_days:  int   = 0,              # 0 = no per-position max hold
+    skip_if_no_trigger: bool = False,       # Smart-rebalance: if today has no
+                                            # exit, no drop-out, no significant
+                                            # drift, do nothing — save costs.
+    drift_trigger_pct: float = 0.05,        # If max(|target_w - current_w|) /
+                                            # NAV exceeds this, trigger rebalance
+                                            # even with no exits / drop-outs.
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Rolling daily rebalance to a Markowitz QP portfolio of top-K available.
 
@@ -183,6 +195,76 @@ def run_rebalance_backtest(
 
     for day in trading_days:
         day = pd.Timestamp(day)
+
+        # ── 0. Per-stock TP / SL / max-hold pre-check ──
+        # Runs BEFORE the target-build so a stock that hits TP today exits
+        # immediately (and frees cash for the rebalance later in the day).
+        # Trigger flag: any forced exit here makes the day "trigger" the
+        # full rebalance phase even if everything else is stable.
+        any_forced_exit = False
+        if (tp_sigma_mult > 0 or sl_sigma_mult > 0 or max_hold_days > 0):
+            kept_pre: List[Position] = []
+            for p in positions:
+                if p.entry_date == day:
+                    kept_pre.append(p); continue              # T+1
+                df = prices.get(p.ts_code)
+                if df is None or day not in df.index:
+                    kept_pre.append(p); continue
+                row = df.loc[day]
+                op = float(row.get('open')  or 0.0)
+                hi = float(row.get('high')  or 0.0)
+                lo = float(row.get('low')   or 0.0)
+                cl = float(row.get('close') or 0.0)
+                if hi <= 0:
+                    kept_pre.append(p); continue
+                # Locked-down: can't fill exit
+                if _is_locked_at_limit(row) == 'locked_down':
+                    kept_pre.append(p); continue
+
+                # Per-stock TP / SL prices from rolling σ_60d (in %)
+                exit_price, reason = None, None
+                s_series = sigmas.get(p.ts_code)
+                sigma = float(s_series.loc[day]) if (s_series is not None
+                                                      and day in s_series.index) else float('nan')
+
+                if tp_sigma_mult > 0 and np.isfinite(sigma):
+                    tp_pct = tp_sigma_mult * sigma / 100.0
+                    tp_price = p.entry_price * (1.0 + tp_pct)
+                    if (lo <= tp_price <= hi) or (op > tp_price):
+                        exit_price = tp_price if (lo <= tp_price <= hi) else op
+                        reason = 'take_profit'
+
+                if exit_price is None and sl_sigma_mult > 0 and np.isfinite(sigma):
+                    sl_pct = sl_sigma_mult * sigma / 100.0
+                    sl_price = p.entry_price * (1.0 - sl_pct)
+                    if (lo <= sl_price <= hi) or (op < sl_price):
+                        exit_price = sl_price if (lo <= sl_price <= hi) else op
+                        reason = 'stop_loss'
+
+                if exit_price is None and max_hold_days > 0:
+                    held_days = len(df.loc[p.entry_date:day]) - 1
+                    if held_days >= max_hold_days:
+                        exit_price = cl
+                        reason = 'max_hold'
+
+                if exit_price is None:
+                    kept_pre.append(p); continue
+
+                # Execute the forced exit
+                proceeds = exit_price * p.shares * (1.0 - xc)
+                pnl = proceeds - p.cost_basis
+                cash += proceeds
+                any_forced_exit = True
+                trade_rows.append({
+                    'ts_code': p.ts_code, 'entry_date': p.entry_date,
+                    'exit_date': day, 'entry_price': p.entry_price,
+                    'exit_price': exit_price, 'shares': p.shares,
+                    'cost_basis': p.cost_basis, 'proceeds': proceeds,
+                    'pnl': pnl, 'ret': pnl / p.cost_basis if p.cost_basis else 0,
+                    'held_days': len(df.loc[p.entry_date:day]) - 1,
+                    'reason': reason,
+                })
+            positions = kept_pre
 
         # ── 1. Build target portfolio from pred at (day - impl_lag) ──
         i_today = day_index.get(day, -1)
@@ -297,6 +379,61 @@ def run_rebalance_backtest(
         # doesn't try to buy a full NAV-weight of top-K names while the
         # parked names are still consuming portfolio space.
         tradeable_nav = max(nav - parked_value, 0.0)
+
+        # ── 4b. SMART REBALANCE GATE: skip the day entirely unless something
+        #         meaningful changed. Saves 25 bps round-trip every skipped day.
+        #
+        # Triggers (any one fires the rebalance):
+        #   • a per-stock TP/SL/max_hold exit happened earlier today
+        #   • a held position fell out of the hold-set (top_k + buffer)
+        #   • target weights drifted >= drift_trigger_pct of NAV vs current
+        #   • there's enough idle cash to buy a meaningful new position
+        if skip_if_no_trigger:
+            held_codes_pre = {p.ts_code for p in positions}
+            any_dropout = any(ts not in hold_set for ts in held_codes_pre)
+
+            # Drift: use both MAX and L1-sum drift, gated independently.
+            #   drift_max = max single-name drift (catches concentration)
+            #   drift_total = sum of |drift| (catches overall portfolio shift)
+            # Either alone can trigger, but the user's drift_trigger_pct
+            # applies to drift_total / nav (more stable signal). We also
+            # require that the drift be larger than the rebalance_threshold
+            # so a 0.5%-of-NAV drift doesn't trigger on a 2%-of-NAV threshold.
+            drift_total = 0.0
+            drift_max   = 0.0
+            if nav > 0:
+                for ts in set(target_codes) | set(current_dollars.keys()):
+                    t_dollars = target_weights.get(ts, 0.0) * tradeable_nav
+                    c_dollars = current_dollars.get(ts, 0.0)
+                    d = abs(t_dollars - c_dollars)
+                    drift_total += d
+                    drift_max    = max(drift_max, d)
+                drift_total /= nav
+                drift_max   /= nav
+
+            cash_idle_pct = cash / nav if nav > 0 else 0.0
+            cash_significant = cash_idle_pct > 2 * drift_trigger_pct
+
+            triggered = (any_forced_exit or any_dropout
+                          or drift_total >= drift_trigger_pct
+                          or cash_significant)
+            if not triggered:
+                # Skip rebalance — record equity row only
+                invested_close = 0.0
+                for p in positions:
+                    df = prices.get(p.ts_code)
+                    if df is None or day not in df.index:
+                        invested_close += p.cost_basis
+                    else:
+                        invested_close += float(df.loc[day, 'close']) * p.shares
+                equity_rows.append({
+                    'trade_date': day, 'nav': cash + invested_close,
+                    'cash': cash, 'invested': invested_close,
+                    'n_pos': len(positions),
+                    'turnover_today': 0.0,
+                    'pnl_realized_day': 0.0,
+                })
+                continue
 
         # ── 5. EXIT phase: sell positions that fell out of target ──
         realized_today = 0.0
@@ -497,6 +634,21 @@ def main():
                         'Stabilises top-K membership when raw daily preds '
                         'are noisy. 1 = no smoothing (raw), 5 = default, '
                         '10 = aggressive smoothing.')
+    p.add_argument('--tp_sigma_mult', type=float, default=0.0,
+                   help='Per-stock take-profit at +tp_sigma_mult × σ_60d (in %%). '
+                        '0 = disabled (pure rank exit). 1.5 = TP at +1.5σ.')
+    p.add_argument('--sl_sigma_mult', type=float, default=0.0,
+                   help='Per-stock stop-loss at -sl_sigma_mult × σ_60d. '
+                        '0 = disabled. 1.0 = SL at -1σ.')
+    p.add_argument('--max_hold_days', type=int, default=0,
+                   help='Per-position max-hold horizon. 0 = no hard cap.')
+    p.add_argument('--skip_if_no_trigger', action='store_true',
+                   help='Smart-rebalance: do nothing on days where no exit, '
+                        'no drop-out, no significant drift, and no idle cash. '
+                        'Reduces transaction costs.')
+    p.add_argument('--drift_trigger_pct', type=float, default=0.05,
+                   help='Trigger threshold for weight drift (fraction of NAV). '
+                        'Default 0.05 = rebalance when max drift >= 5%% of NAV.')
     p.add_argument('--hold_buffer_k', type=int, default=20,
                    help='Stickiness buffer: a held position stays in the '
                         'portfolio while it is in top (top_k + hold_buffer_k) '

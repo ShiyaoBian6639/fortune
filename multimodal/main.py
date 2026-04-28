@@ -227,14 +227,16 @@ def run_train(config: dict, phase: int = 1, fresh: bool = False):
         # the "Loading weights" startup cost.
         bert = None
 
-        # MultimodalChunkedLoader for train: bulk sequential reads into RAM,
-        # background-thread depth-2 prefetch — eliminates 100% disk from random seeks.
+        # MultimodalChunkedLoader for train: gathers chunks of samples from
+        # the compact price_matrix + per-day news table, depth-2 prefetched.
         train_loader = MultimodalChunkedLoader(
             cache_dir,
-            split         = 'train',
-            batch_size    = config.get('batch_size', 1024),
-            chunk_samples = config.get('chunk_samples', 50_000),
-            seed          = config.get('random_seed', 42),
+            split           = 'train',
+            batch_size      = config.get('batch_size', 1024),
+            chunk_samples   = config.get('chunk_samples', 50_000),
+            seed            = config.get('random_seed', 42),
+            news_cache_path = config.get('news_cache_path'),
+            news_window     = config.get('news_window'),
         )
         val_loader, _ = create_val_test_dataloaders(cache_dir, config, splits=('val',))
         print(f"[dataset] Train: {train_loader.n_samples:,}  Val: {len(val_loader.dataset):,}"

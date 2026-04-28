@@ -391,20 +391,28 @@ def _texts_from_csvs(csv_paths: List[Path]) -> List[str]:
     title_col   = title_col.astype(str).str.strip()
     content_col = content_col.astype(str).str.strip()
 
-    # Build combined text: "title content" when both present, else whichever exists
-    texts_raw = []
+    # Build combined text: "title content" when both present, else whichever exists.
+    # Internal whitespace is collapsed to single spaces ('\n', '\t', and runs of
+    # spaces all become one ' ') before storing, so articles that differ only in
+    # whitespace become exact duplicates and the dedup below catches them.  Some
+    # source CSVs (notably eastmoney) repeat the same article many times within a
+    # single file with minor whitespace variations.
+    texts_raw: List[str] = []
     for title, content in zip(title_col, content_col):
         if title and content:
-            texts_raw.append(title + ' ' + content)
+            combined = title + ' ' + content
         elif content:
-            texts_raw.append(content)
+            combined = content
         elif title:
-            texts_raw.append(title)
-        # both empty → skip
+            combined = title
+        else:
+            continue
+        normalised = ' '.join(combined.split())
+        if normalised:
+            texts_raw.append(normalised)
 
-    # Deduplicate: keep first occurrence of each unique text (preserves temporal order).
-    # Using full text as the key handles all cases: same article appearing multiple
-    # times in one source's CSV, and cross-source exact reposts.
+    # Deduplicate: keep first occurrence (preserves temporal order).  Whitespace-
+    # collapsed text serves as both the key and the value passed to BERT.
     seen: set = set()
     texts: List[str] = []
     for text in texts_raw:
