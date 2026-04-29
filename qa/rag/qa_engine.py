@@ -1,0 +1,185 @@
+"""
+Qwen-based Q&A engine — wraps Qwen2.5-Instruct for the stock-research task.
+
+Loads the same Qwen2.5-7B-Instruct that `xgbmodel/qwen_sentiment.py` uses
+(weights are HF-cached so no second download), but configured for free-form
+generation instead of single-token sentiment classification.
+
+Usage:
+    qa = QAEngine(model_id='Qwen/Qwen2.5-7B-Instruct', quant='4bit')
+    answer = qa.ask("贵州茅台最近一季度业绩如何", retriever, builder)
+
+The retriever + context_builder produce structured Markdown context. We
+prepend a strict system prompt that requires the model to ONLY use the
+provided facts, never invent numbers, and cite the news date+source when
+referencing news.
+"""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+
+from qa.rag.retriever import Retriever
+from qa.rag.context_builder import ContextBuilder
+
+
+SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。回答问题时必须遵守以下规则：
+
+1. **只使用「资料」中的事实**。如果资料中没有该信息，必须明确说"资料中未提供"。
+2. **数字必须严格摘自资料**——绝不凭空生成 EPS、ROE、收盘价、涨跌幅等数据。
+3. **引用新闻时**写明日期、来源（[2026-04-28] [eastmoney] 标题），不要发明新闻条目。
+4. 回答简洁清晰：
+   - 业绩问题 → 用一段话总结趋势 + 列出关键季度指标。
+   - 新闻问题 → 列出 3-5 条最相关的新闻，每条一行。
+   - 比较问题 → 用 Markdown 表格直接对比指标。
+5. 用中文回答，专业但易读。"""
+
+
+FEW_SHOT_USER = """资料：
+## 宁德时代（300750.SZ）
+- 申万一级：电力设备　二级：电池
+
+### 业绩（最近4季）
+| 报告期 | EPS（元） | ROE % | 毛利率 % |
+|---|---|---|---|
+| 20260331 | 4.58 | 5.97 | 24.82 |
+| 20251231 | 16.14 | 24.72 | 26.27 |
+| 20250930 | 11.02 | 17.48 | 25.31 |
+| 20250630 | 6.92 | 11.25 | 25.02 |
+
+问题：宁德时代最近一季业绩如何？"""
+
+FEW_SHOT_ASSISTANT = """**宁德时代（300750.SZ）2026Q1 业绩摘要**
+
+最新一季报告期 2026-03-31，EPS 4.58 元、ROE 5.97%、毛利率 24.82%。
+
+- ROE 较 2025Q4 单季水平回落（24.72% → 5.97%），主要是单季 vs 累计口径差异，不构成趋势恶化。
+- 毛利率 24.82%，相比 2025Q4 的 26.27% 略降，但仍处于近 4 季稳定区间（25%-26%）。
+- 单季 EPS 4.58 元，大幅高于 2025 同期，盈利能力保持。
+
+资料未提供 2026Q1 营收 YoY 与归母净利 YoY 的具体数值。"""
+
+
+class QAEngine:
+    def __init__(self,
+                 model_id: str = 'Qwen/Qwen2.5-7B-Instruct',
+                 device: str = 'cuda',
+                 quant: str = '4bit',           # '4bit' for 4070, 'none' for 5090
+                 max_new_tokens: int = 600,
+                 temperature: float = 0.3):
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+        self.torch = torch
+        self.device = device
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+
+        print(f"[qa] loading {model_id} (quant={quant}) ...", flush=True)
+        kw = dict(torch_dtype=torch.bfloat16, device_map=device,
+                  trust_remote_code=True)
+        if quant == '4bit':
+            from transformers import BitsAndBytesConfig
+            kw['quantization_config'] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type='nf4',
+                bnb_4bit_use_double_quant=True,
+            )
+            kw.pop('torch_dtype')
+        elif quant == '8bit':
+            from transformers import BitsAndBytesConfig
+            kw['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
+            kw.pop('torch_dtype')
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        self.model     = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+        self.model.eval()
+        print(f"[qa] model ready on {self.model.device}", flush=True)
+
+    def _build_messages(self, question: str, context: str) -> list:
+        return [
+            {'role': 'system',    'content': SYSTEM_PROMPT},
+            {'role': 'user',      'content': FEW_SHOT_USER},
+            {'role': 'assistant', 'content': FEW_SHOT_ASSISTANT},
+            {'role': 'user',      'content': f"资料：\n{context}\n\n问题：{question}"},
+        ]
+
+    def generate(self, question: str, context: str) -> str:
+        messages = self._build_messages(question, context)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors='pt',
+                                 truncation=True, max_length=8192).to(self.model.device)
+        prompt_len = inputs['input_ids'].shape[1]
+
+        with self.torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.temperature > 0,
+                temperature=max(self.temperature, 0.01),
+                top_p=0.95,
+                repetition_penalty=1.05,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        new_tokens = out[0, prompt_len:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    def ask(self, question: str,
+             retriever: Retriever,
+             builder: ContextBuilder,
+             top_k: int = 5,
+             max_context_tokens: int = 3000) -> dict:
+        out = retriever.search(question, top_k=top_k)
+        context = builder.build_for(out['ts_codes'], out['articles'],
+                                      max_tokens=max_context_tokens)
+        if not out['ts_codes']:
+            answer = "未能在问题中识别出A股代码或股票名称。请提供 ts_code 或公司名称。"
+        else:
+            t0 = time.time()
+            answer = self.generate(question, context)
+            elapsed = time.time() - t0
+            print(f"[qa] generated in {elapsed:.1f}s", flush=True)
+        return {
+            'question':      question,
+            'answer':        answer,
+            'ts_codes':      out['ts_codes'],
+            'n_articles':    len(out['articles']),
+            'context_chars': len(context),
+        }
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--quant', choices=['none','8bit','4bit'], default='4bit',
+                   help='4bit fits 12GB VRAM; none requires ≥18GB')
+    p.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct')
+    p.add_argument('--questions', nargs='+', default=[
+        '300750.SZ最近一季度的业绩怎么样？',
+        '茅台最近有什么新闻？',
+        '比亚迪和宁德时代谁的毛利率更高？',
+    ])
+    args = p.parse_args()
+
+    r  = Retriever('stock_data/qa/aliases.json',
+                    'stock_data/qa/news_linked.parquet')
+    cb = ContextBuilder('stock_data/qa/aliases.json')
+    qa = QAEngine(model_id=args.model, quant=args.quant)
+
+    for q in args.questions:
+        print()
+        print('=' * 70)
+        print(f'Q: {q}')
+        print('=' * 70)
+        out = qa.ask(q, r, cb)
+        print(f"resolved ts_codes: {out['ts_codes']}  "
+              f"({out['n_articles']} articles, {out['context_chars']} ctx chars)")
+        print()
+        print(out['answer'])
+
+
+if __name__ == '__main__':
+    main()
