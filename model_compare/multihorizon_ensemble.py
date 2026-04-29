@@ -106,12 +106,12 @@ def main():
         if name not in selected: continue
         df = load_engine_preds(name, pat, kind, args.basis)
         if df is None or df.empty:
-            _log(f"  ✗ {name}: no preds available")
+            _log(f"  [no] {name}: no preds available")
             continue
         # Drop rows with any NaN pred
         before = len(df)
         df = df.dropna(subset=[f'pred_d{h}' for h in HORIZONS])
-        _log(f"  ✓ {name}: {len(df):,} rows ({before-len(df):,} dropped due to NaN)")
+        _log(f"  [ok] {name}: {len(df):,} rows ({before-len(df):,} dropped due to NaN)")
         frames[name] = df
 
     if not frames:

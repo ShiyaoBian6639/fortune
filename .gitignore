@@ -54,3 +54,6 @@ Thumbs.db
 *.log
 .prof_log/
 .claude/
+
+# Gradio per-machine local TLS cert / cache
+.gradio/
