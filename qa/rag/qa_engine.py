@@ -175,48 +175,60 @@ class QAEngine:
 
     def generate_stream(self, question: str, context: str,
                          max_new_tokens: int | None = None) -> Iterator[str]:
-        """Yield decoded text chunks as they're generated. Drops perceived
-        latency from ~15-20 s to <1 s for first tokens.
+        """Yield decoded text chunks as they're generated.
 
-        The GPU lock is held for the duration of generation — concurrent
-        callers wait. This prevents two streams from both being in-flight
-        on the GPU at once (which doubles KV-cache and OOMs 12 GB).
+        Critical: this generator does NOT use ``with self._gpu_lock:``.
+        Python keeps the `with` block alive across yields, and if the
+        SSE consumer disconnects mid-stream the generator is suspended
+        at a yield until garbage collection — which can be never. The
+        lock would stay held forever and every later /ask deadlocks.
+
+        Instead the lock is acquired manually with a 5 s timeout. If a
+        prior request is stuck holding it we surface an error chunk and
+        return rather than wait forever. The finally block drains the
+        streamer queue, joins the model.generate thread, clears CUDA
+        cache, and releases the lock — robust against early consumer
+        cancellation.
         """
         from transformers import TextIteratorStreamer
         max_new = max_new_tokens or self.max_new_tokens
         messages = self._build_messages(question, context)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        # 4 K is the safe cap on a 12 GB card. The peak VRAM during the
-        # prompt forward pass is dominated by the attention softmax tensor
-        # — shape [heads, seq, seq] @ fp16 = 28 × 6144² × 2 ≈ 2.1 GB at
-        # 6 K but only ~0.9 GB at 4 K. SDPA shrinks this further but the
-        # cap is the safety net.
         inputs = self.tokenizer(prompt, return_tensors='pt',
                                  truncation=True, max_length=4096).to(self.model.device)
 
         streamer = TextIteratorStreamer(self.tokenizer,
                                          skip_prompt=True,
-                                         skip_special_tokens=True)
+                                         skip_special_tokens=True,
+                                         timeout=60.0)
         kwargs = self._gen_kwargs(inputs, max_new)
         kwargs['streamer'] = streamer
 
-        with self._gpu_lock:
-            thread = Thread(target=self.model.generate, kwargs=kwargs)
-            thread.start()
+        if not self._gpu_lock.acquire(timeout=5.0):
+            yield ("⚠️ GPU is busy with another request that didn't release "
+                   "cleanly. Restart the API server to clear it.")
+            return
+
+        thread = Thread(target=self.model.generate, kwargs=kwargs, daemon=True)
+        thread.start()
+        try:
+            for piece in streamer:
+                if piece:
+                    yield piece
+        finally:
             try:
-                for piece in streamer:
-                    if piece:
-                        yield piece
-            finally:
-                # Drain any remaining tokens then join — never leak the
-                # background generate thread, otherwise the next request
-                # holds the lock forever.
+                # Drain remaining tokens so the generate thread can finish.
+                # Streamer has a 60s timeout (set above) so this can't hang
+                # forever if the underlying generate has gone silent.
                 for _ in streamer:
                     pass
-                thread.join()
-                if self.torch.cuda.is_available():
-                    self.torch.cuda.empty_cache()
+            except Exception:
+                pass
+            thread.join(timeout=30.0)
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
+            self._gpu_lock.release()
 
     def _retrieve_and_build(self, question, retriever, builder,
                               top_k, max_context_tokens):

@@ -246,9 +246,15 @@ def ask_stream(body: AskBody, request: Request):
         meta = None
         full_text_parts: list[str] = []
         t0 = time.time()
-        for ev in engine.ask_stream(body.query, retriever, builder,
-                                      top_k=body.top_k,
-                                      max_context_tokens=body.max_context_tokens):
+        # Wrap the generator in a try/finally so a client disconnect
+        # forces ``gen.close()`` → triggers the engine generator's finally
+        # → releases the GPU lock. Without this the lock leaks on early
+        # disconnect and every subsequent /ask hangs forever.
+        gen = engine.ask_stream(body.query, retriever, builder,
+                                  top_k=body.top_k,
+                                  max_context_tokens=body.max_context_tokens)
+        try:
+          for ev in gen:
             if ev['event'] == 'meta':
                 meta = ev
                 yield f"event: meta\ndata: {json.dumps({k: ev[k] for k in ('ts_codes','n_articles','context_chars')}, ensure_ascii=False)}\n\n"
@@ -280,8 +286,47 @@ def ask_stream(body: AskBody, request: Request):
                         'n_articles':    meta['n_articles'],
                         'context_chars': meta['context_chars'],
                     })
+        finally:
+            # Force the engine generator to finalize even if the SSE
+            # consumer disconnected mid-stream — this runs the
+            # generate_stream finally block which releases the GPU lock.
+            try:
+                gen.close()
+            except Exception:
+                pass
 
     return StreamingResponse(iter_sse(), media_type='text/event-stream')
+
+
+@app.post('/lock_status')
+def lock_status():
+    """Diagnose lock state. ``locked`` is True if a generation is
+    currently in flight; if it stays True with no active client,
+    something leaked — POST /lock_force_release as a last resort."""
+    if 'engine' not in _state:
+        return {'locked': False, 'note': 'engine not loaded'}
+    lk = _state['engine']._gpu_lock
+    held = not lk.acquire(blocking=False)
+    if not held:
+        lk.release()
+    return {'locked': held}
+
+
+@app.post('/lock_force_release')
+def lock_force_release():
+    """Last-resort emergency: forcibly release the GPU lock without
+    waiting for the generator to finalize. Only use when /lock_status
+    shows locked=true and no request is actually in flight (e.g. after
+    a browser disconnect that orphaned the generator). Restart the
+    server if generation still hangs after this."""
+    if 'engine' not in _state:
+        return {'released': False, 'note': 'engine not loaded'}
+    lk = _state['engine']._gpu_lock
+    try:
+        lk.release()
+        return {'released': True}
+    except RuntimeError:
+        return {'released': False, 'note': 'lock was not held'}
 
 
 def main():
