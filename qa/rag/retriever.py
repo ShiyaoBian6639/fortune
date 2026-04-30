@@ -307,6 +307,7 @@ class Retriever:
                 'datetime': row.get('datetime'),
                 'title':    str(row.get('title') or ''),
                 'source':   str(row.get('source') or ''),
+                'content':  str(row.get('content_snippet') or ''),
                 'content_hash': row.get('content_hash'),
             })
         # Attach ts_codes by cross-referencing news_linked.parquet via
@@ -355,7 +356,7 @@ class Retriever:
                 'ts_code':  (h['ts_codes'][0] if h.get('ts_codes') else ''),
                 'datetime': h['datetime'],
                 'title':    h['title'],
-                'content':  '',
+                'content':  h.get('content', ''),
                 'source':   h['source'],
             })
         return ts_codes, articles

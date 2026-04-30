@@ -103,7 +103,12 @@ def main():
                                 show_progress=False)
         index.add(vecs.astype(np.float32))
 
-        meta_rows.append(df[['datetime', 'title', 'source', 'content_hash']]
+        # Keep a 256-char content snippet alongside the title — the
+        # retriever falls back to news_meta when the news-semantic path
+        # fires, and a title alone is usually too thin to answer from.
+        df['content_snippet'] = df['content'].fillna('').str[:256]
+        meta_rows.append(df[['datetime', 'title', 'source',
+                              'content_hash', 'content_snippet']]
                           .reset_index(drop=True))
 
         rows_done += len(df)

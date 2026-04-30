@@ -47,11 +47,17 @@ def main():
     dropdown_choices = [f"{r['ts_code']}  {r['name']}" for r in aliases]
     print(f"[ui] loaded {len(dropdown_choices):,} stocks for filter dropdown")
 
+    import re as _re
+    _TS_CODE_RE = _re.compile(r'^\d{6}\.(SH|SZ)$', _re.IGNORECASE)
+
     def ask_qa(question, history, ts_filter):
-        # If a stock filter is selected, prepend the ts_code to the query
-        if ts_filter and ts_filter.strip():
-            ts = ts_filter.split()[0]
-            if ts not in question:
+        # Only prepend when the dropdown actually holds a parseable ts_code
+        # (e.g. "600519.SH  贵州茅台"). With allow_custom_value=True the
+        # field can also contain free-form filter text the user typed; we
+        # ignore those — they shouldn't redirect the question to a stock.
+        if ts_filter and isinstance(ts_filter, str) and ts_filter.strip():
+            ts = ts_filter.strip().split()[0]
+            if _TS_CODE_RE.match(ts) and ts not in question:
                 question = f"{ts} {question}"
         try:
             r = requests.post(f"{args.api}/ask",
@@ -77,7 +83,8 @@ def main():
         with gr.Row():
             ts_filter = gr.Dropdown(
                 choices=dropdown_choices,
-                label="股票筛选 (可选, 输入代码或名称片段即可过滤)",
+                value=None,                # start empty — no auto-selected stock
+                label="股票筛选 (可选, 输入代码或名称片段即可过滤; 留空表示不限定)",
                 interactive=True,
                 allow_custom_value=True,
                 filterable=True,
