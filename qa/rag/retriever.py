@@ -340,26 +340,57 @@ class Retriever:
             hits = [h for h in hits if any(t in ts_set for t in h.get('ts_codes', []))]
         return hits[:top_k]
 
+    @staticmethod
+    def _dedupe_articles(articles: List[dict], top_k: int) -> List[dict]:
+        """Drop near-duplicate cross-posts. Same story re-published by
+        sina / yicai / eastmoney usually keeps the headline verbatim, so
+        keying on (date, normalised-title-prefix) catches them while
+        being cheap. Keeps the first-seen instance (newest, since the
+        flat news frame is already sorted DESC by datetime)."""
+        seen = set()
+        out: List[dict] = []
+        for a in articles:
+            d = a.get('datetime')
+            d_str = d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)[:10]
+            t = (a.get('title') or '').strip().lower()
+            # Strip whitespace + common punctuation differences across sources
+            for ch in '【】[]()（）"“”\'‘’，。!！?？:：':
+                t = t.replace(ch, '')
+            t = t[:32]
+            key = (d_str, t)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(a)
+            if len(out) >= top_k:
+                break
+        return out
+
     # ─── News retrieval ────────────────────────────────────────────────────
     def news_for(self, ts_code: str, top_k: int = 8) -> List[dict]:
-        """Most recent top_k linked-news articles for a single ts_code."""
+        """Most recent top_k linked-news articles for a single ts_code,
+        deduplicated by (date, title-prefix) so cross-posts of the same
+        story don't all stack into the context."""
         if ts_code not in self._news_by_code_groups.groups:
             return []
-        g = self._news_by_code_groups.get_group(ts_code)
-        g = g.head(top_k)
-        out = []
+        # Pull a wider raw slice so dedup doesn't starve the result.
+        g = self._news_by_code_groups.get_group(ts_code).head(top_k * 4)
+        raw = []
         for _, r in g.iterrows():
-            out.append({
+            raw.append({
                 'ts_code':  ts_code,
                 'datetime': r['datetime'],
                 'title':    str(r.get('title') or ''),
-                'content':  str(r.get('content') or '')[:400],   # snippet
+                'content':  str(r.get('content') or '')[:400],
                 'source':   str(r.get('source') or ''),
             })
-        return out
+        return self._dedupe_articles(raw, top_k)
 
     def _articles_from_news_hits(self, news_hits: List[dict]) -> tuple[List[str], List[dict]]:
-        """Convert semantic_news_search hits into (ts_codes, articles)."""
+        """Convert semantic_news_search hits into (ts_codes, articles).
+        Cross-post duplicates are filtered out so Qwen sees distinct
+        articles (instead of the same story repeated 3× from sina /
+        yicai / eastmoney)."""
         from collections import Counter
         tally = Counter(t for h in news_hits for t in h.get('ts_codes', []))
         ts_codes = [ts for ts, _ in tally.most_common(self._semantic_top_k)]
@@ -372,7 +403,7 @@ class Retriever:
                 'content':  h.get('content', ''),
                 'source':   h['source'],
             })
-        return ts_codes, articles
+        return ts_codes, self._dedupe_articles(articles, top_k=len(articles))
 
     # ─── Combined query interface ──────────────────────────────────────────
     def search(self, query: str, top_k: int = 8) -> dict:

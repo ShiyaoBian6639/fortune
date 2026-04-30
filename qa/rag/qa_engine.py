@@ -147,8 +147,11 @@ class QAEngine:
             messages, tokenize=False, add_generation_prompt=True)
         # Cap prompt length aggressively — KV-cache scales linearly with
         # seq_len. 4096 = ~1.5 GB cache headroom on 12 GB during gen.
+        # 6 K leaves comfortable headroom: Qwen 7B int4 weights ≈ 10 GB,
+        # 6 K KV cache @ fp16 ≈ 1.6 GB, +700 new tokens ≈ 0.2 GB,
+        # total ~12 GB. The lock keeps two requests from stacking.
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=4096).to(self.model.device)
+                                 truncation=True, max_length=6144).to(self.model.device)
         prompt_len = inputs['input_ids'].shape[1]
 
         with self._gpu_lock, self.torch.no_grad():
@@ -178,8 +181,11 @@ class QAEngine:
         messages = self._build_messages(question, context)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
+        # 6 K leaves comfortable headroom: Qwen 7B int4 weights ≈ 10 GB,
+        # 6 K KV cache @ fp16 ≈ 1.6 GB, +700 new tokens ≈ 0.2 GB,
+        # total ~12 GB. The lock keeps two requests from stacking.
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=4096).to(self.model.device)
+                                 truncation=True, max_length=6144).to(self.model.device)
 
         streamer = TextIteratorStreamer(self.tokenizer,
                                          skip_prompt=True,
@@ -215,7 +221,7 @@ class QAEngine:
              retriever: Retriever,
              builder: ContextBuilder,
              top_k: int = 5,
-             max_context_tokens: int = 3000) -> dict:
+             max_context_tokens: int = 4000) -> dict:
         out, context = self._retrieve_and_build(question, retriever, builder,
                                                   top_k, max_context_tokens)
         if not out['ts_codes'] and not out['articles']:
@@ -238,7 +244,7 @@ class QAEngine:
                     retriever: Retriever,
                     builder: ContextBuilder,
                     top_k: int = 5,
-                    max_context_tokens: int = 3000) -> Iterator[dict]:
+                    max_context_tokens: int = 4000) -> Iterator[dict]:
         """Yield events:
             {'event':'meta',  'ts_codes':..., 'n_articles':..., 'context_chars':...}
             {'event':'token', 'text': '...'}            (zero or more)

@@ -123,7 +123,7 @@ app = FastAPI(title='A-Share Q&A', version='0.1.0', lifespan=lifespan)
 class AskBody(BaseModel):
     query: str
     top_k: int = 5
-    max_context_tokens: int = 3000
+    max_context_tokens: int = 4000
 
 
 @app.get('/healthz')

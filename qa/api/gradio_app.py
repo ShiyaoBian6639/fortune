@@ -88,7 +88,11 @@ def main():
                             meta = payload
                         elif event_type == 'token':
                             buf += payload.get('text', '')
-                            yield buf + '\n\n*生成中…*'
+                            # Stream the partial answer as-is. Gradio
+                            # animates the chat bubble; an explicit
+                            # "生成中…" suffix would stick around as
+                            # garbage if the stream ends mid-line.
+                            yield buf
                         elif event_type == 'done':
                             elapsed = payload.get('elapsed_seconds', 0)
                             cached = payload.get('cached', False)
