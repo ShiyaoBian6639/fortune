@@ -63,7 +63,7 @@ def _latest_fina_snippet(ts_code: str) -> str:
     return ' / '.join(parts)
 
 
-def _build_card(rec: dict, fina_line: str) -> str:
+def _build_card(rec: dict, fina_line: str, tags: list | None = None) -> str:
     """Render the entity card. Keep ≤200 tokens for bge-m3 efficiency."""
     aliases = rec.get('aliases') or []
     parts = [
@@ -90,6 +90,8 @@ def _build_card(rec: dict, fina_line: str) -> str:
         parts.append('管理层: ' + ', '.join(leader_bits))
     if fina_line:
         parts.append("最新业绩: " + fina_line)
+    if tags:
+        parts.append("热门概念: " + ', '.join(tags))
     return ' | '.join(parts)
 
 
@@ -108,10 +110,23 @@ def main():
         aliases = json.load(f)
     print(f"[entity_idx] {len(aliases):,} stocks")
 
+    # News-derived concept tags (Phase 2 enrichment) — pin distinctive
+    # phrases like "钙钛矿" / "刀片电池" / "飞天" to the card so bge-m3
+    # can bridge market-jargon queries that don't match any structured
+    # entity field.
+    concept_tags: dict = {}
+    ct_path = QA_DIR / 'concept_tags.json'
+    if ct_path.exists():
+        with open(ct_path, 'r', encoding='utf-8') as f:
+            concept_tags = json.load(f)
+        n_with_tags = sum(1 for v in concept_tags.values() if v)
+        print(f"[entity_idx] concept_tags: {n_with_tags:,} ts_codes tagged")
+
     rows = []
     for ts, rec in aliases.items():
         fina = _latest_fina_snippet(ts)
-        card = _build_card(rec, fina)
+        tags = concept_tags.get(ts, [])
+        card = _build_card(rec, fina, tags=tags)
         rows.append({'ts_code': ts, 'name': rec.get('name', ''), 'card': card})
     df = pd.DataFrame(rows)
     print(f"[entity_idx] cards built: {len(df):,}")
