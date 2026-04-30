@@ -323,11 +323,13 @@ query now resolves to BYD (002594.SZ) and produces a comparison table.
 - **No auth.** Add Gradio basic auth before exposing publicly.
 - **`type='messages'` removed.** Gradio 6 uses messages format by default;
   the older arg name is no longer accepted.
-- **News dense index unused at query time.** `qa/build_news_index.py`
-  produces a 3.8 GB FAISS index, but the retriever currently goes
-  `query → ts_codes → news_linked.parquet` (filter, not embed). Wiring
-  the news index into the retriever for free-text "policy / event"
-  queries is open work.
+- **News index activates rarely.** `qa/build_news_index.py` produces an
+  8.5 GB FAISS index that the retriever lazy-loads as a third fallback
+  (alias → entity-semantic → news-semantic). In practice the
+  entity-semantic path matches almost every query first, even loosely-
+  related meta ones, so the news path rarely fires. Routing between
+  the two (e.g. detect "meta" queries by keyword and prefer news first)
+  is open work.
 
 ---
 
