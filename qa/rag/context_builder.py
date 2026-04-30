@@ -160,19 +160,20 @@ class ContextBuilder:
         out = ['### 相关新闻']
         if ts_codes:
             # Stock-specific: group by ts_code so the LLM can attribute
-            # each article to its company.
+            # each article to its company. Use bullets (not numbered)
+            # so the model picks its own numbering and starts at 1.
             for ts in ts_codes:
                 ts_articles = [a for a in articles if a['ts_code'] == ts][:max_per_code]
                 if not ts_articles: continue
                 out.append(f'**{ts}：**')
-                for i, a in enumerate(ts_articles, 1):
-                    out.append(f"{i}. {_render(a)}")
+                for a in ts_articles:
+                    out.append(f"- {_render(a)}")
         else:
             # Meta query (e.g. "美联储加息对A股的影响"): no specific
             # stock — render the articles flat so Qwen can synthesize
             # an answer directly from them.
-            for i, a in enumerate(articles[:max_per_code * 2], 1):
-                out.append(f"{i}. {_render(a)}")
+            for a in articles[:max_per_code * 2]:
+                out.append(f"- {_render(a)}")
         return '\n'.join(out) + '\n'
 
     # ─── Top-level interface ───────────────────────────────────────────────
