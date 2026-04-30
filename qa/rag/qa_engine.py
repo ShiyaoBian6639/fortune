@@ -145,7 +145,13 @@ class QAEngine:
         with self.torch.no_grad():
             out = self.model.generate(**self._gen_kwargs(inputs, max_new))
         new_tokens = out[0, prompt_len:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        # Release transient activation / KV-cache buffers — without this
+        # they linger and a series of long-context queries gradually
+        # squeezes out room for bge-m3 / future generations.
+        if self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+        return text
 
     def generate_stream(self, question: str, context: str,
                          max_new_tokens: int | None = None) -> Iterator[str]:
@@ -174,6 +180,8 @@ class QAEngine:
                     yield piece
         finally:
             thread.join()
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
 
     def _retrieve_and_build(self, question, retriever, builder,
                               top_k, max_context_tokens):

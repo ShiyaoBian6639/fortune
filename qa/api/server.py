@@ -99,6 +99,14 @@ async def lifespan(app: FastAPI):
                                        entity_meta='stock_data/qa/entities.parquet',
                                        news_index='stock_data/qa/news.faiss',
                                        news_meta='stock_data/qa/news_meta.parquet')
+    # Pre-warm bge-m3 (CPU by default) so the first semantic-fallback
+    # query doesn't pay the ~20 s model-load tax. Defaults to CPU to
+    # keep the 4070 Super's 12 GB VRAM clear for Qwen — set
+    # QA_EMBED_DEVICE=cuda only if you have ≥18 GB VRAM.
+    print("[api] pre-warming bge-m3 ...", flush=True)
+    _t0 = time.time()
+    _state['retriever']._ensure_embedder()
+    print(f"[api] bge-m3 ready in {time.time()-_t0:.1f}s", flush=True)
     _state['builder'] = ContextBuilder('stock_data/qa/aliases.json')
     _state['engine']  = QAEngine(model_id=app.state.model_id,
                                     quant=app.state.quant)

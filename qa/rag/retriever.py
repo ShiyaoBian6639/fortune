@@ -164,11 +164,24 @@ class Retriever:
 
     # ─── Semantic fallback (Phase 2) ───────────────────────────────────────
     def _ensure_embedder(self):
-        """Lazy-load bge-m3 only when the alias path fails — saves VRAM
-        for queries that resolve directly."""
+        """Lazy-load bge-m3 only when the alias path fails. Pinned to CPU
+        because the 4070 Super has only 12 GB VRAM — Qwen 4-bit alone
+        uses ~10 GB and adding bge-m3 (~2.5 GB) on the same device pushes
+        total over the limit, forcing CUDA to spill to system RAM and
+        slowing every subsequent query 10–100×.
+
+        CPU embed costs ~200–400 ms per single query (vs ~50 ms on GPU)
+        which is well below the Qwen generation budget — net no harm.
+        Override via ``QA_EMBED_DEVICE=cuda`` env var if you have ≥18 GB
+        VRAM (e.g. 5090) and want the speed.
+        """
         if self._embedder is None and self._entity_index is not None:
+            import os
             from qa.rag.embedder import BgeM3Embedder
-            self._embedder = BgeM3Embedder(max_length=256)
+            device = os.environ.get('QA_EMBED_DEVICE', 'cpu').lower()
+            self._embedder = BgeM3Embedder(
+                max_length=256, device=device, fp16=(device == 'cuda'),
+            )
         return self._embedder
 
     # Query-intent words that describe what the user wants, not which
