@@ -123,7 +123,7 @@ app = FastAPI(title='A-Share Q&A', version='0.1.0', lifespan=lifespan)
 class AskBody(BaseModel):
     query: str
     top_k: int = 5
-    max_context_tokens: int = 4000
+    max_context_tokens: int = 3200
 
 
 @app.get('/healthz')
@@ -133,23 +133,36 @@ def healthz():
 
 @app.get('/gpu_stats')
 def gpu_stats():
-    """Live VRAM snapshot. Use to diagnose spill-to-shared-memory:
-    if `allocated_gb` jumps above ~11 between requests on a 12 GB card
-    you're at risk; if `reserved_gb` exceeds total VRAM you've already
-    spilled. Each /ask call should leave allocated near the resident
-    weight footprint (~10 GB for Qwen 7B int4) when idle.
+    """Live VRAM snapshot. ``spilled`` is True if peak allocation has
+    ever exceeded physical VRAM — once that happens this run, CUDA
+    has fallen back to shared/system memory and inference is 10–100×
+    slower until the process restarts.
     """
     import torch
     if not torch.cuda.is_available():
         return {'cuda': False}
+    total = torch.cuda.get_device_properties(0).total_memory
+    peak = torch.cuda.max_memory_allocated()
     return {
-        'cuda':         True,
-        'device_name':  torch.cuda.get_device_name(0),
-        'allocated_gb': round(torch.cuda.memory_allocated()  / 1e9, 2),
-        'reserved_gb':  round(torch.cuda.memory_reserved()   / 1e9, 2),
-        'max_alloc_gb': round(torch.cuda.max_memory_allocated() / 1e9, 2),
-        'cache_hits':   len(_cache),
+        'cuda':          True,
+        'device_name':   torch.cuda.get_device_name(0),
+        'total_gb':      round(total / 1e9, 2),
+        'allocated_gb':  round(torch.cuda.memory_allocated() / 1e9, 2),
+        'reserved_gb':   round(torch.cuda.memory_reserved()  / 1e9, 2),
+        'max_alloc_gb':  round(peak / 1e9, 2),
+        'spilled':       peak > total * 0.97,
+        'cache_hits':    len(_cache),
     }
+
+
+@app.post('/gpu_reset_peak')
+def gpu_reset_peak():
+    """Clear torch.cuda.max_memory_allocated() so /gpu_stats peak
+    starts fresh — useful when verifying a fix without restarting."""
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    return {'ok': True}
 
 
 @app.get('/aliases')

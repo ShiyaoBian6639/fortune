@@ -100,8 +100,11 @@ class QAEngine:
         self._gpu_lock = threading.Lock()
 
         print(f"[qa] loading {model_id} (quant={quant}) ...", flush=True)
+        # Explicitly request PyTorch SDPA backend — memory-efficient
+        # attention that avoids materialising the full [heads, seq, seq]
+        # softmax tensor. Saves ~1–2 GB peak VRAM at 4 K seq on the 4070.
         kw = dict(torch_dtype=torch.bfloat16, device_map=device,
-                  trust_remote_code=True)
+                  trust_remote_code=True, attn_implementation='sdpa')
         if quant == '4bit':
             from transformers import BitsAndBytesConfig
             kw['quantization_config'] = BitsAndBytesConfig(
@@ -147,11 +150,13 @@ class QAEngine:
             messages, tokenize=False, add_generation_prompt=True)
         # Cap prompt length aggressively — KV-cache scales linearly with
         # seq_len. 4096 = ~1.5 GB cache headroom on 12 GB during gen.
-        # 6 K leaves comfortable headroom: Qwen 7B int4 weights ≈ 10 GB,
-        # 6 K KV cache @ fp16 ≈ 1.6 GB, +700 new tokens ≈ 0.2 GB,
-        # total ~12 GB. The lock keeps two requests from stacking.
+        # 4 K is the safe cap on a 12 GB card. The peak VRAM during the
+        # prompt forward pass is dominated by the attention softmax tensor
+        # — shape [heads, seq, seq] @ fp16 = 28 × 6144² × 2 ≈ 2.1 GB at
+        # 6 K but only ~0.9 GB at 4 K. SDPA shrinks this further but the
+        # cap is the safety net.
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=6144).to(self.model.device)
+                                 truncation=True, max_length=4096).to(self.model.device)
         prompt_len = inputs['input_ids'].shape[1]
 
         with self._gpu_lock, self.torch.no_grad():
@@ -181,11 +186,13 @@ class QAEngine:
         messages = self._build_messages(question, context)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        # 6 K leaves comfortable headroom: Qwen 7B int4 weights ≈ 10 GB,
-        # 6 K KV cache @ fp16 ≈ 1.6 GB, +700 new tokens ≈ 0.2 GB,
-        # total ~12 GB. The lock keeps two requests from stacking.
+        # 4 K is the safe cap on a 12 GB card. The peak VRAM during the
+        # prompt forward pass is dominated by the attention softmax tensor
+        # — shape [heads, seq, seq] @ fp16 = 28 × 6144² × 2 ≈ 2.1 GB at
+        # 6 K but only ~0.9 GB at 4 K. SDPA shrinks this further but the
+        # cap is the safety net.
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=6144).to(self.model.device)
+                                 truncation=True, max_length=4096).to(self.model.device)
 
         streamer = TextIteratorStreamer(self.tokenizer,
                                          skip_prompt=True,
@@ -221,7 +228,7 @@ class QAEngine:
              retriever: Retriever,
              builder: ContextBuilder,
              top_k: int = 5,
-             max_context_tokens: int = 4000) -> dict:
+             max_context_tokens: int = 3200) -> dict:
         out, context = self._retrieve_and_build(question, retriever, builder,
                                                   top_k, max_context_tokens)
         if not out['ts_codes'] and not out['articles']:
@@ -244,7 +251,7 @@ class QAEngine:
                     retriever: Retriever,
                     builder: ContextBuilder,
                     top_k: int = 5,
-                    max_context_tokens: int = 4000) -> Iterator[dict]:
+                    max_context_tokens: int = 3200) -> Iterator[dict]:
         """Yield events:
             {'event':'meta',  'ts_codes':..., 'n_articles':..., 'context_chars':...}
             {'event':'token', 'text': '...'}            (zero or more)
