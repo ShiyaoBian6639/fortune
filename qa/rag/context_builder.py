@@ -149,17 +149,30 @@ class ContextBuilder:
                    max_per_code: int = 5) -> str:
         if not articles:
             return '### 相关新闻\n(无)\n'
-        # Group by ts_code
+
+        def _render(a: dict) -> str:
+            d = a['datetime'].strftime('%Y-%m-%d') \
+                if hasattr(a['datetime'], 'strftime') else str(a['datetime'])[:10]
+            title = (a.get('title') or '').strip() or '(无标题)'
+            snip  = (a.get('content') or '').strip()[:200]
+            return f"[{d}] [{a.get('source','')}] **{title}**\n   {snip}"
+
         out = ['### 相关新闻']
-        for ts in ts_codes:
-            ts_articles = [a for a in articles if a['ts_code'] == ts][:max_per_code]
-            if not ts_articles: continue
-            out.append(f'**{ts}：**')
-            for i, a in enumerate(ts_articles, 1):
-                d = a['datetime'].strftime('%Y-%m-%d') if hasattr(a['datetime'], 'strftime') else str(a['datetime'])[:10]
-                title = (a.get('title') or '').strip() or '(无标题)'
-                snip  = (a.get('content') or '').strip()[:200]
-                out.append(f"{i}. [{d}] [{a.get('source','')}] **{title}**\n   {snip}")
+        if ts_codes:
+            # Stock-specific: group by ts_code so the LLM can attribute
+            # each article to its company.
+            for ts in ts_codes:
+                ts_articles = [a for a in articles if a['ts_code'] == ts][:max_per_code]
+                if not ts_articles: continue
+                out.append(f'**{ts}：**')
+                for i, a in enumerate(ts_articles, 1):
+                    out.append(f"{i}. {_render(a)}")
+        else:
+            # Meta query (e.g. "美联储加息对A股的影响"): no specific
+            # stock — render the articles flat so Qwen can synthesize
+            # an answer directly from them.
+            for i, a in enumerate(articles[:max_per_code * 2], 1):
+                out.append(f"{i}. {_render(a)}")
         return '\n'.join(out) + '\n'
 
     # ─── Top-level interface ───────────────────────────────────────────────

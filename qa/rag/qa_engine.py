@@ -136,8 +136,13 @@ class QAEngine:
         out = retriever.search(question, top_k=top_k)
         context = builder.build_for(out['ts_codes'], out['articles'],
                                       max_tokens=max_context_tokens)
-        if not out['ts_codes']:
-            answer = "未能在问题中识别出A股代码或股票名称。请提供 ts_code 或公司名称。"
+        # Only short-circuit when we have neither a ts_code nor any
+        # articles — meta queries that resolve via news-semantic have
+        # ts_codes=[] but plenty of relevant article content for Qwen
+        # to answer from.
+        if not out['ts_codes'] and not out['articles']:
+            answer = ("未能识别出问题相关的A股或新闻。请尝试包含股票代码、"
+                       "公司名称或具体行业关键词。")
         else:
             t0 = time.time()
             answer = self.generate(question, context)
