@@ -66,7 +66,9 @@ async def lifespan(app: FastAPI):
     _state['retriever'] = Retriever('stock_data/qa/aliases.json',
                                        'stock_data/qa/news_linked.parquet',
                                        entity_index='stock_data/qa/entities.faiss',
-                                       entity_meta='stock_data/qa/entities.parquet')
+                                       entity_meta='stock_data/qa/entities.parquet',
+                                       news_index='stock_data/qa/news.faiss',
+                                       news_meta='stock_data/qa/news_meta.parquet')
     _state['builder'] = ContextBuilder('stock_data/qa/aliases.json')
     _state['engine']  = QAEngine(model_id=app.state.model_id,
                                     quant=app.state.quant)

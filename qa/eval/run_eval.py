@@ -126,7 +126,9 @@ def main():
     r  = Retriever('stock_data/qa/aliases.json',
                     'stock_data/qa/news_linked.parquet',
                     entity_index='stock_data/qa/entities.faiss',
-                    entity_meta='stock_data/qa/entities.parquet')
+                    entity_meta='stock_data/qa/entities.parquet',
+                    news_index='stock_data/qa/news.faiss',
+                    news_meta='stock_data/qa/news_meta.parquet')
     cb = ContextBuilder('stock_data/qa/aliases.json')
     qa = QAEngine(model_id=args.model, quant=args.quant)
 

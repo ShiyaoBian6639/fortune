@@ -36,8 +36,11 @@ class Retriever:
                  news_linked_parquet: str | Path,
                  entity_index: str | Path | None = None,
                  entity_meta:  str | Path | None = None,
+                 news_index:   str | Path | None = None,
+                 news_meta:    str | Path | None = None,
                  semantic_top_k: int = 3,
-                 semantic_min_score: float = 0.40):
+                 semantic_min_score: float = 0.40,
+                 news_semantic_min_score: float = 0.50):
         with open(aliases_json, 'r', encoding='utf-8') as f:
             self._aliases = json.load(f)        # ts_code → entry
         # Reverse maps for entity resolution
@@ -90,6 +93,25 @@ class Retriever:
                       flush=True)
                 self._entity_index = None
                 self._entity_meta  = None
+
+        # News semantic index — lazy-loaded on first use because it's
+        # 8.5 GB. Path stored at init; index read on first call.
+        self._news_index_path  = Path(news_index) if news_index else None
+        self._news_meta_path   = Path(news_meta)  if news_meta  else None
+        self._news_index       = None
+        self._news_meta        = None
+        self._news_semantic_min_score = news_semantic_min_score
+        if self._news_index_path and not self._news_index_path.exists():
+            print(f"[retriever] news index path missing: {self._news_index_path}",
+                  flush=True)
+            self._news_index_path = None
+        if self._news_meta_path  and not self._news_meta_path.exists():
+            print(f"[retriever] news meta path missing: {self._news_meta_path}",
+                  flush=True)
+            self._news_meta_path = None
+        if self._news_index_path and self._news_meta_path:
+            print(f"[retriever] news index path registered "
+                  f"(lazy-loaded on first use)", flush=True)
 
     # ─── Entity resolution ─────────────────────────────────────────────────
     def resolve_entities(self, query: str) -> List[str]:
@@ -206,6 +228,75 @@ class Retriever:
         cands.sort(key=lambda x: -x[1])
         return [ts for ts, _, _, _ in cands[: self._semantic_top_k]]
 
+    def _ensure_news_index(self):
+        """Lazy-load the 8.5 GB news.faiss + meta only on first use."""
+        if self._news_index is not None:
+            return
+        if not (self._news_index_path and self._news_meta_path):
+            return
+        import faiss
+        print(f"[retriever] loading news index "
+              f"{self._news_index_path} (8+ GB)...", flush=True)
+        self._news_index = faiss.read_index(str(self._news_index_path))
+        self._news_meta  = pd.read_parquet(self._news_meta_path)
+        print(f"[retriever] news index loaded "
+              f"({self._news_index.ntotal:,} vectors)", flush=True)
+
+    def semantic_news_search(self, query: str, top_k: int = 8,
+                              ts_filter: List[str] | None = None) -> List[dict]:
+        """Free-text article search over the news FAISS index.
+
+        Used as a third fallback when neither alias nor entity-card
+        semantic resolution finds a stock — typical for meta queries
+        ("美联储加息对A股的影响", "光伏行业最近的政策利好") whose answer
+        lives in articles, not in a single ticker.
+
+        ``ts_filter`` (optional) restricts results to articles tagged
+        with at least one of the given ts_codes via news_linked.parquet.
+        """
+        if self._news_index is None:
+            self._ensure_news_index()
+        if self._news_index is None:
+            return []
+        emb = self._ensure_embedder()
+        if emb is None:
+            return []
+        import numpy as np
+        q_text = self._normalise_for_embed(query)
+        q = emb.encode([q_text], batch_size=1)
+        # Pull a wider pool, filter, then trim.
+        pool_k = top_k * (8 if ts_filter else 3)
+        scores, idx = self._news_index.search(q.astype(np.float32), k=pool_k)
+        hits: List[dict] = []
+        for s, i in zip(scores[0].tolist(), idx[0].tolist()):
+            if i < 0 or s < self._news_semantic_min_score:
+                continue
+            row = self._news_meta.iloc[i]
+            hits.append({
+                'idx':      int(i),
+                'score':    float(s),
+                'datetime': row.get('datetime'),
+                'title':    str(row.get('title') or ''),
+                'source':   str(row.get('source') or ''),
+                'content_hash': row.get('content_hash'),
+            })
+        # Attach ts_codes by cross-referencing news_linked.parquet via
+        # content_hash (same key used to build news_meta). Articles in
+        # news.faiss but absent from news_linked.parquet are unlinked
+        # (no Aho-Corasick or dense match) — those will have ts_codes=[].
+        if hits and 'content_hash' in self._news_by_code.columns:
+            hashes = {h['content_hash'] for h in hits if h['content_hash']}
+            sub = self._news_by_code[self._news_by_code['content_hash'].isin(hashes)]
+            hash_to_ts = sub.groupby('content_hash')['ts_code'].apply(list).to_dict()
+            for h in hits:
+                h['ts_codes'] = hash_to_ts.get(h['content_hash'], [])
+        else:
+            for h in hits: h['ts_codes'] = []
+        if ts_filter:
+            ts_set = set(ts_filter)
+            hits = [h for h in hits if any(t in ts_set for t in h.get('ts_codes', []))]
+        return hits[:top_k]
+
     # ─── News retrieval ────────────────────────────────────────────────────
     def news_for(self, ts_code: str, top_k: int = 8) -> List[dict]:
         """Most recent top_k linked-news articles for a single ts_code."""
@@ -228,16 +319,45 @@ class Retriever:
     def search(self, query: str, top_k: int = 8) -> dict:
         ts_codes = self.resolve_entities(query)
         used_semantic = False
+        used_news_semantic = False
+
         if not ts_codes:
             sem = self.semantic_resolve(query)
             if sem:
                 ts_codes = sem
                 used_semantic = True
-        articles = []
-        for ts in ts_codes:
-            articles.extend(self.news_for(ts, top_k=top_k))
+
+        articles: List[dict] = []
+
+        if ts_codes:
+            for ts in ts_codes:
+                articles.extend(self.news_for(ts, top_k=top_k))
+        else:
+            # Final fallback: free-text article search. Pick the most
+            # frequent ts_code across the matched articles as the
+            # resolved entity (so context_builder still has fundamentals
+            # to render); if none of the matched articles are linked to
+            # any ts_code, we return articles only and the engine will
+            # answer directly from the news snippets.
+            news_hits = self.semantic_news_search(query, top_k=top_k)
+            if news_hits:
+                used_news_semantic = True
+                from collections import Counter
+                tally = Counter(t for h in news_hits for t in h.get('ts_codes', []))
+                ts_codes = [ts for ts, _ in tally.most_common(self._semantic_top_k)]
+                # Convert hits to the article schema used downstream.
+                for h in news_hits:
+                    articles.append({
+                        'ts_code':  (h['ts_codes'][0] if h.get('ts_codes') else ''),
+                        'datetime': h['datetime'],
+                        'title':    h['title'],
+                        'content':  '',  # snippet not stored in news_meta — title carries the signal
+                        'source':   h['source'],
+                    })
+
         return {'ts_codes': ts_codes, 'articles': articles,
-                'used_semantic': used_semantic}
+                'used_semantic': used_semantic,
+                'used_news_semantic': used_news_semantic}
 
 
 def _self_test():
