@@ -100,11 +100,12 @@ class QAEngine:
         self._gpu_lock = threading.Lock()
 
         print(f"[qa] loading {model_id} (quant={quant}) ...", flush=True)
-        # Explicitly request PyTorch SDPA backend — memory-efficient
-        # attention that avoids materialising the full [heads, seq, seq]
-        # softmax tensor. Saves ~1–2 GB peak VRAM at 4 K seq on the 4070.
         kw = dict(torch_dtype=torch.bfloat16, device_map=device,
-                  trust_remote_code=True, attn_implementation='sdpa')
+                  trust_remote_code=True)
+        # NOTE: attn_implementation='sdpa' was tried here for memory
+        # efficiency, but it silently hung generate() on the bnb 4-bit
+        # Qwen 7B build (model loaded, GPU utilisation stayed at 0 %,
+        # /ask never returned). Leaving it as default.
         if quant == '4bit':
             from transformers import BitsAndBytesConfig
             kw['quantization_config'] = BitsAndBytesConfig(
