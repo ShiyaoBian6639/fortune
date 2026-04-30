@@ -129,23 +129,18 @@ def main():
         cands_per_art,
     ):
         true_set = set(true_codes)
-        # Positive: each true ts_code that ALSO appears in the dense top-K
-        # gets the dense_cos from there; if it didn't make top-K we fall
-        # back to dense_cos=0 (rare; means even the entity card didn't
-        # match the article — useful negative signal).
-        cand_score = {ts: c for ts, c in cands}
-        for ts in true_codes:
-            cos = cand_score.get(ts, 0.0)
-            X.append(_features(art_text, title, ts, cos, ts_aliases))
-            y.append(1)
-        # Negatives: dense candidates NOT in the true set
-        n_neg_added = 0
+        # Reranker scope: only candidates the dense layer actually
+        # surfaced. Positives outside dense top-K are out-of-scope
+        # (the reranker can't help recover them) and must NOT be added
+        # — otherwise we contaminate the cos distribution with cos=0
+        # positives and the model learns the wrong sign on cosine.
         for ts, cos in cands:
-            if ts in true_set: continue
-            X.append(_features(art_text, title, ts, cos, ts_aliases))
-            y.append(0)
-            n_neg_added += 1
-            if n_neg_added >= 5: break    # cap negatives per article
+            if ts in true_set:
+                X.append(_features(art_text, title, ts, cos, ts_aliases))
+                y.append(1)
+            else:
+                X.append(_features(art_text, title, ts, cos, ts_aliases))
+                y.append(0)
 
     X = np.array(X, dtype=np.float32)
     y = np.array(y, dtype=np.int32)
