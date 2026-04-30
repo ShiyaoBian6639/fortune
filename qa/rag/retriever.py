@@ -181,6 +181,35 @@ class Retriever:
         r'业绩|新闻|对比|比较|强|弱|好|差)'
     )
 
+    # Routing keywords: detect whether the query is asking about *events
+    # in the news* (news-flavored) or about *which stocks fit a category*
+    # (entity-flavored). Used to pick which semantic index to consult
+    # first when alias resolution fails.
+    _NEWS_KEYWORDS = re.compile(
+        r'(新闻|消息|动态|事件|进展|公告|政策|监管|调控|加息|降息|'
+        r'利好|利空|影响|冲击|风波|突发|曝光|爆雷|暴涨|暴跌|'
+        r'涨停|跌停|解禁|增持|减持|回购|分红|业绩预告|快报|'
+        r'走势|行情|数据|报告|发布)'
+    )
+    _ENTITY_KEYWORDS = re.compile(
+        r'(龙头|板块|行业|概念|赛道|个股|标的|是谁|是哪|代表|'
+        r'排名|前十|top|前几|领头|主流|核心|主要)',
+        re.IGNORECASE,
+    )
+
+    def _query_flavor(self, query: str) -> str:
+        """Return 'news' | 'entity' | 'neutral'.
+
+        - 'news'   : at least one news keyword AND no entity keyword
+        - 'entity' : at least one entity keyword AND no news keyword
+        - 'neutral': both or neither (default to current order)
+        """
+        has_news   = bool(self._NEWS_KEYWORDS.search(query))
+        has_entity = bool(self._ENTITY_KEYWORDS.search(query))
+        if has_news and not has_entity: return 'news'
+        if has_entity and not has_news: return 'entity'
+        return 'neutral'
+
     def _normalise_for_embed(self, query: str) -> str:
         s = self._INTENT_STOP.sub(' ', query)
         s = re.sub(r'[ ，,。.？?！!、；;：:\s]+', ' ', s).strip()
@@ -315,49 +344,79 @@ class Retriever:
             })
         return out
 
+    def _articles_from_news_hits(self, news_hits: List[dict]) -> tuple[List[str], List[dict]]:
+        """Convert semantic_news_search hits into (ts_codes, articles)."""
+        from collections import Counter
+        tally = Counter(t for h in news_hits for t in h.get('ts_codes', []))
+        ts_codes = [ts for ts, _ in tally.most_common(self._semantic_top_k)]
+        articles: List[dict] = []
+        for h in news_hits:
+            articles.append({
+                'ts_code':  (h['ts_codes'][0] if h.get('ts_codes') else ''),
+                'datetime': h['datetime'],
+                'title':    h['title'],
+                'content':  '',
+                'source':   h['source'],
+            })
+        return ts_codes, articles
+
     # ─── Combined query interface ──────────────────────────────────────────
     def search(self, query: str, top_k: int = 8) -> dict:
+        """Resolve query → (ts_codes, articles).
+
+        Resolution order:
+          1. Lexical alias resolution (always first; cheap + precise).
+          2. If empty, route by query flavor:
+             - 'news'   : try semantic_news_search first, fall back to
+                          semantic_resolve (entity index).
+             - 'entity' : try semantic_resolve first, fall back to
+                          semantic_news_search.
+             - 'neutral': default to entity first (legacy behavior).
+        """
         ts_codes = self.resolve_entities(query)
         used_semantic = False
         used_news_semantic = False
+        flavor = 'lexical'
 
         if not ts_codes:
-            sem = self.semantic_resolve(query)
-            if sem:
-                ts_codes = sem
-                used_semantic = True
+            flavor = self._query_flavor(query)
+            if flavor == 'news':
+                # Prefer the news index — query is about an event.
+                news_hits = self.semantic_news_search(query, top_k=top_k)
+                if news_hits:
+                    ts_codes, news_articles = self._articles_from_news_hits(news_hits)
+                    used_news_semantic = True
+                else:
+                    sem = self.semantic_resolve(query)
+                    if sem:
+                        ts_codes = sem
+                        used_semantic = True
+            else:
+                # 'entity' or 'neutral' → entity index first.
+                sem = self.semantic_resolve(query)
+                if sem:
+                    ts_codes = sem
+                    used_semantic = True
+                else:
+                    news_hits = self.semantic_news_search(query, top_k=top_k)
+                    if news_hits:
+                        ts_codes, news_articles = self._articles_from_news_hits(news_hits)
+                        used_news_semantic = True
 
+        # Build the articles payload. If we used the news path, those
+        # articles already carry the matched titles; otherwise pull
+        # recent news per ts_code from the linked corpus.
         articles: List[dict] = []
-
-        if ts_codes:
+        if used_news_semantic:
+            articles = news_articles  # noqa: F821 — assigned in branch above
+        else:
             for ts in ts_codes:
                 articles.extend(self.news_for(ts, top_k=top_k))
-        else:
-            # Final fallback: free-text article search. Pick the most
-            # frequent ts_code across the matched articles as the
-            # resolved entity (so context_builder still has fundamentals
-            # to render); if none of the matched articles are linked to
-            # any ts_code, we return articles only and the engine will
-            # answer directly from the news snippets.
-            news_hits = self.semantic_news_search(query, top_k=top_k)
-            if news_hits:
-                used_news_semantic = True
-                from collections import Counter
-                tally = Counter(t for h in news_hits for t in h.get('ts_codes', []))
-                ts_codes = [ts for ts, _ in tally.most_common(self._semantic_top_k)]
-                # Convert hits to the article schema used downstream.
-                for h in news_hits:
-                    articles.append({
-                        'ts_code':  (h['ts_codes'][0] if h.get('ts_codes') else ''),
-                        'datetime': h['datetime'],
-                        'title':    h['title'],
-                        'content':  '',  # snippet not stored in news_meta — title carries the signal
-                        'source':   h['source'],
-                    })
 
         return {'ts_codes': ts_codes, 'articles': articles,
                 'used_semantic': used_semantic,
-                'used_news_semantic': used_news_semantic}
+                'used_news_semantic': used_news_semantic,
+                'flavor': flavor}
 
 
 def _self_test():
