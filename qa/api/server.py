@@ -64,7 +64,9 @@ _state = {}
 async def lifespan(app: FastAPI):
     print("[api] initialising QA engine...", flush=True)
     _state['retriever'] = Retriever('stock_data/qa/aliases.json',
-                                       'stock_data/qa/news_linked.parquet')
+                                       'stock_data/qa/news_linked.parquet',
+                                       entity_index='stock_data/qa/entities.faiss',
+                                       entity_meta='stock_data/qa/entities.parquet')
     _state['builder'] = ContextBuilder('stock_data/qa/aliases.json')
     _state['engine']  = QAEngine(model_id=app.state.model_id,
                                     quant=app.state.quant)

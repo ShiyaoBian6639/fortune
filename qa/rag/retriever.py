@@ -33,7 +33,11 @@ FULL_TS_RE = re.compile(r'\b([036]\d{5})\.(SH|SZ)\b', re.I)
 
 class Retriever:
     def __init__(self, aliases_json: str | Path,
-                 news_linked_parquet: str | Path):
+                 news_linked_parquet: str | Path,
+                 entity_index: str | Path | None = None,
+                 entity_meta:  str | Path | None = None,
+                 semantic_top_k: int = 3,
+                 semantic_min_score: float = 0.40):
         with open(aliases_json, 'r', encoding='utf-8') as f:
             self._aliases = json.load(f)        # ts_code → entry
         # Reverse maps for entity resolution
@@ -56,9 +60,36 @@ class Retriever:
         self._news_by_code = flat
         # Per-ts_code index for O(1) lookup
         self._news_by_code_groups = flat.groupby('ts_code', sort=False)
+        # Prominence prior: log(news_count) per ts_code. Used by the
+        # semantic fallback to break dense ties — 龙头 stocks have orders
+        # of magnitude more press than no-name peers in the same sector.
+        nc = flat['ts_code'].value_counts()
+        import numpy as _np
+        self._news_count = nc.to_dict()
+        self._news_count_max_log = float(_np.log1p(nc.iloc[0])) if len(nc) else 1.0
         print(f"[retriever] {len(df):,} linked articles  "
               f"covering {flat['ts_code'].nunique():,} ts_codes",
               flush=True)
+
+        # Optional dense semantic fallback (Phase 2)
+        self._entity_index = None
+        self._entity_meta  = None
+        self._embedder     = None
+        self._semantic_top_k    = semantic_top_k
+        self._semantic_min_score = semantic_min_score
+        if entity_index and Path(entity_index).exists() \
+           and entity_meta and Path(entity_meta).exists():
+            try:
+                import faiss
+                self._entity_index = faiss.read_index(str(entity_index))
+                self._entity_meta  = pd.read_parquet(entity_meta)
+                print(f"[retriever] entity index loaded "
+                      f"({self._entity_index.ntotal:,} vectors)", flush=True)
+            except Exception as e:
+                print(f"[retriever] could not load entity index: {e}",
+                      flush=True)
+                self._entity_index = None
+                self._entity_meta  = None
 
     # ─── Entity resolution ─────────────────────────────────────────────────
     def resolve_entities(self, query: str) -> List[str]:
@@ -109,6 +140,72 @@ class Retriever:
                     masked[i] = '\x00'
         return out
 
+    # ─── Semantic fallback (Phase 2) ───────────────────────────────────────
+    def _ensure_embedder(self):
+        """Lazy-load bge-m3 only when the alias path fails — saves VRAM
+        for queries that resolve directly."""
+        if self._embedder is None and self._entity_index is not None:
+            from qa.rag.embedder import BgeM3Embedder
+            self._embedder = BgeM3Embedder(max_length=256)
+        return self._embedder
+
+    # Query-intent words that describe what the user wants, not which
+    # entity they want. Leaving them in causes bge-m3 to match literal
+    # strings ("龙头" → "龙头股份" textile co.) instead of the sector.
+    _INTENT_STOP = re.compile(
+        r'(板块|龙头股票|龙头股|龙头|代表公司|代表企业|代表股|龙头企业|'
+        r'股票|股价|股份|公司|企业|个股|概念股|概念|行业|赛道|领涨|领跌|'
+        r'最近|今天|近期|最新|怎么样|如何|是谁|是哪些|有哪些|有什么|'
+        r'业绩|新闻|对比|比较|强|弱|好|差)'
+    )
+
+    def _normalise_for_embed(self, query: str) -> str:
+        s = self._INTENT_STOP.sub(' ', query)
+        s = re.sub(r'[ ，,。.？?！!、；;：:\s]+', ' ', s).strip()
+        return s or query   # never embed an empty string
+
+    def semantic_resolve(self, query: str) -> List[str]:
+        """Dense top-K from the entity index, then rerank by news prominence.
+
+        Pure cosine on entity cards picks up token-level matches (e.g.
+        "新能源" in any com_name, "龙头" matching "龙头股份") rather
+        than industry leaders. We retrieve a wider top-K, then add a
+        log-news-count prior so well-covered names (龙头 stocks have
+        10×–1000× more press) bubble up.
+
+        Final score:  cos + 0.10 · (log1p(news_count) / log1p(max_count))
+
+        Cosine still dominates — the prior is a tie-breaker, not a
+        replacement.
+        """
+        if self._entity_index is None or self._entity_meta is None:
+            return []
+        emb = self._ensure_embedder()
+        if emb is None:
+            return []
+        import numpy as np
+        q_text = self._normalise_for_embed(query)
+        q = emb.encode([q_text], batch_size=1)
+        # Wide initial pool — 龙头 stocks often have weaker raw cosine
+        # than literal-name matches and need the prominence prior to
+        # surface. 50 candidates ≈ 1 % of universe, cheap to score.
+        pool_k = max(self._semantic_top_k * 16, 50)
+        scores, idx = self._entity_index.search(q.astype(np.float32),
+                                                 k=pool_k)
+        cands: List[tuple] = []
+        for s, i in zip(scores[0].tolist(), idx[0].tolist()):
+            if i < 0 or s < self._semantic_min_score:
+                continue
+            ts = self._entity_meta.iloc[i]['ts_code']
+            news_n = self._news_count.get(ts, 0)
+            prior = float(np.log1p(news_n) / max(self._news_count_max_log, 1e-9))
+            # Prior weight 0.25: enough to flip a 0.55-cos noname under
+            # a 0.45-cos 龙头 (which has 100×–1000× more news coverage).
+            final = float(s) + 0.25 * prior
+            cands.append((ts, final, float(s), news_n))
+        cands.sort(key=lambda x: -x[1])
+        return [ts for ts, _, _, _ in cands[: self._semantic_top_k]]
+
     # ─── News retrieval ────────────────────────────────────────────────────
     def news_for(self, ts_code: str, top_k: int = 8) -> List[dict]:
         """Most recent top_k linked-news articles for a single ts_code."""
@@ -130,10 +227,17 @@ class Retriever:
     # ─── Combined query interface ──────────────────────────────────────────
     def search(self, query: str, top_k: int = 8) -> dict:
         ts_codes = self.resolve_entities(query)
+        used_semantic = False
+        if not ts_codes:
+            sem = self.semantic_resolve(query)
+            if sem:
+                ts_codes = sem
+                used_semantic = True
         articles = []
         for ts in ts_codes:
             articles.extend(self.news_for(ts, top_k=top_k))
-        return {'ts_codes': ts_codes, 'articles': articles}
+        return {'ts_codes': ts_codes, 'articles': articles,
+                'used_semantic': used_semantic}
 
 
 def _self_test():

@@ -124,7 +124,9 @@ def main():
     args = p.parse_args()
 
     r  = Retriever('stock_data/qa/aliases.json',
-                    'stock_data/qa/news_linked.parquet')
+                    'stock_data/qa/news_linked.parquet',
+                    entity_index='stock_data/qa/entities.faiss',
+                    entity_meta='stock_data/qa/entities.parquet')
     cb = ContextBuilder('stock_data/qa/aliases.json')
     qa = QAEngine(model_id=args.model, quant=args.quant)
 
