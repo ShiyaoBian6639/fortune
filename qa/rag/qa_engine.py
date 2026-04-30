@@ -85,12 +85,19 @@ class QAEngine:
                  quant: str = '4bit',           # '4bit' for 4070, 'none' for 5090
                  max_new_tokens: int = 600,
                  temperature: float = 0.3):
+        import threading
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
         self.torch = torch
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # Serialise GPU access. FastAPI runs sync handlers in a threadpool;
+        # without this lock two near-simultaneous /ask calls each spawn a
+        # model.generate, doubling the KV-cache and OOM-ing 12 GB cards.
+        # The lock is ALSO held across streaming generation so the second
+        # request waits for the first to finish before touching the GPU.
+        self._gpu_lock = threading.Lock()
 
         print(f"[qa] loading {model_id} (quant={quant}) ...", flush=True)
         kw = dict(torch_dtype=torch.bfloat16, device_map=device,
@@ -138,25 +145,33 @@ class QAEngine:
         messages = self._build_messages(question, context)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
+        # Cap prompt length aggressively — KV-cache scales linearly with
+        # seq_len. 4096 = ~1.5 GB cache headroom on 12 GB during gen.
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=8192).to(self.model.device)
+                                 truncation=True, max_length=4096).to(self.model.device)
         prompt_len = inputs['input_ids'].shape[1]
 
-        with self.torch.no_grad():
-            out = self.model.generate(**self._gen_kwargs(inputs, max_new))
-        new_tokens = out[0, prompt_len:]
-        text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        # Release transient activation / KV-cache buffers — without this
-        # they linger and a series of long-context queries gradually
-        # squeezes out room for bge-m3 / future generations.
-        if self.torch.cuda.is_available():
-            self.torch.cuda.empty_cache()
+        with self._gpu_lock, self.torch.no_grad():
+            try:
+                out = self.model.generate(**self._gen_kwargs(inputs, max_new))
+                new_tokens = out[0, prompt_len:]
+                text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            finally:
+                # Release transient activation / KV-cache buffers — without
+                # this they linger and a series of long-context queries
+                # gradually squeezes out room for future generations.
+                if self.torch.cuda.is_available():
+                    self.torch.cuda.empty_cache()
         return text
 
     def generate_stream(self, question: str, context: str,
                          max_new_tokens: int | None = None) -> Iterator[str]:
         """Yield decoded text chunks as they're generated. Drops perceived
         latency from ~15-20 s to <1 s for first tokens.
+
+        The GPU lock is held for the duration of generation — concurrent
+        callers wait. This prevents two streams from both being in-flight
+        on the GPU at once (which doubles KV-cache and OOMs 12 GB).
         """
         from transformers import TextIteratorStreamer
         max_new = max_new_tokens or self.max_new_tokens
@@ -164,7 +179,7 @@ class QAEngine:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=8192).to(self.model.device)
+                                 truncation=True, max_length=4096).to(self.model.device)
 
         streamer = TextIteratorStreamer(self.tokenizer,
                                          skip_prompt=True,
@@ -172,16 +187,22 @@ class QAEngine:
         kwargs = self._gen_kwargs(inputs, max_new)
         kwargs['streamer'] = streamer
 
-        thread = Thread(target=self.model.generate, kwargs=kwargs)
-        thread.start()
-        try:
-            for piece in streamer:
-                if piece:
-                    yield piece
-        finally:
-            thread.join()
-            if self.torch.cuda.is_available():
-                self.torch.cuda.empty_cache()
+        with self._gpu_lock:
+            thread = Thread(target=self.model.generate, kwargs=kwargs)
+            thread.start()
+            try:
+                for piece in streamer:
+                    if piece:
+                        yield piece
+            finally:
+                # Drain any remaining tokens then join — never leak the
+                # background generate thread, otherwise the next request
+                # holds the lock forever.
+                for _ in streamer:
+                    pass
+                thread.join()
+                if self.torch.cuda.is_available():
+                    self.torch.cuda.empty_cache()
 
     def _retrieve_and_build(self, question, retriever, builder,
                               top_k, max_context_tokens):

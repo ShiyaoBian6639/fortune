@@ -131,6 +131,27 @@ def healthz():
     return {'status': 'ok' if 'engine' in _state else 'starting'}
 
 
+@app.get('/gpu_stats')
+def gpu_stats():
+    """Live VRAM snapshot. Use to diagnose spill-to-shared-memory:
+    if `allocated_gb` jumps above ~11 between requests on a 12 GB card
+    you're at risk; if `reserved_gb` exceeds total VRAM you've already
+    spilled. Each /ask call should leave allocated near the resident
+    weight footprint (~10 GB for Qwen 7B int4) when idle.
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return {'cuda': False}
+    return {
+        'cuda':         True,
+        'device_name':  torch.cuda.get_device_name(0),
+        'allocated_gb': round(torch.cuda.memory_allocated()  / 1e9, 2),
+        'reserved_gb':  round(torch.cuda.memory_reserved()   / 1e9, 2),
+        'max_alloc_gb': round(torch.cuda.max_memory_allocated() / 1e9, 2),
+        'cache_hits':   len(_cache),
+    }
+
+
 @app.get('/aliases')
 def aliases(prefix: Optional[str] = None, limit: int = 50):
     out = []
