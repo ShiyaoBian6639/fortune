@@ -50,31 +50,63 @@ def main():
     import re as _re
     _TS_CODE_RE = _re.compile(r'^\d{6}\.(SH|SZ)$', _re.IGNORECASE)
 
-    def ask_qa(question, history, ts_filter):
-        # Only prepend when the dropdown actually holds a parseable ts_code
-        # (e.g. "600519.SH  贵州茅台"). With allow_custom_value=True the
-        # field can also contain free-form filter text the user typed; we
-        # ignore those — they shouldn't redirect the question to a stock.
+    def _maybe_prepend_ts(question, ts_filter):
         if ts_filter and isinstance(ts_filter, str) and ts_filter.strip():
             ts = ts_filter.strip().split()[0]
             if _TS_CODE_RE.match(ts) and ts not in question:
-                question = f"{ts} {question}"
+                return f"{ts} {question}"
+        return question
+
+    def ask_qa_stream(question, ts_filter):
+        """Generator that yields the partial assistant message as tokens
+        arrive over SSE. Runs against /ask_stream on the FastAPI server.
+        """
+        question = _maybe_prepend_ts(question, ts_filter)
         try:
-            r = requests.post(f"{args.api}/ask",
-                               json={'query': question, 'top_k': 5},
-                               timeout=120)
-            r.raise_for_status()
-            data = r.json()
-            answer = data.get('answer', '(no answer)')
-            ts_codes = data.get('ts_codes', [])
-            n_arts = data.get('n_articles', 0)
-            elapsed = data.get('elapsed_seconds', 0)
-            footer = (f"\n\n---\n*resolved: {ts_codes}　"
-                      f"articles: {n_arts}　"
-                      f"latency: {elapsed:.1f}s*")
-            return answer + footer
+            with requests.post(f"{args.api}/ask_stream",
+                                json={'query': question, 'top_k': 5},
+                                stream=True, timeout=180) as r:
+                r.raise_for_status()
+                meta = {}
+                buf = ''
+                event_type = None
+                event_data = []
+                for raw in r.iter_lines(decode_unicode=True):
+                    # SSE frames are blank-line-separated. Accumulate
+                    # within a frame, parse on blank line.
+                    if raw is None:
+                        continue
+                    if raw == '':
+                        if not event_data:
+                            continue
+                        data = '\n'.join(event_data)
+                        try:
+                            payload = json.loads(data)
+                        except Exception:
+                            payload = {}
+                        if event_type == 'meta':
+                            meta = payload
+                        elif event_type == 'token':
+                            buf += payload.get('text', '')
+                            yield buf + '\n\n*生成中…*'
+                        elif event_type == 'done':
+                            elapsed = payload.get('elapsed_seconds', 0)
+                            cached = payload.get('cached', False)
+                            footer = (f"\n\n---\n*resolved: {meta.get('ts_codes',[])}　"
+                                      f"articles: {meta.get('n_articles',0)}　"
+                                      f"latency: {elapsed:.1f}s"
+                                      f"{'  (cached)' if cached else ''}*")
+                            yield buf + footer
+                            return
+                        event_type = None
+                        event_data = []
+                        continue
+                    if raw.startswith('event: '):
+                        event_type = raw[len('event: '):].strip()
+                    elif raw.startswith('data: '):
+                        event_data.append(raw[len('data: '):])
         except Exception as e:
-            return f"❌ error: {e}"
+            yield f"❌ error: {e}"
 
     with gr.Blocks(title='无能囃人A股深度解析') as demo:
         gr.Markdown("# 无能囃人A股深度解析")
@@ -100,13 +132,17 @@ def main():
 
         def respond(msg, history, ts_filter):
             if not msg or not msg.strip():
-                return '', history
-            answer = ask_qa(msg, history, ts_filter)
+                yield '', history
+                return
+            # Append the user message and an empty assistant message
+            # before streaming so the UI shows progress in real time.
             history = history + [
                 {'role': 'user',      'content': msg},
-                {'role': 'assistant', 'content': answer},
+                {'role': 'assistant', 'content': ''},
             ]
-            return '', history
+            for partial in ask_qa_stream(msg, ts_filter):
+                history[-1] = {'role': 'assistant', 'content': partial}
+                yield '', history
 
         msg.submit(respond, [msg, chatbot, ts_filter], [msg, chatbot])
         submit.click(respond, [msg, chatbot, ts_filter], [msg, chatbot])

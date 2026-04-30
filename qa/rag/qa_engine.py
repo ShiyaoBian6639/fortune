@@ -17,14 +17,28 @@ referencing news.
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from pathlib import Path
-from typing import List, Optional
+from threading import Thread
+from typing import Iterator, List, Optional
 
 import numpy as np
 
 from qa.rag.retriever import Retriever
 from qa.rag.context_builder import ContextBuilder
+
+
+# Heuristic for picking max_new_tokens. Big chunks of tokens are the
+# bottleneck (~30 tok/s on RTX 4070 Super at int4); not generating
+# tokens we don't need is the cheapest real win.
+_RE_SHORT  = re.compile(r'(是多少|多少元|多少钱|多少倍|什么时候|哪一年|哪天|是哪个|是谁|代码是|属于哪)')
+_RE_LONG   = re.compile(r'(新闻|消息|动态|进展|影响|对比|比较|分析|趋势|为什么|怎么看|策略|展望|预测)')
+
+def pick_max_new_tokens(question: str, default: int = 400) -> int:
+    if _RE_SHORT.search(question): return 200
+    if _RE_LONG.search(question):  return 700
+    return default
 
 
 SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。回答问题时必须遵守以下规则：
@@ -107,7 +121,20 @@ class QAEngine:
             {'role': 'user',      'content': f"资料：\n{context}\n\n问题：{question}"},
         ]
 
-    def generate(self, question: str, context: str) -> str:
+    def _gen_kwargs(self, inputs, max_new_tokens: int) -> dict:
+        return dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=self.temperature > 0,
+            temperature=max(self.temperature, 0.01),
+            top_p=0.95,
+            repetition_penalty=1.05,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+
+    def generate(self, question: str, context: str,
+                  max_new_tokens: int | None = None) -> str:
+        max_new = max_new_tokens or self.max_new_tokens
         messages = self._build_messages(question, context)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
@@ -116,38 +143,60 @@ class QAEngine:
         prompt_len = inputs['input_ids'].shape[1]
 
         with self.torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=self.temperature > 0,
-                temperature=max(self.temperature, 0.01),
-                top_p=0.95,
-                repetition_penalty=1.05,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+            out = self.model.generate(**self._gen_kwargs(inputs, max_new))
         new_tokens = out[0, prompt_len:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    def generate_stream(self, question: str, context: str,
+                         max_new_tokens: int | None = None) -> Iterator[str]:
+        """Yield decoded text chunks as they're generated. Drops perceived
+        latency from ~15-20 s to <1 s for first tokens.
+        """
+        from transformers import TextIteratorStreamer
+        max_new = max_new_tokens or self.max_new_tokens
+        messages = self._build_messages(question, context)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors='pt',
+                                 truncation=True, max_length=8192).to(self.model.device)
+
+        streamer = TextIteratorStreamer(self.tokenizer,
+                                         skip_prompt=True,
+                                         skip_special_tokens=True)
+        kwargs = self._gen_kwargs(inputs, max_new)
+        kwargs['streamer'] = streamer
+
+        thread = Thread(target=self.model.generate, kwargs=kwargs)
+        thread.start()
+        try:
+            for piece in streamer:
+                if piece:
+                    yield piece
+        finally:
+            thread.join()
+
+    def _retrieve_and_build(self, question, retriever, builder,
+                              top_k, max_context_tokens):
+        out = retriever.search(question, top_k=top_k)
+        context = builder.build_for(out['ts_codes'], out['articles'],
+                                      max_tokens=max_context_tokens)
+        return out, context
 
     def ask(self, question: str,
              retriever: Retriever,
              builder: ContextBuilder,
              top_k: int = 5,
              max_context_tokens: int = 3000) -> dict:
-        out = retriever.search(question, top_k=top_k)
-        context = builder.build_for(out['ts_codes'], out['articles'],
-                                      max_tokens=max_context_tokens)
-        # Only short-circuit when we have neither a ts_code nor any
-        # articles — meta queries that resolve via news-semantic have
-        # ts_codes=[] but plenty of relevant article content for Qwen
-        # to answer from.
+        out, context = self._retrieve_and_build(question, retriever, builder,
+                                                  top_k, max_context_tokens)
         if not out['ts_codes'] and not out['articles']:
             answer = ("未能识别出问题相关的A股或新闻。请尝试包含股票代码、"
                        "公司名称或具体行业关键词。")
         else:
             t0 = time.time()
-            answer = self.generate(question, context)
-            elapsed = time.time() - t0
-            print(f"[qa] generated in {elapsed:.1f}s", flush=True)
+            answer = self.generate(question, context,
+                                     max_new_tokens=pick_max_new_tokens(question))
+            print(f"[qa] generated in {time.time()-t0:.1f}s", flush=True)
         return {
             'question':      question,
             'answer':        answer,
@@ -155,6 +204,36 @@ class QAEngine:
             'n_articles':    len(out['articles']),
             'context_chars': len(context),
         }
+
+    def ask_stream(self, question: str,
+                    retriever: Retriever,
+                    builder: ContextBuilder,
+                    top_k: int = 5,
+                    max_context_tokens: int = 3000) -> Iterator[dict]:
+        """Yield events:
+            {'event':'meta',  'ts_codes':..., 'n_articles':..., 'context_chars':...}
+            {'event':'token', 'text': '...'}            (zero or more)
+            {'event':'done',  'elapsed_seconds': ...}
+        """
+        out, context = self._retrieve_and_build(question, retriever, builder,
+                                                  top_k, max_context_tokens)
+        yield {
+            'event': 'meta',
+            'ts_codes':      out['ts_codes'],
+            'n_articles':    len(out['articles']),
+            'context_chars': len(context),
+        }
+        if not out['ts_codes'] and not out['articles']:
+            yield {'event': 'token',
+                   'text': "未能识别出问题相关的A股或新闻。请尝试包含股票代码、"
+                            "公司名称或具体行业关键词。"}
+            yield {'event': 'done', 'elapsed_seconds': 0.0}
+            return
+        t0 = time.time()
+        for piece in self.generate_stream(question, context,
+                                            max_new_tokens=pick_max_new_tokens(question)):
+            yield {'event': 'token', 'text': piece}
+        yield {'event': 'done', 'elapsed_seconds': time.time() - t0}
 
 
 def main():
