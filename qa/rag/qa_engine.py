@@ -139,8 +139,13 @@ class QAEngine:
             max_new_tokens=max_new_tokens,
             do_sample=self.temperature > 0,
             temperature=max(self.temperature, 0.01),
-            top_p=0.95,
-            repetition_penalty=1.05,
+            top_p=0.92,
+            # Source articles include bureaucratic Chinese boilerplate
+            # (announcement texts repeating 《关于公司...的议案》 dozens of
+            # times). Without strong anti-repetition the model loops on
+            # these. 1.15 + 4-gram block reliably breaks them.
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=4,
             pad_token_id=self.tokenizer.eos_token_id,
         )
 

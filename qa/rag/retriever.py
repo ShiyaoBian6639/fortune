@@ -228,7 +228,7 @@ class Retriever:
         s = re.sub(r'[ ，,。.？?！!、；;：:\s]+', ' ', s).strip()
         return s or query   # never embed an empty string
 
-    def semantic_resolve(self, query: str) -> List[str]:
+    def semantic_resolve(self, query: str, return_score: bool = False):
         """Dense top-K from the entity index, then rerank by news prominence.
 
         Pure cosine on entity cards picks up token-level matches (e.g.
@@ -268,7 +268,14 @@ class Retriever:
             final = float(s) + 0.25 * prior
             cands.append((ts, final, float(s), news_n))
         cands.sort(key=lambda x: -x[1])
-        return [ts for ts, _, _, _ in cands[: self._semantic_top_k]]
+        ts_codes = [ts for ts, _, _, _ in cands[: self._semantic_top_k]]
+        # Top RAW cosine (not the prior-boosted score) — used by the
+        # router to detect low-confidence concept-token matches like
+        # "钙钛矿" → 宝钛股份 / 金浦钛业 (collision on 钛 character).
+        top_raw = float(cands[0][2]) if cands else 0.0
+        if return_score:
+            return ts_codes, top_raw
+        return ts_codes
 
     def _ensure_news_index(self):
         """Lazy-load the 8.5 GB news.faiss + meta only on first use."""
@@ -437,9 +444,21 @@ class Retriever:
                         ts_codes = sem
                         used_semantic = True
             else:
-                # 'entity' or 'neutral' → entity index first.
-                sem = self.semantic_resolve(query)
-                if sem:
+                # 'entity' or 'neutral' → entity index first, but with a
+                # confidence check. When the query mentions a market
+                # concept that has no representation in the structured
+                # entity cards (e.g. "钙钛矿" → 宝馨/协鑫/京山) bge-m3
+                # latches onto whatever shares characters (钛 → 宝钛股份)
+                # at low cosine. Falling through to news-semantic in that
+                # case usually finds the right stocks via the linker's
+                # tagged ts_codes on real concept articles.
+                sem, top_raw = self.semantic_resolve(query, return_score=True)
+                # 0.50 separates real category matches (锂电池→亿纬锂能
+                # ~0.55, 光伏→阳光电源ish ~0.55) from token-collision
+                # garbage (钙钛矿→宝钛股份 ~0.45 on the 钛 character).
+                # Below this cutoff we trust the news index more.
+                ENTITY_HIGH_CONF = 0.50
+                if sem and top_raw >= ENTITY_HIGH_CONF:
                     ts_codes = sem
                     used_semantic = True
                 else:
@@ -447,6 +466,11 @@ class Retriever:
                     if news_hits:
                         ts_codes, news_articles = self._articles_from_news_hits(news_hits)
                         used_news_semantic = True
+                    elif sem:
+                        # No news hits — accept the low-confidence
+                        # entity match rather than return nothing.
+                        ts_codes = sem
+                        used_semantic = True
 
         # Build the articles payload. If we used the news path, those
         # articles already carry the matched titles; otherwise pull
