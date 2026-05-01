@@ -63,7 +63,8 @@ def _latest_fina_snippet(ts_code: str) -> str:
     return ' / '.join(parts)
 
 
-def _build_card(rec: dict, fina_line: str, tags: list | None = None) -> str:
+def _build_card(rec: dict, fina_line: str, tags: list | None = None,
+                 main_biz: str = '', biz_scope: str = '') -> str:
     """Render the entity card. Keep ≤200 tokens for bge-m3 efficiency."""
     aliases = rec.get('aliases') or []
     parts = [
@@ -88,6 +89,14 @@ def _build_card(rec: dict, fina_line: str, tags: list | None = None) -> str:
     if rec.get('manager'):  leader_bits.append(f"总经理 {rec['manager']}")
     if leader_bits:
         parts.append('管理层: ' + ', '.join(leader_bits))
+    # main_business + business_scope were tried here as Phase 2 v2.
+    # Eval regressed (29/50 → 25/50): retrieval saw modest gains on a
+    # handful of concept queries, but the larger entity cards pushed
+    # total prompt length up enough that Qwen 7B 4-bit started looping
+    # on previously-fine queries. The news-derived concept_tags below
+    # carry the same signal at 1/10 the token cost. Keep
+    # company_business.csv around — it's available for future use
+    # with a larger model.
     if fina_line:
         parts.append("最新业绩: " + fina_line)
     if tags:
@@ -122,17 +131,38 @@ def main():
         n_with_tags = sum(1 for v in concept_tags.values() if v)
         print(f"[entity_idx] concept_tags: {n_with_tags:,} ts_codes tagged")
 
+    # Tushare-filed main_business + business_scope (Phase 2 v2). Captures
+    # what the company actually does in its own filings — independent
+    # of news coverage — so concept queries that current news mining
+    # misses (医美 → 爱美客, 国产CPU → 海光信息, 智能驾驶 → 中科创达)
+    # find the right cards on text-level match.
+    biz: dict = {}
+    cb_path = QA_DIR / 'company_business.csv'
+    if cb_path.exists():
+        cb_df = pd.read_csv(cb_path, encoding='utf-8-sig')
+        for _, r in cb_df.iterrows():
+            biz[r['ts_code']] = (
+                str(r.get('main_business') or '').strip(),
+                str(r.get('business_scope') or '').strip(),
+            )
+        print(f"[entity_idx] company_business: {len(biz):,} ts_codes loaded")
+
     rows = []
     for ts, rec in aliases.items():
         fina = _latest_fina_snippet(ts)
         tags = concept_tags.get(ts, [])
-        card = _build_card(rec, fina, tags=tags)
+        mb, bs = biz.get(ts, ('', ''))
+        card = _build_card(rec, fina, tags=tags, main_biz=mb, biz_scope=bs)
         rows.append({'ts_code': ts, 'name': rec.get('name', ''), 'card': card})
     df = pd.DataFrame(rows)
     print(f"[entity_idx] cards built: {len(df):,}")
     print(f"[entity_idx] sample card: {df['card'].iloc[0][:200]}")
 
-    embedder = BgeM3Embedder(fp16=not args.no_fp16, max_length=256)
+    # 512 fits the longer cards: name + aliases + sector + main_biz +
+    # business_scope + fundamentals + concept tags ≈ 400-500 Chinese
+    # chars ≈ 400-500 tokens. Truncation here was previously silently
+    # dropping the just-added biz fields.
+    embedder = BgeM3Embedder(fp16=not args.no_fp16, max_length=512)
     vecs = embedder.encode(df['card'].tolist(),
                             batch_size=args.batch, show_progress=True)
     print(f"[entity_idx] embeddings: {vecs.shape}  dtype={vecs.dtype}")
