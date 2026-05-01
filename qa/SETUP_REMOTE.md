@@ -648,3 +648,106 @@ The forecast keywords (`前景`, `未来走势`, `预测`, `看多`, `看空`,
 `后市`) trigger the new model-prediction block (§Phase 2 forecast
 integration) with the disclaimer "基于模型预测，仅供参考，不构成
 投资建议".
+
+## 13. Smoke-test curl commands
+
+Quick copy-paste recipes for verifying the stack post-deployment.
+All run on the VM (or anywhere the API is reachable on `:8080`).
+
+### A. Health checks
+
+```bash
+# Our API
+curl -s http://localhost:8080/healthz
+# {"status":"ok"}
+
+# vLLM is reachable + actually serving the expected model
+curl -s http://localhost:8080/vllm_health
+# {"status":"ok","vllm_url":"http://localhost:8000/v1",
+#  "served_models":["Qwen/Qwen2.5-32B-Instruct-AWQ"],"cache_hits":0}
+```
+
+### B. Direct /ask — answer + meta
+
+```bash
+curl -s -X POST http://localhost:8080/ask \
+     -H 'Content-Type: application/json' \
+     --data '{"query":"600519.SH 业绩怎么样","top_k":5}' \
+   | python -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f'ts_codes:    {d[\"ts_codes\"]}')
+print(f'n_articles:  {d[\"n_articles\"]}')
+print(f'context_chars: {d[\"context_chars\"]}')
+print(f'elapsed_seconds: {d[\"elapsed_seconds\"]}')
+print(f'cached:      {d.get(\"cached\")}')
+print()
+print(d['answer'])
+"
+```
+
+### C. Forecast sanity test (the `X / Y` / `P%` check)
+
+The system prompt deliberately uses `X / Y` / `P%` as placeholder
+text. If those *literally* appear in the answer, the `模型预测`
+block didn't reach Qwen — usually because `stock_data/modelfactory/`
+isn't populated on the VM yet (see §11).
+
+```bash
+# Forecast-flavoured query → should cite real numbers
+curl -s -X POST http://localhost:8080/ask \
+     -H 'Content-Type: application/json' \
+     --data '{"query":"000088.SZ 未来走势怎样","top_k":3}' \
+   | python -c "
+import json, sys, re
+d = json.load(sys.stdin)
+ans = d['answer']
+print(f'ctx_chars: {d[\"context_chars\"]}')
+print()
+print(ans)
+print('---')
+if re.search(r'\bX\s*/\s*Y\b|\bP\s*%', ans):
+    print('  ✗ FAIL — answer contains X/Y or P% placeholders.')
+    print('     Check that stock_data/modelfactory/{live,runs}/ are populated')
+    print('     on the VM, then restart the API server (vLLM stays up).')
+else:
+    print('  ✓ ok — no placeholder leakage')
+"
+```
+
+A clean answer should mention concrete numbers like `14 / 30 看多`,
+`53.6%`, `+0.32%`, plus an RSI / momentum trend, and end with the
+disclaimer `基于模型预测，仅供参考，不构成投资建议`.
+
+### D. Streaming /ask_stream (Server-Sent Events)
+
+```bash
+curl -N -X POST http://localhost:8080/ask_stream \
+     -H 'Content-Type: application/json' \
+     --data '{"query":"宁德时代前景如何","top_k":3}'
+```
+
+`-N` disables curl's output buffering so you see tokens land as they
+stream. You'll see `event: meta`, then a long sequence of
+`event: token`, then a final `event: done` with the full answer +
+elapsed time.
+
+### E. Aliases dropdown helper
+
+```bash
+# Quick name → ts_code lookup (used by Gradio's stock-filter dropdown)
+curl -s "http://localhost:8080/aliases?prefix=茅台&limit=5"
+# [{"ts_code":"600519.SH","name":"贵州茅台","symbol":"600519"}, ...]
+```
+
+### F. From your laptop (instead of from the VM)
+
+If the API is ssh-port-forwarded or exposed via autodl 自定义服务,
+swap `localhost:8080` for the public URL:
+
+```bash
+API=https://u123456-port8080.region-1.autodl.com   # your public URL
+curl -s -X POST $API/ask \
+     -H 'Content-Type: application/json' \
+     --data '{"query":"光伏龙头股票","top_k":3}'
+```
