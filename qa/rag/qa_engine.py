@@ -41,17 +41,20 @@ def pick_max_new_tokens(question: str, default: int = 400) -> int:
     return default
 
 
-SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。回答问题时必须遵守以下规则：
+SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。
 
-1. **只使用「资料」中的事实**。如果资料中没有该信息，必须明确说"资料中未提供"。
-2. **数字必须严格摘自资料**——绝不凭空生成 EPS、ROE、收盘价、涨跌幅等数据。
+**核心规则：**
+1. **只使用「资料」中的事实**。资料里没有就明确说"资料中未提供"。
+2. **数字与股票代码必须严格摘自资料**——绝不凭空生成 EPS、ROE、收盘价、涨跌幅、ts_code 等数据。引用 ts_code 时必须照抄资料中给出的 6 位数字 + 市场后缀。
 3. **引用新闻时**写明日期、来源（[2026-04-28] [eastmoney] 标题），不要发明新闻条目。
-4. 回答格式：
-   - 业绩问题 → 用一段话总结趋势 + 列出关键季度指标。
-   - 新闻问题 → 列出 3-5 条最相关的新闻，**编号必须从 1 开始连续编号**（1. 2. 3. ...）。
-   - 比较问题 → 用 Markdown 表格直接对比指标。
-   - 行业/概念查询 → 先点名 2-3 家代表公司，再给出资料中的关键数据/新闻支持。
-5. 用中文回答，专业但易读。"""
+4. **不要在回答中出现"问题："、"请列出"等再次提问的语句。** 只回答用户当前的问题，不要继续问问题，不要列出后续问题。
+5. **同一公司或短语不要在一段话里反复出现 3 次以上。** 一次清晰地说完。
+6. 回答格式：
+   - 业绩问题 → 用一段话总结趋势 + 关键季度指标。
+   - 新闻问题 → 3-5 条最相关的新闻，编号从 1 开始连续。
+   - 比较问题 → Markdown 表格直接对比。
+   - 行业/概念查询 → 先点名 2-3 家代表公司，再给资料中的关键数据/新闻支持。
+7. 用中文回答，专业但易读，控制在 600 字以内。"""
 
 
 FEW_SHOT_USER = """资料：
@@ -126,11 +129,12 @@ class QAEngine:
         print(f"[qa] model ready on {self.model.device}", flush=True)
 
     def _build_messages(self, question: str, context: str) -> list:
+        # Few-shot example was leaking its "问题：宁德时代..." trailer
+        # into outputs (Qwen would echo "问题：请列出X" at the end of its
+        # response). System prompt + structured context is enough.
         return [
-            {'role': 'system',    'content': SYSTEM_PROMPT},
-            {'role': 'user',      'content': FEW_SHOT_USER},
-            {'role': 'assistant', 'content': FEW_SHOT_ASSISTANT},
-            {'role': 'user',      'content': f"资料：\n{context}\n\n问题：{question}"},
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user',   'content': f"资料：\n{context}\n\n问题：{question}"},
         ]
 
     def _gen_kwargs(self, inputs, max_new_tokens: int) -> dict:
@@ -140,11 +144,12 @@ class QAEngine:
             do_sample=self.temperature > 0,
             temperature=max(self.temperature, 0.01),
             top_p=0.92,
-            # Source articles include bureaucratic Chinese boilerplate
-            # (announcement texts repeating 《关于公司...的议案》 dozens of
-            # times). Without strong anti-repetition the model loops on
-            # these. 1.15 + 4-gram block reliably breaks them.
-            repetition_penalty=1.15,
+            # 1.18 / ngram=4 is the empirical sweet spot: ngram=3 over-
+            # blocks common Chinese phrases and the model compensates
+            # by paraphrasing the same idea 4 times in different
+            # 3-grams (so 8-char repetition detection still triggers);
+            # ngram=5 lets bureaucratic boilerplate slip through.
+            repetition_penalty=1.18,
             no_repeat_ngram_size=4,
             pad_token_id=self.tokenizer.eos_token_id,
         )
