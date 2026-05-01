@@ -310,19 +310,60 @@ This makes `BGE_M3_LOCAL_DIR` resolve to the HF cache snapshot —
 
 ## 10. Running the QA backend on vLLM
 
-(Forthcoming — once `qa/rag/qa_engine.py` is refactored to talk to
-vLLM via the OpenAI client, you'll start the stack as:)
+`qa.rag.qa_engine.QAEngine` is now a thin OpenAI-client wrapper around
+vLLM. Two-process stack:
 
 ```bash
-# Terminal 1: vLLM serves Qwen at :8000
+# ─── Terminal 1 (or screen window) — vLLM serves Qwen at :8000 ───
+screen -S vllm
 ./venv_vllm/bin/vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ \
     --gpu-memory-utilization 0.85 \
     --max-model-len 8192 \
     --quantization awq_marlin \
-    --port 8000 &
+    --port 8000
+# Ctrl+A then D to detach. Reattach with: screen -r vllm
 
-# Terminal 2: our FastAPI server at :8080 talks to vLLM
+# ─── Terminal 2 — our FastAPI server at :8080 ───
+screen -S api
 ./venv_vllm/bin/python -m qa.api.server \
     --vllm-url http://localhost:8000/v1 \
-    --port 8080 &
+    --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --host 0.0.0.0 --port 8080
+# Ctrl+A then D to detach.
 ```
+
+`--host 0.0.0.0` exposes on the LAN — needed if you're hitting the API
+from your laptop. autodl typically ssh-forwards :8080.
+
+Verify both:
+
+```bash
+curl -s http://localhost:8080/healthz
+# {"status": "ok"}
+
+curl -s http://localhost:8080/vllm_health
+# {"status": "ok", "vllm_url": "http://localhost:8000/v1",
+#  "served_models": ["Qwen/Qwen2.5-32B-Instruct-AWQ"], "cache_hits": 0}
+
+curl -s -X POST http://localhost:8080/ask \
+     -H "Content-Type: application/json" \
+     --data '{"query":"600519.SH 业绩","top_k":5}' | python -c \
+     "import json, sys; d=json.load(sys.stdin); print(d['answer'][:300])"
+```
+
+The first request takes ~3–6 s (vLLM warm), subsequent identical
+queries return instantly from the LRU cache. Concurrent users now
+share KV cache via vLLM's PagedAttention — no GPU lock.
+
+### Re-running the 50-question demo against vLLM
+
+```bash
+./venv_vllm/bin/python -m qa.eval.run_phase2_demo \
+    --api http://localhost:8080 \
+    --out stock_data/qa/phase2_demo_report_vllm.json
+```
+
+Expected on Qwen2.5-32B-AWQ + vLLM: substantially fewer rep loops,
+better synthesis quality, ~3 s per question avg vs ~10 s on the 7B
+int4. Re-enable `main_business` in `qa/build_entity_index.py` first
+— the v4/v5 regression on 7B doesn't recur with the bigger model.

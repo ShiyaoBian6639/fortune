@@ -1,39 +1,55 @@
 """
-Qwen-based Q&A engine — wraps Qwen2.5-Instruct for the stock-research task.
+QA generation engine — thin client over a vLLM OpenAI-compatible server.
 
-Loads the same Qwen2.5-7B-Instruct that `xgbmodel/qwen_sentiment.py` uses
-(weights are HF-cached so no second download), but configured for free-form
-generation instead of single-token sentiment classification.
+Previously this module loaded Qwen in-process via transformers + bnb-4bit
+on a 12 GB 4070 Super. That setup hit several walls (KV-cache OOM,
+generator-with-lock leaks, single-request serialisation, ~30 tok/s).
 
-Usage:
-    qa = QAEngine(model_id='Qwen/Qwen2.5-7B-Instruct', quant='4bit')
-    answer = qa.ask("贵州茅台最近一季度业绩如何", retriever, builder)
+The new layout puts the LLM in a separate vLLM process owning the GPU
+and exposes an OpenAI-compatible endpoint. This module just sends
+chat-completion requests, optionally streamed. vLLM handles batching,
+KV cache paging, concurrency, and AWQ-quantised serving — typically
+3–5× faster end-to-end than the old setup, and supports many concurrent
+users.
 
-The retriever + context_builder produce structured Markdown context. We
-prepend a strict system prompt that requires the model to ONLY use the
-provided facts, never invent numbers, and cite the news date+source when
-referencing news.
+Architecture:
+
+    [Gradio / curl / eval]            (HTTP)
+            │
+            ▼
+    [qa.api.server  :8080]            (this repo's FastAPI)
+            │
+            ├── retriever  (alias / entity FAISS / news FAISS)
+            ├── builder    (markdown context)
+            └── QAEngine  ──(OpenAI client)──► vllm serve  :8000  (GPU)
+
+Run vLLM separately:
+
+    vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 8192 \
+        --quantization awq_marlin \
+        --port 8000
+
+Then start this repo's API server (``qa.api.server --vllm-url http://...``).
 """
 from __future__ import annotations
 
 import argparse
 import re
 import time
-from pathlib import Path
-from threading import Thread
-from typing import Iterator, List, Optional
+from typing import Iterator, Optional
 
-import numpy as np
+from openai import OpenAI
 
 from qa.rag.retriever import Retriever
 from qa.rag.context_builder import ContextBuilder
 
 
-# Heuristic for picking max_new_tokens. Big chunks of tokens are the
-# bottleneck (~30 tok/s on RTX 4070 Super at int4); not generating
-# tokens we don't need is the cheapest real win.
+# ─── Dynamic max-token heuristic ─────────────────────────────────────────────
 _RE_SHORT  = re.compile(r'(是多少|多少元|多少钱|多少倍|什么时候|哪一年|哪天|是哪个|是谁|代码是|属于哪)')
 _RE_LONG   = re.compile(r'(新闻|消息|动态|进展|影响|对比|比较|分析|趋势|为什么|怎么看|策略|展望|预测)')
+
 
 def pick_max_new_tokens(question: str, default: int = 400) -> int:
     if _RE_SHORT.search(question): return 200
@@ -41,6 +57,7 @@ def pick_max_new_tokens(question: str, default: int = 400) -> int:
     return default
 
 
+# ─── System prompt ───────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。
 
 **核心规则：**
@@ -57,77 +74,50 @@ SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。
 7. 用中文回答，专业但易读，控制在 600 字以内。"""
 
 
-FEW_SHOT_USER = """资料：
-## 宁德时代（300750.SZ）
-- 申万一级：电力设备　二级：电池
-
-### 业绩（最近4季）
-| 报告期 | EPS（元） | ROE % | 毛利率 % |
-|---|---|---|---|
-| 20260331 | 4.58 | 5.97 | 24.82 |
-| 20251231 | 16.14 | 24.72 | 26.27 |
-| 20250930 | 11.02 | 17.48 | 25.31 |
-| 20250630 | 6.92 | 11.25 | 25.02 |
-
-问题：宁德时代最近一季业绩如何？"""
-
-FEW_SHOT_ASSISTANT = """**宁德时代（300750.SZ）2026Q1 业绩摘要**
-
-最新一季报告期 2026-03-31，EPS 4.58 元、ROE 5.97%、毛利率 24.82%。
-
-- ROE 较 2025Q4 单季水平回落（24.72% → 5.97%），主要是单季 vs 累计口径差异，不构成趋势恶化。
-- 毛利率 24.82%，相比 2025Q4 的 26.27% 略降，但仍处于近 4 季稳定区间（25%-26%）。
-- 单季 EPS 4.58 元，大幅高于 2025 同期，盈利能力保持。
-
-资料未提供 2026Q1 营收 YoY 与归母净利 YoY 的具体数值。"""
-
-
+# ─── Engine ──────────────────────────────────────────────────────────────────
 class QAEngine:
+    """OpenAI-client wrapper around a running vLLM server.
+
+    All the in-process Qwen/transformers complexity (threading lock,
+    KV-cache management, attention backend selection, bnb quantisation)
+    is gone — vLLM owns the GPU and we just send HTTP requests.
+    """
+
     def __init__(self,
-                 model_id: str = 'Qwen/Qwen2.5-7B-Instruct',
-                 device: str = 'cuda',
-                 quant: str = '4bit',           # '4bit' for 4070, 'none' for 5090
+                 vllm_url: str = 'http://localhost:8000/v1',
+                 model:    str = 'Qwen/Qwen2.5-32B-Instruct-AWQ',
                  max_new_tokens: int = 600,
-                 temperature: float = 0.3):
-        import threading
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
-        self.torch = torch
-        self.device = device
+                 temperature: float = 0.3,
+                 timeout: float = 180.0,
+                 # Kept for API compat with old call sites (ignored)
+                 device: str = 'cuda',
+                 quant: str | None = None,
+                 model_id: str | None = None):
+        self.vllm_url = vllm_url
+        self.model    = model_id or model
         self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        # Serialise GPU access. FastAPI runs sync handlers in a threadpool;
-        # without this lock two near-simultaneous /ask calls each spawn a
-        # model.generate, doubling the KV-cache and OOM-ing 12 GB cards.
-        # The lock is ALSO held across streaming generation so the second
-        # request waits for the first to finish before touching the GPU.
-        self._gpu_lock = threading.Lock()
+        self.temperature    = temperature
+        self.timeout        = timeout
+        self.client = OpenAI(base_url=vllm_url, api_key='EMPTY',
+                              timeout=timeout)
+        # Probe vLLM to fail fast if the server isn't reachable; pick the
+        # served model name automatically when it differs from the default.
+        try:
+            served = self.client.models.list().data
+            served_ids = [m.id for m in served]
+            if served_ids and self.model not in served_ids:
+                # vLLM's served name uses the same string as --model. If
+                # the user passed a different ID, prefer the actual served
+                # one to avoid 404s.
+                print(f"[qa] requested model {self.model!r} not in "
+                      f"{served_ids} — falling back to {served_ids[0]!r}")
+                self.model = served_ids[0]
+            print(f"[qa] vllm @ {vllm_url}  model={self.model}")
+        except Exception as e:
+            print(f"[qa] WARNING: vllm not reachable at {vllm_url} — {e}",
+                  flush=True)
 
-        print(f"[qa] loading {model_id} (quant={quant}) ...", flush=True)
-        kw = dict(torch_dtype=torch.bfloat16, device_map=device,
-                  trust_remote_code=True)
-        # NOTE: attn_implementation='sdpa' was tried here for memory
-        # efficiency, but it silently hung generate() on the bnb 4-bit
-        # Qwen 7B build (model loaded, GPU utilisation stayed at 0 %,
-        # /ask never returned). Leaving it as default.
-        if quant == '4bit':
-            from transformers import BitsAndBytesConfig
-            kw['quantization_config'] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type='nf4',
-                bnb_4bit_use_double_quant=True,
-            )
-            kw.pop('torch_dtype')
-        elif quant == '8bit':
-            from transformers import BitsAndBytesConfig
-            kw['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
-            kw.pop('torch_dtype')
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        self.model     = AutoModelForCausalLM.from_pretrained(model_id, **kw)
-        self.model.eval()
-        print(f"[qa] model ready on {self.model.device}", flush=True)
-
+    # ─── Prompt assembly ──────────────────────────────────────────────────
     def _build_messages(self, question: str, context: str) -> list:
         # Few-shot example was leaking its "问题：宁德时代..." trailer
         # into outputs (Qwen would echo "问题：请列出X" at the end of its
@@ -137,110 +127,52 @@ class QAEngine:
             {'role': 'user',   'content': f"资料：\n{context}\n\n问题：{question}"},
         ]
 
-    def _gen_kwargs(self, inputs, max_new_tokens: int) -> dict:
-        return dict(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=self.temperature > 0,
-            temperature=max(self.temperature, 0.01),
-            top_p=0.92,
-            # 1.18 / ngram=4 is the empirical sweet spot: ngram=3 over-
-            # blocks common Chinese phrases and the model compensates
-            # by paraphrasing the same idea 4 times in different
-            # 3-grams (so 8-char repetition detection still triggers);
-            # ngram=5 lets bureaucratic boilerplate slip through.
-            repetition_penalty=1.18,
-            no_repeat_ngram_size=4,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+    def _extra(self) -> dict:
+        # vLLM accepts these as extra fields — repetition_penalty +
+        # no_repeat_ngram_size are forwarded to the underlying generate.
+        return {
+            'repetition_penalty': 1.18,
+            'top_p': 0.92,
+        }
 
+    # ─── Generation ───────────────────────────────────────────────────────
     def generate(self, question: str, context: str,
                   max_new_tokens: int | None = None) -> str:
         max_new = max_new_tokens or self.max_new_tokens
-        messages = self._build_messages(question, context)
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        # Cap prompt length aggressively — KV-cache scales linearly with
-        # seq_len. 4096 = ~1.5 GB cache headroom on 12 GB during gen.
-        # 4 K is the safe cap on a 12 GB card. The peak VRAM during the
-        # prompt forward pass is dominated by the attention softmax tensor
-        # — shape [heads, seq, seq] @ fp16 = 28 × 6144² × 2 ≈ 2.1 GB at
-        # 6 K but only ~0.9 GB at 4 K. SDPA shrinks this further but the
-        # cap is the safety net.
-        inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=4096).to(self.model.device)
-        prompt_len = inputs['input_ids'].shape[1]
-
-        with self._gpu_lock, self.torch.no_grad():
-            try:
-                out = self.model.generate(**self._gen_kwargs(inputs, max_new))
-                new_tokens = out[0, prompt_len:]
-                text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-            finally:
-                # Release transient activation / KV-cache buffers — without
-                # this they linger and a series of long-context queries
-                # gradually squeezes out room for future generations.
-                if self.torch.cuda.is_available():
-                    self.torch.cuda.empty_cache()
-        return text
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=self._build_messages(question, context),
+            max_tokens=max_new,
+            temperature=self.temperature,
+            extra_body=self._extra(),
+        )
+        return (resp.choices[0].message.content or '').strip()
 
     def generate_stream(self, question: str, context: str,
                          max_new_tokens: int | None = None) -> Iterator[str]:
-        """Yield decoded text chunks as they're generated.
+        """Yield text deltas as the vLLM server emits them.
 
-        Critical: this generator does NOT use ``with self._gpu_lock:``.
-        Python keeps the `with` block alive across yields, and if the
-        SSE consumer disconnects mid-stream the generator is suspended
-        at a yield until garbage collection — which can be never. The
-        lock would stay held forever and every later /ask deadlocks.
-
-        Instead the lock is acquired manually with a 5 s timeout. If a
-        prior request is stuck holding it we surface an error chunk and
-        return rather than wait forever. The finally block drains the
-        streamer queue, joins the model.generate thread, clears CUDA
-        cache, and releases the lock — robust against early consumer
-        cancellation.
+        No threading lock, no streamer queue, no thread.join. The OpenAI
+        client iterator handles SSE under the hood; if the consumer
+        disconnects the iterator simply ends and the underlying HTTP
+        connection closes — vLLM cancels the request server-side.
         """
-        from transformers import TextIteratorStreamer
         max_new = max_new_tokens or self.max_new_tokens
-        messages = self._build_messages(question, context)
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(prompt, return_tensors='pt',
-                                 truncation=True, max_length=4096).to(self.model.device)
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=self._build_messages(question, context),
+            max_tokens=max_new,
+            temperature=self.temperature,
+            extra_body=self._extra(),
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices: continue
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
 
-        streamer = TextIteratorStreamer(self.tokenizer,
-                                         skip_prompt=True,
-                                         skip_special_tokens=True,
-                                         timeout=60.0)
-        kwargs = self._gen_kwargs(inputs, max_new)
-        kwargs['streamer'] = streamer
-
-        if not self._gpu_lock.acquire(timeout=5.0):
-            yield ("⚠️ GPU is busy with another request that didn't release "
-                   "cleanly. Restart the API server to clear it.")
-            return
-
-        thread = Thread(target=self.model.generate, kwargs=kwargs, daemon=True)
-        thread.start()
-        try:
-            for piece in streamer:
-                if piece:
-                    yield piece
-        finally:
-            try:
-                # Drain remaining tokens so the generate thread can finish.
-                # Streamer has a 60s timeout (set above) so this can't hang
-                # forever if the underlying generate has gone silent.
-                for _ in streamer:
-                    pass
-            except Exception:
-                pass
-            thread.join(timeout=30.0)
-            if self.torch.cuda.is_available():
-                self.torch.cuda.empty_cache()
-            self._gpu_lock.release()
-
+    # ─── Retrieval + answer ───────────────────────────────────────────────
     def _retrieve_and_build(self, question, retriever, builder,
                               top_k, max_context_tokens):
         out = retriever.search(question, top_k=top_k)
@@ -302,11 +234,11 @@ class QAEngine:
         yield {'event': 'done', 'elapsed_seconds': time.time() - t0}
 
 
+# ─── CLI smoke test ──────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--quant', choices=['none','8bit','4bit'], default='4bit',
-                   help='4bit fits 12GB VRAM; none requires ≥18GB')
-    p.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct')
+    p.add_argument('--vllm-url', default='http://localhost:8000/v1')
+    p.add_argument('--model',    default='Qwen/Qwen2.5-32B-Instruct-AWQ')
     p.add_argument('--questions', nargs='+', default=[
         '300750.SZ最近一季度的业绩怎么样？',
         '茅台最近有什么新闻？',
@@ -315,18 +247,24 @@ def main():
     args = p.parse_args()
 
     r  = Retriever('stock_data/qa/aliases.json',
-                    'stock_data/qa/news_linked.parquet')
+                    'stock_data/qa/news_linked.parquet',
+                    entity_index='stock_data/qa/entities.faiss',
+                    entity_meta='stock_data/qa/entities.parquet',
+                    news_index='stock_data/qa/news.faiss',
+                    news_meta='stock_data/qa/news_meta.parquet')
     cb = ContextBuilder('stock_data/qa/aliases.json')
-    qa = QAEngine(model_id=args.model, quant=args.quant)
+    qa = QAEngine(vllm_url=args.vllm_url, model=args.model)
 
     for q in args.questions:
         print()
         print('=' * 70)
         print(f'Q: {q}')
         print('=' * 70)
+        t0 = time.time()
         out = qa.ask(q, r, cb)
         print(f"resolved ts_codes: {out['ts_codes']}  "
-              f"({out['n_articles']} articles, {out['context_chars']} ctx chars)")
+              f"({out['n_articles']} articles, {out['context_chars']} ctx chars)  "
+              f"{time.time()-t0:.1f}s")
         print()
         print(out['answer'])
 

@@ -118,8 +118,8 @@ def _check_case(case: dict, out: dict, retriever: Retriever) -> dict:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--quant', choices=['none', '8bit', '4bit'], default='4bit')
-    p.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct')
+    p.add_argument('--vllm-url', default='http://localhost:8000/v1')
+    p.add_argument('--model',    default='Qwen/Qwen2.5-32B-Instruct-AWQ')
     p.add_argument('--out', default='stock_data/qa/eval_report.json')
     args = p.parse_args()
 
@@ -130,7 +130,7 @@ def main():
                     news_index='stock_data/qa/news.faiss',
                     news_meta='stock_data/qa/news_meta.parquet')
     cb = ContextBuilder('stock_data/qa/aliases.json')
-    qa = QAEngine(model_id=args.model, quant=args.quant)
+    qa = QAEngine(vllm_url=args.vllm_url, model=args.model)
 
     results = []
     n_pass = 0

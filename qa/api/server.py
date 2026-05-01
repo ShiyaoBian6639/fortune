@@ -1,25 +1,32 @@
 """
-FastAPI server for the stock-research Q&A engine.
+FastAPI server for the stock-research Q&A engine (vLLM backend).
+
+The heavy LLM lives in a separate vLLM process. This server is the
+retrieval + context-builder + cache layer that talks to vLLM via the
+OpenAI-compatible API.
 
 Endpoints
 ---------
 POST /ask
-    body: {"query": str, "top_k": int = 5}
-    returns: {
-        "question":    str,
-        "answer":      str,
-        "ts_codes":    list[str],
-        "n_articles":  int,
-        "context_chars": int,
-        "elapsed_seconds": float,
-    }
+    body: {"query": str, "top_k": int = 5, "max_context_tokens": int = 3200}
+    returns: {question, answer, ts_codes, n_articles, context_chars,
+              elapsed_seconds, cached}
 
-GET /healthz   {"status": "ok"}
+POST /ask_stream
+    Same body, returns SSE stream:
+        event: meta   data: {ts_codes, n_articles, context_chars}
+        event: token  data: {text: '...'}                   (many)
+        event: done   data: {elapsed_seconds, cached, full_answer}
 
-GET /aliases?prefix=...   list of {ts_code, name} for the dropdown UI.
+GET  /healthz                       {"status": "ok"|"starting"}
+GET  /aliases?prefix=...&limit=50   dropdown UI helper
+GET  /vllm_health                   proxies vLLM /health for diagnosis
 
-Run:
-    ./venv/Scripts/python -m qa.api.server --quant 4bit --port 8080
+Run after vLLM is up on :8000:
+    ./venv_vllm/bin/python -m qa.api.server \
+        --vllm-url http://localhost:8000/v1 \
+        --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+        --port 8080
 """
 from __future__ import annotations
 
@@ -31,11 +38,15 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+from qa.rag.retriever import Retriever
+from qa.rag.context_builder import ContextBuilder
+from qa.rag.qa_engine import QAEngine
 
 
 QA_LOG_PATH = Path('stock_data/qa/qa_log.jsonl')
@@ -43,15 +54,17 @@ _log_lock = threading.Lock()
 
 
 # ─── LRU response cache ────────────────────────────────────────────────────
-# Identical query strings hit again within the cache window return the
-# stored answer instantly (full ~20 s saved). Keyed on the normalised
-# query + top_k so different top_k values don't collide.
+# Identical query strings hit again return the stored answer instantly.
+# vLLM has its own prefix cache so even un-cached repeats are fast, but
+# this avoids the round-trip + re-tokenisation entirely.
 _CACHE_SIZE = 256
 _cache: "OrderedDict[str, dict]" = OrderedDict()
 _cache_lock = threading.Lock()
 
+
 def _cache_key(query: str, top_k: int) -> str:
     return f"{top_k}\x1f{query.strip()}"
+
 
 def cache_get(query: str, top_k: int):
     k = _cache_key(query, top_k)
@@ -60,6 +73,7 @@ def cache_get(query: str, top_k: int):
             _cache.move_to_end(k)
             return _cache[k]
     return None
+
 
 def cache_put(query: str, top_k: int, value: dict):
     k = _cache_key(query, top_k)
@@ -79,12 +93,7 @@ def _log_interaction(record: dict):
             with open(QA_LOG_PATH, 'a', encoding='utf-8') as f:
                 f.write(line + '\n')
     except Exception as e:
-        # Never let logging take down a request
         print(f"[qa_log] write failed: {e}", flush=True)
-
-from qa.rag.retriever import Retriever
-from qa.rag.context_builder import ContextBuilder
-from qa.rag.qa_engine import QAEngine
 
 
 _state = {}
@@ -92,32 +101,30 @@ _state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[api] initialising QA engine...", flush=True)
+    print("[api] initialising QA stack...", flush=True)
     _state['retriever'] = Retriever('stock_data/qa/aliases.json',
                                        'stock_data/qa/news_linked.parquet',
                                        entity_index='stock_data/qa/entities.faiss',
                                        entity_meta='stock_data/qa/entities.parquet',
                                        news_index='stock_data/qa/news.faiss',
                                        news_meta='stock_data/qa/news_meta.parquet')
-    # Pre-warm bge-m3 (CPU by default) so the first semantic-fallback
-    # query doesn't pay the ~20 s model-load tax. Defaults to CPU to
-    # keep the 4070 Super's 12 GB VRAM clear for Qwen — set
-    # QA_EMBED_DEVICE=cuda only if you have ≥18 GB VRAM.
+    # Pre-warm bge-m3. With 32 GB VRAM (5090) we keep it on GPU by
+    # default — set QA_EMBED_DEVICE=cpu if you'd rather reserve VRAM.
     print("[api] pre-warming bge-m3 ...", flush=True)
     _t0 = time.time()
     _state['retriever']._ensure_embedder()
     print(f"[api] bge-m3 ready in {time.time()-_t0:.1f}s", flush=True)
     _state['builder'] = ContextBuilder('stock_data/qa/aliases.json')
-    _state['engine']  = QAEngine(model_id=app.state.model_id,
-                                    quant=app.state.quant)
-    # Pre-load alias name list for the dropdown
+    _state['engine']  = QAEngine(vllm_url=app.state.vllm_url,
+                                    model=app.state.model)
     with open('stock_data/qa/aliases.json', 'r', encoding='utf-8') as f:
         _state['aliases'] = json.load(f)
-    print(f"[api] ready (model={app.state.model_id} quant={app.state.quant})", flush=True)
+    print(f"[api] ready (vllm={app.state.vllm_url} model={app.state.model})",
+          flush=True)
     yield
 
 
-app = FastAPI(title='A-Share Q&A', version='0.1.0', lifespan=lifespan)
+app = FastAPI(title='A-Share Q&A', version='0.2.0-vllm', lifespan=lifespan)
 
 
 class AskBody(BaseModel):
@@ -131,38 +138,20 @@ def healthz():
     return {'status': 'ok' if 'engine' in _state else 'starting'}
 
 
-@app.get('/gpu_stats')
-def gpu_stats():
-    """Live VRAM snapshot. ``spilled`` is True if peak allocation has
-    ever exceeded physical VRAM — once that happens this run, CUDA
-    has fallen back to shared/system memory and inference is 10–100×
-    slower until the process restarts.
-    """
-    import torch
-    if not torch.cuda.is_available():
-        return {'cuda': False}
-    total = torch.cuda.get_device_properties(0).total_memory
-    peak = torch.cuda.max_memory_allocated()
-    return {
-        'cuda':          True,
-        'device_name':   torch.cuda.get_device_name(0),
-        'total_gb':      round(total / 1e9, 2),
-        'allocated_gb':  round(torch.cuda.memory_allocated() / 1e9, 2),
-        'reserved_gb':   round(torch.cuda.memory_reserved()  / 1e9, 2),
-        'max_alloc_gb':  round(peak / 1e9, 2),
-        'spilled':       peak > total * 0.97,
-        'cache_hits':    len(_cache),
-    }
-
-
-@app.post('/gpu_reset_peak')
-def gpu_reset_peak():
-    """Clear torch.cuda.max_memory_allocated() so /gpu_stats peak
-    starts fresh — useful when verifying a fix without restarting."""
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    return {'ok': True}
+@app.get('/vllm_health')
+def vllm_health():
+    """Proxy /health from the vLLM server. Useful for end-to-end
+    sanity checks (does our process see vLLM, does vLLM respond)."""
+    if 'engine' not in _state:
+        return {'status': 'starting'}
+    try:
+        models = _state['engine'].client.models.list().data
+        return {'status': 'ok',
+                'vllm_url': _state['engine'].vllm_url,
+                'served_models': [m.id for m in models],
+                'cache_hits': len(_cache)}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
 
 
 @app.get('/aliases')
@@ -218,24 +207,22 @@ def ask(body: AskBody, request: Request):
 
 @app.post('/ask_stream')
 def ask_stream(body: AskBody, request: Request):
-    """SSE endpoint that streams answer tokens as they're generated.
-    Drops perceived latency from ~15 s to <1 s for first tokens.
+    """SSE endpoint — streams answer tokens as vLLM emits them.
 
-    Emits Server-Sent Events:
-        event: meta   data: {ts_codes, n_articles, context_chars}
-        event: token  data: {text: '...'}                   (many)
-        event: done   data: {elapsed_seconds, full_answer}
+    No GPU lock concerns: vLLM serialises GPU access internally and
+    the OpenAI client iterator cleans up its HTTP connection on
+    consumer disconnect.
     """
     if 'engine' not in _state:
         raise HTTPException(503, 'engine still loading')
 
-    # Cache hit → emit the cached answer as a single token, then done.
     cached = cache_get(body.query, body.top_k)
 
     def iter_sse():
-        nonlocal cached
+        # Cache hit → emit the cached answer as a single token.
         if cached is not None:
-            yield f"event: meta\ndata: {json.dumps({k: cached[k] for k in ('ts_codes','n_articles','context_chars')}, ensure_ascii=False)}\n\n"
+            meta_payload = {k: cached[k] for k in ('ts_codes','n_articles','context_chars')}
+            yield f"event: meta\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
             yield f"event: token\ndata: {json.dumps({'text': cached['answer']}, ensure_ascii=False)}\n\n"
             yield f"event: done\ndata: {json.dumps({'elapsed_seconds': 0.0, 'cached': True, 'full_answer': cached['answer']}, ensure_ascii=False)}\n\n"
             return
@@ -246,50 +233,44 @@ def ask_stream(body: AskBody, request: Request):
         meta = None
         full_text_parts: list[str] = []
         t0 = time.time()
-        # Wrap the generator in a try/finally so a client disconnect
-        # forces ``gen.close()`` → triggers the engine generator's finally
-        # → releases the GPU lock. Without this the lock leaks on early
-        # disconnect and every subsequent /ask hangs forever.
+
         gen = engine.ask_stream(body.query, retriever, builder,
                                   top_k=body.top_k,
                                   max_context_tokens=body.max_context_tokens)
         try:
-          for ev in gen:
-            if ev['event'] == 'meta':
-                meta = ev
-                yield f"event: meta\ndata: {json.dumps({k: ev[k] for k in ('ts_codes','n_articles','context_chars')}, ensure_ascii=False)}\n\n"
-            elif ev['event'] == 'token':
-                full_text_parts.append(ev['text'])
-                yield f"event: token\ndata: {json.dumps({'text': ev['text']}, ensure_ascii=False)}\n\n"
-            elif ev['event'] == 'done':
-                full = ''.join(full_text_parts)
-                elapsed = time.time() - t0
-                yield f"event: done\ndata: {json.dumps({'elapsed_seconds': elapsed, 'cached': False, 'full_answer': full}, ensure_ascii=False)}\n\n"
-                # Persist to log + cache after streaming completes.
-                if meta is not None:
-                    rec = {
-                        'timestamp':   _dt.datetime.now().isoformat(timespec='seconds'),
-                        'client':      request.client.host if request.client else None,
-                        'query':       body.query,
-                        'top_k':       body.top_k,
-                        'ts_codes':    meta['ts_codes'],
-                        'n_articles':  meta['n_articles'],
-                        'context_chars': meta['context_chars'],
-                        'elapsed_seconds': round(elapsed, 2),
-                        'answer':      full,
-                    }
-                    _log_interaction(rec)
-                    cache_put(body.query, body.top_k, {
-                        'question':      body.query,
-                        'answer':        full,
-                        'ts_codes':      meta['ts_codes'],
-                        'n_articles':    meta['n_articles'],
-                        'context_chars': meta['context_chars'],
-                    })
+            for ev in gen:
+                if ev['event'] == 'meta':
+                    meta = ev
+                    payload = {k: ev[k] for k in ('ts_codes','n_articles','context_chars')}
+                    yield f"event: meta\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif ev['event'] == 'token':
+                    full_text_parts.append(ev['text'])
+                    yield f"event: token\ndata: {json.dumps({'text': ev['text']}, ensure_ascii=False)}\n\n"
+                elif ev['event'] == 'done':
+                    full = ''.join(full_text_parts)
+                    elapsed = time.time() - t0
+                    yield f"event: done\ndata: {json.dumps({'elapsed_seconds': elapsed, 'cached': False, 'full_answer': full}, ensure_ascii=False)}\n\n"
+                    if meta is not None:
+                        rec = {
+                            'timestamp':   _dt.datetime.now().isoformat(timespec='seconds'),
+                            'client':      request.client.host if request.client else None,
+                            'query':       body.query,
+                            'top_k':       body.top_k,
+                            'ts_codes':    meta['ts_codes'],
+                            'n_articles':  meta['n_articles'],
+                            'context_chars': meta['context_chars'],
+                            'elapsed_seconds': round(elapsed, 2),
+                            'answer':      full,
+                        }
+                        _log_interaction(rec)
+                        cache_put(body.query, body.top_k, {
+                            'question':      body.query,
+                            'answer':        full,
+                            'ts_codes':      meta['ts_codes'],
+                            'n_articles':    meta['n_articles'],
+                            'context_chars': meta['context_chars'],
+                        })
         finally:
-            # Force the engine generator to finalize even if the SSE
-            # consumer disconnected mid-stream — this runs the
-            # generate_stream finally block which releases the GPU lock.
             try:
                 gen.close()
             except Exception:
@@ -298,48 +279,19 @@ def ask_stream(body: AskBody, request: Request):
     return StreamingResponse(iter_sse(), media_type='text/event-stream')
 
 
-@app.post('/lock_status')
-def lock_status():
-    """Diagnose lock state. ``locked`` is True if a generation is
-    currently in flight; if it stays True with no active client,
-    something leaked — POST /lock_force_release as a last resort."""
-    if 'engine' not in _state:
-        return {'locked': False, 'note': 'engine not loaded'}
-    lk = _state['engine']._gpu_lock
-    held = not lk.acquire(blocking=False)
-    if not held:
-        lk.release()
-    return {'locked': held}
-
-
-@app.post('/lock_force_release')
-def lock_force_release():
-    """Last-resort emergency: forcibly release the GPU lock without
-    waiting for the generator to finalize. Only use when /lock_status
-    shows locked=true and no request is actually in flight (e.g. after
-    a browser disconnect that orphaned the generator). Restart the
-    server if generation still hangs after this."""
-    if 'engine' not in _state:
-        return {'released': False, 'note': 'engine not loaded'}
-    lk = _state['engine']._gpu_lock
-    try:
-        lk.release()
-        return {'released': True}
-    except RuntimeError:
-        return {'released': False, 'note': 'lock was not held'}
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--port', type=int, default=8080)
     p.add_argument('--host', default='127.0.0.1')
-    p.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct')
-    p.add_argument('--quant', choices=['none', '8bit', '4bit'], default='4bit')
+    p.add_argument('--vllm-url', default='http://localhost:8000/v1',
+                   help='vLLM OpenAI-compatible base URL')
+    p.add_argument('--model', default='Qwen/Qwen2.5-32B-Instruct-AWQ',
+                   help='Served model name (must match vllm serve <model>)')
     args = p.parse_args()
 
     import uvicorn
-    app.state.model_id = args.model
-    app.state.quant    = args.quant
+    app.state.vllm_url = args.vllm_url
+    app.state.model    = args.model
     uvicorn.run(app, host=args.host, port=args.port)
 
 
