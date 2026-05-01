@@ -9,24 +9,46 @@ common autodl layout:
 
 ## 1. Two env vars cover all download paths
 
+`export` is **per-session** by default — the variables vanish when you
+log out or the instance restarts. To make them permanent, append the
+block once to `~/.bashrc` (which is on the persistent `/root` volume
+on autodl, so it survives stop/start cycles):
+
 ```bash
-# Where vLLM / transformers / huggingface_hub put downloaded model
-# weights. Affects Qwen, bge-m3, anything pulled via from_pretrained.
+cat >> ~/.bashrc <<'EOF'
+
+# QA backend storage paths (persist across autodl restarts)
 export HF_HOME=/root/autodl-tmp/huggingface
-
-# Where THIS project's `qa.local_loader` saves its local snapshot
-# copies (currently just bge-m3's save_pretrained directory).
 export QA_MODELS_DIR=/root/autodl-tmp/qa_models
-
-# Optional: put pip / Python wheel cache on the data disk too — vLLM
-# install pulls ~9 GB of CUDA wheels which would otherwise overflow /
 export PIP_CACHE_DIR=/root/autodl-tmp/pip_cache
 export TMPDIR=/root/autodl-tmp/tmp
-mkdir -p $HF_HOME $QA_MODELS_DIR $PIP_CACHE_DIR $TMPDIR
+mkdir -p "$HF_HOME" "$QA_MODELS_DIR" "$PIP_CACHE_DIR" "$TMPDIR"
+EOF
+
+# Apply to the current shell without logging out
+source ~/.bashrc
 ```
 
-Add these to `~/.bashrc` (or autodl's persistent profile) so they
-survive container restarts.
+What each one does:
+
+| Var | Read by | Default if unset |
+|---|---|---|
+| `HF_HOME` | vLLM / transformers / huggingface_hub — Qwen, bge-m3, anything via `from_pretrained` | `~/.cache/huggingface` |
+| `QA_MODELS_DIR` | This project's `qa.local_loader` — bge-m3 `save_pretrained` copy | `<repo>/stock_data/models/` |
+| `PIP_CACHE_DIR` | pip wheel cache — vLLM install pulls ~9 GB of CUDA wheels | `~/.cache/pip` |
+| `TMPDIR` | Linux temp files (build steps, large extracts) | `/tmp` |
+
+After the one-time append, every new shell — including the one autodl
+gives you on instance restart — picks them up automatically. Verify
+on a fresh login:
+
+```bash
+echo $HF_HOME       # should print /root/autodl-tmp/huggingface
+echo $QA_MODELS_DIR # should print /root/autodl-tmp/qa_models
+```
+
+If either is empty, your `.bashrc` didn't apply — log out and back in
+or `source ~/.bashrc` manually.
 
 ## 2. Recommended directory layout on the data disk
 
