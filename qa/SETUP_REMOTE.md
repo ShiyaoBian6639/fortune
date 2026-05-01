@@ -109,17 +109,168 @@ huggingface-cli download BAAI/bge-m3
 
 # Build local bge-m3 snapshot (goes to $QA_MODELS_DIR)
 ./venv_vllm/bin/python -m qa.local_loader
-
-# Build/copy data files (entities.faiss, news.faiss, etc.) — usually
-# rsync these from your laptop or rebuild via:
-#   ./venv_vllm/bin/python -m qa.build_alias_dict
-#   ./venv_vllm/bin/python -m qa.linker.predict
-#   ./venv_vllm/bin/python -m qa.build_concept_tags
-#   ./venv_vllm/bin/python -m qa.build_entity_index
-#   ./venv_vllm/bin/python -m qa.build_news_index
 ```
 
-## 5. Sanity-check the env vars are honoured
+After this, the venv + models are on disk, but `stock_data/` is still
+empty. Pick **one** of the next two options to populate it.
+
+## 5. Get the data files
+
+The QA backend needs ~30 GB of data files under `stock_data/` —
+half are raw Tushare pulls, half are pre-built FAISS indexes /
+parquets. Two paths to get them:
+
+### Option A — rsync from your local machine (fastest, ~30 min)
+
+If you already have everything built locally (the case after running
+the QA pipeline on your laptop), just transfer the files. From your
+local repo:
+
+```bash
+# Replace <user>@<host>:<port> with your autodl ssh creds
+RSYNC_DEST="root@region-1.autodl.com:22000:/root/autodl-tmp/tushare"
+
+# Required minimum for QA inference (~10 GB)
+rsync -avzP --info=progress2 stock_data/qa/         $RSYNC_DEST/stock_data/qa/
+rsync -avzP --info=progress2 stock_data/sh/         $RSYNC_DEST/stock_data/sh/
+rsync -avzP --info=progress2 stock_data/sz/         $RSYNC_DEST/stock_data/sz/
+rsync -avzP --info=progress2 stock_data/fina_indicator/ \
+                                                    $RSYNC_DEST/stock_data/fina_indicator/
+rsync -avzP --info=progress2 stock_data/static_features/ \
+                                                    $RSYNC_DEST/stock_data/static_features/
+rsync -avzP --info=progress2 stock_data/stock_list.csv stock_data/stock_sectors.csv \
+                                stock_data/news_sentiment_qwen.csv \
+                                                    $RSYNC_DEST/stock_data/
+
+# Optional: only if you plan to RE-RUN the linker on the remote
+# (otherwise news_linked.parquet alone is enough for QA inference).
+rsync -avzP --info=progress2 stock_data/news_corpus_dedup.parquet \
+                                stock_data/news_corpus_dedup_codes.parquet \
+                                                    $RSYNC_DEST/stock_data/
+```
+
+`-z` compresses over the wire — important for parquet/CSV which
+compress well. `-P` shows progress and resumes interrupted transfers.
+
+### Option B — fresh fetch + rebuild on the remote (clean, ~6–8 hr)
+
+Only needed if you don't have the data locally. The remote machine
+has Tushare access from US.
+
+```bash
+# 1. Configure Tushare token (one-time)
+# Edit dl/config.py and paste your Tushare Pro token in TUSHARE_TOKEN.
+
+# 2. Pull stock daily bars (forward + backward fill, ~30 min)
+./venv_vllm/bin/python extend_stock_data.py --update --workers 8
+
+# 3. Pull static features (~5 min)
+./venv_vllm/bin/python -m api.static_features --source stock_company
+./venv_vllm/bin/python -m api.static_features --source index_member_pit
+
+# 4. Pull fundamentals (~10 min, fina_indicator across all stocks)
+./venv_vllm/bin/python -m api.fina_extras   # whatever the entry point is
+
+# 5. Pull news corpus (~3-5 hr — the long pole)
+./venv_vllm/bin/python main.py              # runs features.news.run('download')
+
+# 6. Pull main_business + business_scope sidecar (~30 sec)
+./venv_vllm/bin/python -m qa.fetch_company_business
+
+# 7. Build all QA-derived artifacts in order:
+./venv_vllm/bin/python -m qa.build_alias_dict       # ~5 sec
+./venv_vllm/bin/python -m qa.linker.predict          # ~1 min over 1.95 M articles
+./venv_vllm/bin/python -m qa.build_concept_tags      # ~30 sec
+./venv_vllm/bin/python -m qa.build_entity_index      # ~30 sec on GPU
+./venv_vllm/bin/python -m qa.linker.train_reranker   # ~5 min
+./venv_vllm/bin/python -m qa.linker.predict --use_dense  # ~80 min, optional
+./venv_vllm/bin/python -m qa.build_news_index        # ~110 min on RTX 4070;
+                                                     # ~50 min on RTX 5090
+```
+
+Steps 5 and 7-final (news index) are the slow ones. If you don't need
+free-text news semantic search at first, skip step 7-final and the
+QA backend still works (alias + entity-semantic paths cover most
+queries — 75 % of the demo passes without it).
+
+## 6. What ends up under stock_data/ — file-by-file
+
+After either option, you should have:
+
+| Path | Size | Purpose |
+|---|---|---|
+| `stock_data/sh/<code>.csv` × 2,400 | ~1.8 GB | SH daily price bars (price summary in QA context) |
+| `stock_data/sz/<code>.csv` × 3,000 | ~2.2 GB | SZ daily price bars |
+| `stock_data/fina_indicator/*.csv` × 5,200 | ~150 MB | Quarterly fundamentals (EPS / ROE / margins) |
+| `stock_data/static_features/stock_company.csv` | ~1 MB | Company info (chairman / manager / sector) |
+| `stock_data/static_features/index_member_pit.csv` | ~5 MB | CSI300 / SSE50 membership over time |
+| `stock_data/stock_list.csv` | <1 MB | Stock universe |
+| `stock_data/stock_sectors.csv` | <1 MB | Shenwan sector taxonomy |
+| `stock_data/news_sentiment_qwen.csv` | ~3 MB | Sentiment trend (used in entity card context) |
+| `stock_data/news_corpus_dedup.parquet` | ~1.2 GB | Raw deduped news corpus *(only needed for re-linking)* |
+| `stock_data/news_corpus_dedup_codes.parquet` | ~70 MB | Regex-confirmed positives *(only needed for reranker training)* |
+| **`stock_data/qa/aliases.json`** | ~3 MB | **Alias dict — required** |
+| **`stock_data/qa/news_linked.parquet`** | ~134 MB | **Linker output — required** |
+| **`stock_data/qa/entities.faiss`** + `entities.parquet` | ~25 MB | **Entity index — required** |
+| `stock_data/qa/concept_tags.json` | ~0.6 MB | News-derived concept tags |
+| `stock_data/qa/company_business.csv` | ~5 MB | Tushare main_business (preserved for future use) |
+| `stock_data/qa/linker_reranker.pkl` | small | Optional dense reranker |
+| **`stock_data/qa/news.faiss`** + `news_meta.parquet` | ~8.5 GB | **News index — required for free-text article search** |
+
+The four bolded files are the must-have minimum if you only want
+inference. Everything else is either a build input (raw data) or
+optional enhancement.
+
+## 7. Verify the data is in place
+
+```bash
+./venv_vllm/bin/python -c "
+from pathlib import Path
+import pandas as pd, json
+
+DATA = Path('stock_data')
+checks = [
+  ('aliases',          DATA/'qa/aliases.json',          'json',    5000),
+  ('news_linked',      DATA/'qa/news_linked.parquet',   'parquet', 400_000),
+  ('entities.faiss',   DATA/'qa/entities.faiss',        'exists',  None),
+  ('entities.parquet', DATA/'qa/entities.parquet',      'parquet', 5000),
+  ('news.faiss',       DATA/'qa/news.faiss',            'exists',  None),
+  ('news_meta',        DATA/'qa/news_meta.parquet',     'parquet', 1_500_000),
+  ('fina_indicator',   DATA/'fina_indicator',           'dir',     5000),
+  ('sh prices',        DATA/'sh',                       'dir',     2000),
+  ('sz prices',        DATA/'sz',                       'dir',     2500),
+]
+for name, p, kind, min_n in checks:
+  if not p.exists():
+    print(f'  MISSING {name}: {p}')
+    continue
+  if kind == 'json':
+    n = len(json.loads(p.read_text(encoding='utf-8')))
+  elif kind == 'parquet':
+    n = len(pd.read_parquet(p))
+  elif kind == 'dir':
+    n = len(list(p.glob('*')))
+  else:
+    n = p.stat().st_size
+  ok = '[ok]' if (min_n is None or n >= min_n) else '[low]'
+  print(f'  {ok} {name:<18} count/size = {n:>12,}')
+"
+```
+
+Expected output:
+```
+  [ok] aliases             count/size =        5,190
+  [ok] news_linked         count/size =      548,231
+  [ok] entities.faiss      count/size =   23,789,632
+  [ok] entities.parquet    count/size =        5,190
+  [ok] news.faiss          count/size = 8,545,239,316
+  [ok] news_meta           count/size =    1,951,451
+  [ok] fina_indicator      count/size =        5,200
+  [ok] sh prices           count/size =        2,454
+  [ok] sz prices           count/size =        3,077
+```
+
+## 8. Sanity-check the env vars are honoured
 
 ```bash
 ./venv_vllm/bin/python -c "
@@ -133,7 +284,7 @@ print('BGE_M3_LOCAL_DIR:', BGE_M3_LOCAL_DIR)
 # All paths should be under /root/autodl-tmp
 ```
 
-## 6. Optional: skip the bge-m3 local snapshot (save 2.3 GB)
+## 9. Optional: skip the bge-m3 local snapshot (save 2.3 GB)
 
 `qa.local_loader.ensure_bge_m3` does a `save_pretrained` copy of
 bge-m3 from the HF cache to `$QA_MODELS_DIR/bge-m3/`. The original
@@ -152,7 +303,7 @@ print(h.snapshot_download('BAAI/bge-m3', local_files_only=True).rsplit('/bge-m3'
 This makes `BGE_M3_LOCAL_DIR` resolve to the HF cache snapshot —
 `ensure_bge_m3` finds `config.json` already there and is a no-op.
 
-## 7. Running the QA backend on vLLM
+## 10. Running the QA backend on vLLM
 
 (Forthcoming — once `qa/rag/qa_engine.py` is refactored to talk to
 vLLM via the OpenAI client, you'll start the stack as:)
