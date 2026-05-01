@@ -425,3 +425,226 @@ Expected on Qwen2.5-32B-AWQ + vLLM: substantially fewer rep loops,
 better synthesis quality, ~3 s per question avg vs ~10 s on the 7B
 int4. Re-enable `main_business` in `qa/build_entity_index.py` first
 — the v4/v5 regression on 7B doesn't recur with the bigger model.
+
+## 11. Build derived data ON the VM (skip the 8.5 GB upload)
+
+If your upload bandwidth is slow, transfer **only the build inputs**
+and let the 5090 rebuild the heavy outputs (`news.faiss`,
+`news_linked.parquet`, `entities.faiss`, etc.) locally. Net savings:
+~10 GB of upload, ~50 min of GPU compute.
+
+### What to upload
+
+| Path | Size | Why |
+|---|---|---|
+| `stock_data/news_corpus_dedup.parquet` | ~1.2 GB | input to linker.predict + build_news_index |
+| `stock_data/sh/` × 2,400 | ~1.8 GB | OHLCV (price section + forecast TA) |
+| `stock_data/sz/` × 3,000 | ~2.2 GB | same |
+| `stock_data/fina_indicator/` × 5,200 | ~150 MB | quarterly fundamentals |
+| `stock_data/static_features/*.csv` | ~10 MB | sectors, index members |
+| `stock_data/stock_list.csv` + `stock_sectors.csv` | <1 MB | universe |
+| `stock_data/news_sentiment_qwen.csv` | ~3 MB | sentiment trend |
+
+Optional but useful:
+| `stock_data/news_corpus_dedup_codes.parquet` | ~70 MB | regex-confirmed positives for the linker reranker |
+
+**Total upload: ~5.5 GB** (vs ~13 GB if you also push the derived qa/
+files).
+
+```bash
+HOST=region-1.autodl.com
+PORT=22000
+DEST=root@$HOST:/root/autodl-tmp/fortune/stock_data/
+SSH="ssh -p $PORT"
+rsync -avzP -e "$SSH" \
+    stock_data/news_corpus_dedup.parquet \
+    stock_data/news_corpus_dedup_codes.parquet \
+    stock_data/sh/ stock_data/sz/ \
+    stock_data/fina_indicator/ stock_data/static_features/ \
+    stock_data/stock_list.csv stock_data/stock_sectors.csv \
+    stock_data/news_sentiment_qwen.csv \
+    $DEST
+```
+
+### Build sequence on the VM
+
+In dependency order. Each command writes its output under
+`stock_data/qa/`:
+
+```bash
+cd /root/autodl-tmp/fortune       # or wherever you cloned the repo
+source venv_vllm/bin/activate
+
+# 1. Build alias dict from raw CSVs (~5 sec)
+python -m qa.build_alias_dict
+
+# 2. Build the news linker output (~1 min on 1.95 M rows, CPU)
+#    Reads: news_corpus_dedup.parquet + qa/aliases.json
+#    Writes: qa/news_linked.parquet  ← THIS IS WHAT THE API NEEDS
+python -m qa.linker.predict
+
+# 3. Mine concept tags from the linker output (~30 sec)
+python -m qa.build_concept_tags
+
+# 4. Pull main_business / business_scope from Tushare (~30 sec)
+#    Configure dl/config.py with TUSHARE_TOKEN first if not already.
+python -m qa.fetch_company_business
+
+# 5. Build the entity FAISS index (~30 sec on GPU; bge-m3 must be cached)
+python -m qa.build_entity_index
+
+# 6. (Optional) Train the linker reranker (~5 min)
+python -m qa.linker.train_reranker
+
+# 7. (Optional) Re-run linker with reranker boost (~30 min on 5090)
+python -m qa.linker.predict --use_dense
+
+# 8. Build the news FAISS index (~50 min on RTX 5090)
+#    Reads: news_corpus_dedup.parquet
+#    Writes: qa/news.faiss + qa/news_meta.parquet
+python -m qa.build_news_index
+```
+
+After step 2 the API server can already start (see §10) — steps 3–8
+add semantic news search and concept-tag fallback. Step 8 is the long
+pole; skip it if you only want fundamentals + alias-driven queries
+working today.
+
+### Verify after build
+
+```bash
+ls -lh stock_data/qa/
+# Expected:
+#   aliases.json          ~3 MB
+#   news_linked.parquet   ~134 MB
+#   concept_tags.json     ~1 MB
+#   company_business.csv  ~5 MB
+#   entities.faiss        ~22 MB
+#   entities.parquet      ~1 MB
+#   news.faiss            ~8.5 GB    (after step 8)
+#   news_meta.parquet     ~70 MB     (after step 8)
+```
+
+## 12. Run the full service + share the UI
+
+Three screen sessions = three long-running processes. Make sure §1
+env vars are loaded (`source ~/.bashrc`) and the venv is activated.
+
+```bash
+cd /root/autodl-tmp/fortune
+source venv_vllm/bin/activate
+
+# ─── Terminal A — vLLM (Qwen on GPU at :8000) ───
+screen -S vllm
+vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 8192 \
+    --quantization awq_marlin \
+    --port 8000
+# Ctrl+A then D to detach
+
+# ─── Terminal B — FastAPI (retrieval + cache + log at :8080) ───
+screen -S api
+python -m qa.api.server \
+    --vllm-url http://localhost:8000/v1 \
+    --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --host 0.0.0.0 --port 8080
+# Ctrl+A then D
+
+# ─── Terminal C — Gradio UI (at :7860) ───
+screen -S ui
+python -m qa.api.gradio_app \
+    --api http://127.0.0.1:8080 \
+    --host 0.0.0.0 --port 7860
+# Ctrl+A then D
+```
+
+Reattach any session with `screen -r <name>`. List with `screen -ls`.
+
+Note `http://localhost:8000/v1` (with the `/v1` suffix) — that's the
+OpenAI-compatible base URL. A typo like `/v` will load the API server
+fine but every `/ask` call fails on the upstream.
+
+### Verify locally on the VM
+
+```bash
+curl -s http://localhost:8080/healthz                # {"status":"ok"}
+curl -s http://localhost:8080/vllm_health            # served_models lists Qwen
+curl -s http://localhost:7860/ | head -3             # Gradio HTML
+```
+
+### Three ways to share the UI publicly
+
+#### Option A — autodl built-in tunnel (recommended for autodl)
+
+autodl's web console has a port-forwarding feature ("自定义服务"):
+
+1. Instance dashboard → **更多 → 自定义服务**
+2. Add port `7860` → autodl gives a URL like
+   `https://u123456-port7860.region-1.autodl.com`
+3. Send that URL. HTTPS, no expiry, autodl-native.
+
+#### Option B — Gradio's built-in share tunnel (instant, 72 h)
+
+Restart Terminal C with `--share`:
+
+```bash
+python -m qa.api.gradio_app \
+    --api http://127.0.0.1:8080 \
+    --host 0.0.0.0 --port 7860 --share
+```
+
+On Linux, Gradio auto-downloads `frpc` on first run (no Defender
+issues like on Windows). Output shows `Running on public URL:
+https://<random>.gradio.live`. Free, HTTPS, expires in 72 h.
+
+#### Option C — Cloudflare Tunnel (no expiry, free)
+
+```bash
+# One-time install on the VM
+wget -qO cloudflared \
+    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+chmod +x cloudflared
+sudo mv cloudflared /usr/local/bin/
+
+# Open a 4th screen session for the tunnel
+screen -S tunnel
+cloudflared tunnel --url http://localhost:7860
+# prints: https://<random>.trycloudflare.com
+# Ctrl+A then D
+```
+
+Stays alive while `cloudflared` runs. Stop with `screen -r tunnel`
+then Ctrl+C. Free, HTTPS, no expiry, no account.
+
+### Add basic auth before sharing
+
+Anyone with the public URL can hit your GPU. Edit
+`qa/api/gradio_app.py:demo.launch(...)` to add:
+
+```python
+demo.launch(server_name=args.host, server_port=args.port,
+            share=args.share, auth=("guest", "your-shared-password"))
+```
+
+Restart Terminal C. Visitors will see a login screen first.
+
+### Send users this cheat sheet
+
+```
+🔗 https://<your-public-url>
+
+试试这些问题：
+  • 600519.SH 业绩怎么样
+  • 茅台最近有什么新闻
+  • 锂电池龙头股有哪些
+  • 钙钛矿电池标的
+  • 宁德时代前景如何      ← 触发"模型预测"板块
+  • 比亚迪未来走势怎样     ← 触发"模型预测"板块
+  • 美联储加息对A股的影响  ← 政策类问题
+```
+
+The forecast keywords (`前景`, `未来走势`, `预测`, `看多`, `看空`,
+`后市`) trigger the new model-prediction block (§Phase 2 forecast
+integration) with the disclaimer "基于模型预测，仅供参考，不构成
+投资建议".
