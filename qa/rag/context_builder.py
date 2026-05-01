@@ -176,15 +176,66 @@ class ContextBuilder:
                 out.append(f"- {_render(a)}")
         return '\n'.join(out) + '\n'
 
+    # ─── Forecast section ──────────────────────────────────────────────────
+    def _fmt_forecast(self, ts_code: str, fp) -> str:
+        """Render the modelfactory vote summary + top features for one
+        ts_code. Always emits the disclaimer line. Returns '' if the
+        ts_code isn't covered by the live predictions."""
+        s = fp.summary(ts_code, n_days=14, max_features=5,
+                        max_with_values=2)
+        if not s.get('covered'):
+            return ''
+
+        v = self._aliases.get(ts_code, {})
+        name = v.get('name', '')
+        out = [f"### 模型预测 — 仅供参考 ({ts_code} {name})",
+               f"预测日期：{s.get('trade_date','—')}"]
+
+        n_total = s['n_models_total']
+        n_up    = s['n_models_up']
+        out.append(f"- 模型投票：**{n_up} / {n_total} 看多**")
+        if s.get('binary_up_prob') is not None:
+            out.append(f"- 二分类上涨概率（xgb+lgb+catboost 均值）: "
+                       f"{100*s['binary_up_prob']:.1f}%")
+        if s.get('reg_next_day_pct') is not None:
+            out.append(f"- 次日收益预测（regression 均值）: "
+                       f"{s['reg_next_day_pct']:+.2f}%")
+        if s.get('reg_5d_pct') is not None:
+            out.append(f"- 5 日累计收益预测（regression 均值）: "
+                       f"{s['reg_5d_pct']:+.2f}%")
+
+        if s.get('top_features'):
+            out.append('')
+            out.append('**Top 关键特征**（按 XGB regression r_close_close 重要性）：')
+            for i, f in enumerate(s['top_features'], 1):
+                desc = f' — {f["desc"]}' if f.get('desc') else ''
+                imp  = f.get('importance')
+                imp_str = f"importance {imp/1e6:.2f}M" if imp else "(TA fallback)"
+                line = f"{i}. `{f['name']}`{desc}（{imp_str}）"
+                if f.get('recent'):
+                    tail = f['recent'][-7:]   # last week's worth
+                    series = ' → '.join(f"{val:.2f}" for _, val in tail)
+                    line += f" 近期: {series}"
+                out.append(line)
+
+        out.append('')
+        out.append('> 基于模型预测，仅供参考，不构成投资建议。')
+        return '\n'.join(out) + '\n'
+
     # ─── Top-level interface ───────────────────────────────────────────────
     def build_for(self, ts_codes: List[str], articles: List[dict],
-                   max_tokens: int = 3500) -> str:
+                   max_tokens: int = 3500,
+                   fp = None,
+                   include_forecast: bool = False) -> str:
         sections = []
         for ts in ts_codes:
             sections.append(self._fmt_entity(ts))
             sections.append(self._fmt_fundamentals(ts))
             sections.append(self._fmt_price(ts))
             sections.append(self._fmt_sentiment(ts))
+            if include_forecast and fp is not None:
+                fc = self._fmt_forecast(ts, fp)
+                if fc: sections.append(fc)
         sections.append(self._fmt_news(articles, ts_codes))
 
         # Greedy concat with a token-budget guard

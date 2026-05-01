@@ -40,8 +40,10 @@ import re
 import time
 from typing import Iterator, Optional
 
-from openai import OpenAI
-
+# `openai` is only needed when QAEngine is instantiated against vLLM —
+# import it lazily so test scripts and tooling on machines without
+# the openai package can still use is_forecast_query / pick_max_new_tokens
+# / SYSTEM_PROMPT etc.
 from qa.rag.retriever import Retriever
 from qa.rag.context_builder import ContextBuilder
 
@@ -50,11 +52,21 @@ from qa.rag.context_builder import ContextBuilder
 _RE_SHORT  = re.compile(r'(是多少|多少元|多少钱|多少倍|什么时候|哪一年|哪天|是哪个|是谁|代码是|属于哪)')
 _RE_LONG   = re.compile(r'(新闻|消息|动态|进展|影响|对比|比较|分析|趋势|为什么|怎么看|策略|展望|预测)')
 
+# Forecast-flavoured queries — when these appear AND ts_codes resolve,
+# we add a "模型预测" section to the context using ForecastProvider.
+_RE_FORECAST = re.compile(
+    r'(未来|前景|趋势|预测|走势|涨跌|看多|看空|展望|后市|目标价|短期|中长期|短线|中线|长线|建议|怎么看|怎么样)'
+)
+
 
 def pick_max_new_tokens(question: str, default: int = 400) -> int:
     if _RE_SHORT.search(question): return 200
     if _RE_LONG.search(question):  return 700
     return default
+
+
+def is_forecast_query(question: str) -> bool:
+    return bool(_RE_FORECAST.search(question))
 
 
 # ─── System prompt ───────────────────────────────────────────────────────────
@@ -71,7 +83,14 @@ SYSTEM_PROMPT = """你是一名严谨的中国A股研究助手。
    - 新闻问题 → 3-5 条最相关的新闻，编号从 1 开始连续。
    - 比较问题 → Markdown 表格直接对比。
    - 行业/概念查询 → 先点名 2-3 家代表公司，再给资料中的关键数据/新闻支持。
-7. 用中文回答，专业但易读，控制在 600 字以内。"""
+7. **如果资料中出现"模型预测"板块（未来走势 / 前景 / 预测类问题）：**
+   - 必须开头注明"基于模型预测，仅供参考"
+   - 复述模型投票结果（X / Y 看多）和上涨概率
+   - 引用 1–2 个 Top 特征及其近期数值作为佐证（注意：是佐证，不是依据）
+   - 如有近期 RSI / 动量 数值，结合数值做简短解读（如 RSI > 70 偏超买、< 30 偏超卖）
+   - **不得给出明确的买入 / 卖出建议**；以 "中性 / 偏多 / 偏空 / 信号分歧" 等表述结尾
+   - 回答末尾必须保留 "基于模型预测，仅供参考，不构成投资建议"
+8. 用中文回答，专业但易读，控制在 600 字以内。"""
 
 
 # ─── Engine ──────────────────────────────────────────────────────────────────
@@ -93,6 +112,7 @@ class QAEngine:
                  device: str = 'cuda',
                  quant: str | None = None,
                  model_id: str | None = None):
+        from openai import OpenAI
         self.vllm_url = vllm_url
         self.model    = model_id or model
         self.max_new_tokens = max_new_tokens
@@ -174,19 +194,33 @@ class QAEngine:
 
     # ─── Retrieval + answer ───────────────────────────────────────────────
     def _retrieve_and_build(self, question, retriever, builder,
-                              top_k, max_context_tokens):
+                              top_k, max_context_tokens, forecast=None):
         out = retriever.search(question, top_k=top_k)
+        # Only ask the context_builder to render the forecast section
+        # when (a) the user query is forecast-flavoured AND (b) we
+        # actually have a ForecastProvider AND (c) at least one ts_code
+        # was resolved. The provider itself returns '' for un-covered
+        # ts_codes so this is a cheap-no-op when the data isn't there.
+        include_forecast = (
+            forecast is not None
+            and bool(out.get('ts_codes'))
+            and is_forecast_query(question)
+        )
         context = builder.build_for(out['ts_codes'], out['articles'],
-                                      max_tokens=max_context_tokens)
+                                      max_tokens=max_context_tokens,
+                                      fp=forecast,
+                                      include_forecast=include_forecast)
         return out, context
 
     def ask(self, question: str,
              retriever: Retriever,
              builder: ContextBuilder,
              top_k: int = 5,
-             max_context_tokens: int = 3200) -> dict:
+             max_context_tokens: int = 3200,
+             forecast=None) -> dict:
         out, context = self._retrieve_and_build(question, retriever, builder,
-                                                  top_k, max_context_tokens)
+                                                  top_k, max_context_tokens,
+                                                  forecast=forecast)
         if not out['ts_codes'] and not out['articles']:
             answer = ("未能识别出问题相关的A股或新闻。请尝试包含股票代码、"
                        "公司名称或具体行业关键词。")
@@ -207,14 +241,16 @@ class QAEngine:
                     retriever: Retriever,
                     builder: ContextBuilder,
                     top_k: int = 5,
-                    max_context_tokens: int = 3200) -> Iterator[dict]:
+                    max_context_tokens: int = 3200,
+                    forecast=None) -> Iterator[dict]:
         """Yield events:
             {'event':'meta',  'ts_codes':..., 'n_articles':..., 'context_chars':...}
             {'event':'token', 'text': '...'}            (zero or more)
             {'event':'done',  'elapsed_seconds': ...}
         """
         out, context = self._retrieve_and_build(question, retriever, builder,
-                                                  top_k, max_context_tokens)
+                                                  top_k, max_context_tokens,
+                                                  forecast=forecast)
         yield {
             'event': 'meta',
             'ts_codes':      out['ts_codes'],

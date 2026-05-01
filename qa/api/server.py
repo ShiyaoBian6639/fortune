@@ -47,6 +47,7 @@ from fastapi.responses import StreamingResponse
 from qa.rag.retriever import Retriever
 from qa.rag.context_builder import ContextBuilder
 from qa.rag.qa_engine import QAEngine
+from qa.rag.forecast import ForecastProvider
 
 
 QA_LOG_PATH = Path('stock_data/qa/qa_log.jsonl')
@@ -115,6 +116,14 @@ async def lifespan(app: FastAPI):
     _state['retriever']._ensure_embedder()
     print(f"[api] bge-m3 ready in {time.time()-_t0:.1f}s", flush=True)
     _state['builder'] = ContextBuilder('stock_data/qa/aliases.json')
+    # ForecastProvider — rendered into context only when the query is
+    # forecast-flavoured (前景 / 未来走势 / 预测 / ...). Loads ~5 MB of
+    # live model CSVs at startup; query-time cost is microseconds.
+    try:
+        _state['forecast'] = ForecastProvider()
+    except Exception as e:
+        print(f"[api] forecast provider unavailable: {e}", flush=True)
+        _state['forecast'] = None
     _state['engine']  = QAEngine(vllm_url=app.state.vllm_url,
                                     model=app.state.model)
     with open('stock_data/qa/aliases.json', 'r', encoding='utf-8') as f:
@@ -186,6 +195,7 @@ def ask(body: AskBody, request: Request):
     out = _state['engine'].ask(
         body.query, _state['retriever'], _state['builder'],
         top_k=body.top_k, max_context_tokens=body.max_context_tokens,
+        forecast=_state.get('forecast'),
     )
     out['elapsed_seconds'] = time.time() - t0
     out['cached'] = False
@@ -236,7 +246,8 @@ def ask_stream(body: AskBody, request: Request):
 
         gen = engine.ask_stream(body.query, retriever, builder,
                                   top_k=body.top_k,
-                                  max_context_tokens=body.max_context_tokens)
+                                  max_context_tokens=body.max_context_tokens,
+                                  forecast=_state.get('forecast'))
         try:
             for ev in gen:
                 if ev['event'] == 'meta':
