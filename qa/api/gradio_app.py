@@ -112,10 +112,22 @@ def main():
         except Exception as e:
             yield f"❌ error: {e}"
 
-    with gr.Blocks(title='无能囃人A股深度解析') as demo:
-        gr.Markdown("# 无能囃人A股深度解析")
-        gr.Markdown("基于 tushare 全量数据 + Qwen2.5-7B + RAG。"
-                    "可问业绩、新闻、对比等。")
+    # Three demo questions hand-picked to cover the distinct capability
+    # axes of the system — each one exercises a different retrieval +
+    # context branch the user might not realise is available.
+    EXAMPLES = [
+        # 1. Fundamentals + news + price summary on a single stock
+        '600519.SH 最近一季度业绩怎么样？',
+        # 2. Industry-leader / concept resolution (entity-semantic + concept tags)
+        '钙钛矿电池标的有哪些？',
+        # 3. Forecast block — modelfactory votes + RSI/momentum trend
+        '宁德时代未来走势怎样？',
+    ]
+
+    with gr.Blocks(title='能工智人A股深度解析') as demo:
+        gr.Markdown("# 能工智人A股深度解析")
+        gr.Markdown("可问业绩、新闻、对比、趋势。"
+                    "**仅供参考，不作为投资建议。股市有风险，投资需谨慎。**")
         with gr.Row():
             ts_filter = gr.Dropdown(
                 choices=dropdown_choices,
@@ -132,6 +144,11 @@ def main():
                               placeholder="例如: 茅台最近一季业绩如何?  (Enter 提交, Shift+Enter 换行)",
                               lines=2, scale=4)
             submit = gr.Button("提交", variant='primary', scale=1)
+
+        gr.Markdown("**示例问题（点击试用）**：")
+        with gr.Row():
+            example_btns = [gr.Button(q, size='sm') for q in EXAMPLES]
+
         clear = gr.Button("清空")
 
         def respond(msg, history, ts_filter):
@@ -148,8 +165,25 @@ def main():
                 history[-1] = {'role': 'assistant', 'content': partial}
                 yield '', history
 
+        def submit_example(q, history, ts_filter):
+            # Same pipeline as a manual submit: append user msg, stream
+            # assistant message in. Don't echo into the textbox — the
+            # example button is a one-click "ask".
+            history = history + [
+                {'role': 'user',      'content': q},
+                {'role': 'assistant', 'content': ''},
+            ]
+            for partial in ask_qa_stream(q, ts_filter):
+                history[-1] = {'role': 'assistant', 'content': partial}
+                yield history
+
         msg.submit(respond, [msg, chatbot, ts_filter], [msg, chatbot])
         submit.click(respond, [msg, chatbot, ts_filter], [msg, chatbot])
+        for btn, q in zip(example_btns, EXAMPLES):
+            btn.click(
+                lambda hist, ts, q=q: (yield from submit_example(q, hist, ts)),
+                [chatbot, ts_filter], [chatbot],
+            )
         clear.click(lambda: [], None, chatbot)
 
     demo.launch(server_name=args.host, server_port=args.port, share=args.share)
