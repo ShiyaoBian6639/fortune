@@ -6,8 +6,24 @@ After the one-time download, every load reads from a filesystem path with
 ``local_files_only=True`` — no HuggingFace network calls, no background
 safetensors-conversion thread.
 
+Storage paths (configurable via env vars — important for cloud GPUs
+like autodl where the system disk is small):
+
+  HF_HOME             override for the HuggingFace cache (vLLM, Qwen,
+                      transformers all read this). Set to a data-disk
+                      path before running anything that downloads.
+                      Default: ``~/.cache/huggingface/``
+
+  QA_MODELS_DIR       override for THIS project's local model snapshots
+                      (the save_pretrained copy of bge-m3). Default:
+                      ``<repo>/stock_data/models/``.
+
+Typical autodl setup (200 GB at /root/autodl-tmp):
+    export HF_HOME=/root/autodl-tmp/huggingface
+    export QA_MODELS_DIR=/root/autodl-tmp/qa_models
+
 Models managed:
-  BAAI/bge-m3   →  stock_data/models/bge-m3/
+  BAAI/bge-m3   →  $QA_MODELS_DIR/bge-m3/
 """
 from __future__ import annotations
 
@@ -24,7 +40,11 @@ transformers.logging.set_verbosity_error()
 from transformers import AutoModel, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = ROOT / 'stock_data' / 'models'
+
+# Allow callers / cloud deployments to redirect the entire models
+# directory to a data disk via env var, without code changes.
+_DEFAULT_MODELS_DIR = ROOT / 'stock_data' / 'models'
+MODELS_DIR = Path(os.environ.get('QA_MODELS_DIR', _DEFAULT_MODELS_DIR))
 
 BGE_M3_LOCAL_DIR = MODELS_DIR / 'bge-m3'
 BGE_M3_HF_ID     = 'BAAI/bge-m3'
@@ -42,13 +62,20 @@ def _find_hf_snapshot(hf_model_id: str) -> Optional[Path]:
         return None
 
 
-def ensure_bge_m3(local_dir: Path = BGE_M3_LOCAL_DIR) -> Path:
+def ensure_bge_m3(local_dir: Path | None = None) -> Path:
     """Idempotent: copy/download BAAI/bge-m3 to ``local_dir``.
 
     Returns the local directory path. After first call:
       - tokenizer + model can be loaded with ``local_files_only=True``
       - no network calls for any subsequent load
+
+    ``local_dir`` resolution order:
+      1. explicit argument
+      2. $QA_MODELS_DIR/bge-m3 (env var, picked up at module load)
+      3. <repo>/stock_data/models/bge-m3 (default)
     """
+    if local_dir is None:
+        local_dir = BGE_M3_LOCAL_DIR
     local_dir = Path(local_dir)
     if (local_dir / 'config.json').exists():
         return local_dir
