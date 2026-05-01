@@ -124,32 +124,63 @@ def main():
         '宁德时代未来走势怎样？',
     ]
 
-    with gr.Blocks(title='能工智人A股深度解析') as demo:
+    # Mobile-friendly layout. Key principles:
+    #   1. Single column on phones — gr.Row defaults wrap when items don't
+    #      fit, but we further force min-widths so the chat doesn't get
+    #      squashed by the dropdown next to it on small screens.
+    #   2. Chatbot uses min_height + max_height (instead of fixed height)
+    #      so it scales with viewport; on phones it shrinks gracefully.
+    #   3. Example buttons get a min-width so they wrap to 1 / 2 / 3 columns
+    #      depending on width.
+    #   4. Custom CSS adds touch-target sizing + viewport-aware paddings.
+    _mobile_css = """
+    .gradio-container { max-width: 1100px !important; margin: 0 auto !important; }
+    .gradio-container .prose { font-size: 1rem; line-height: 1.55; }
+    /* On narrow viewports stack everything vertically */
+    @media (max-width: 720px) {
+        .gradio-container { padding: 0.5rem !important; }
+        .gradio-container .prose h1 { font-size: 1.4rem !important; margin: 0.3rem 0 !important; }
+        .gradio-container .prose p  { font-size: 0.9rem !important; }
+        .gr-button { min-height: 44px !important; padding: 8px 12px !important; }
+        .gr-textbox textarea { font-size: 16px !important; }   /* prevent iOS zoom on focus */
+    }
+    /* Example-question buttons — wrap nicely on any width */
+    .examples-row { gap: 6px !important; }
+    .examples-row > * { flex: 1 1 240px !important; min-width: 220px !important; }
+    """
+
+    with gr.Blocks(title='能工智人A股深度解析',
+                    theme=gr.themes.Soft(),
+                    css=_mobile_css) as demo:
         gr.Markdown("# 能工智人A股深度解析")
         gr.Markdown("可问业绩、新闻、对比、趋势。"
                     "**仅供参考，不作为投资建议。股市有风险，投资需谨慎。**")
-        with gr.Row():
-            ts_filter = gr.Dropdown(
-                choices=dropdown_choices,
-                value=None,                # start empty — no auto-selected stock
-                label="股票筛选 (可选, 输入代码或名称片段即可过滤; 留空表示不限定)",
-                interactive=True,
-                allow_custom_value=True,
-                filterable=True,
-                scale=1,
-            )
-            chatbot = gr.Chatbot(height=500, scale=3)
+
+        # Filter dropdown is now full-width above the chat (was a side
+        # column at scale=1 — squashed on phones, wasted on desktop too).
+        ts_filter = gr.Dropdown(
+            choices=dropdown_choices,
+            value=None,
+            label="股票筛选 (可选, 输入代码或名称片段即可过滤; 留空表示不限定)",
+            interactive=True,
+            allow_custom_value=True,
+            filterable=True,
+        )
+
+        chatbot = gr.Chatbot(height=None, min_height=320, max_height=600,
+                              show_label=False)
+
         with gr.Row():
             msg = gr.Textbox(label="问题",
                               placeholder="例如: 茅台最近一季业绩如何?  (Enter 提交, Shift+Enter 换行)",
-                              lines=2, scale=4)
-            submit = gr.Button("提交", variant='primary', scale=1)
+                              lines=2, scale=5, min_width=200)
+            submit = gr.Button("提交", variant='primary', scale=1, min_width=80)
 
         gr.Markdown("**示例问题（点击试用）**：")
-        with gr.Row():
+        with gr.Row(elem_classes=['examples-row']):
             example_btns = [gr.Button(q, size='sm') for q in EXAMPLES]
 
-        clear = gr.Button("清空")
+        clear = gr.Button("清空对话", size='sm')
 
         def respond(msg, history, ts_filter):
             if not msg or not msg.strip():
