@@ -103,9 +103,14 @@ python -m venv venv_vllm
 source venv_vllm/bin/activate
 pip install vllm openai requests fastapi uvicorn faiss-cpu pandas pyarrow
 
-# Pre-download models (everything goes to $HF_HOME automatically)
-huggingface-cli download Qwen/Qwen2.5-32B-Instruct-AWQ
-huggingface-cli download BAAI/bge-m3
+# Pre-download models (everything goes to $HF_HOME automatically).
+# huggingface_hub ≥ 0.27 renamed `huggingface-cli` → `hf`. Use whichever
+# is available on your image:
+hf download Qwen/Qwen2.5-32B-Instruct-AWQ      # newer (autodl 2024+ images)
+hf download BAAI/bge-m3
+# or, on older boxes:
+# huggingface-cli download Qwen/Qwen2.5-32B-Instruct-AWQ
+# huggingface-cli download BAAI/bge-m3
 
 # Build local bge-m3 snapshot (goes to $QA_MODELS_DIR)
 ./venv_vllm/bin/python -m qa.local_loader
