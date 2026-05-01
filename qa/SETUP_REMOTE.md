@@ -7,6 +7,65 @@ common autodl layout:
 - **System disk** `/root` ~30 GB — too small for HF cache + Python wheels
 - **Data disk**   `/root/autodl-tmp` ~200 GB — where everything must live
 
+## TL;DR — what you must transfer before running
+
+After §1–§4 (env vars, venv, model downloads), you still need
+**~12 GB of pre-built data** under `stock_data/` for the QA backend
+to answer anything. The minimum required from your local machine to
+the remote `:/root/autodl-tmp/tushare/`:
+
+| Path | Size | Why |
+|---|---|---|
+| `stock_data/qa/aliases.json` | ~3 MB | Stock alias dict (5,190 stocks) |
+| `stock_data/qa/news_linked.parquet` | ~134 MB | Articles → ts_codes |
+| `stock_data/qa/entities.faiss` | ~22 MB | Per-stock embeddings |
+| `stock_data/qa/entities.parquet` | ~1 MB | Sidecar for entities.faiss |
+| `stock_data/qa/news.faiss` | ~8.5 GB | News article embeddings |
+| `stock_data/qa/news_meta.parquet` | ~70 MB | Sidecar for news.faiss |
+| `stock_data/qa/concept_tags.json` | ~0.6 MB | News-derived concept tags |
+| `stock_data/qa/company_business.csv` | ~5 MB | Tushare main_business |
+| `stock_data/qa/linker_reranker.pkl` | small | Optional dense reranker |
+| `stock_data/sh/<code>.csv` × 2,400 | ~1.8 GB | SH daily prices |
+| `stock_data/sz/<code>.csv` × 3,000 | ~2.2 GB | SZ daily prices |
+| `stock_data/fina_indicator/*.csv` × 5,200 | ~150 MB | Quarterly fundamentals |
+| `stock_data/static_features/*.csv` | ~10 MB | Company info / index members |
+| `stock_data/stock_list.csv` + `stock_sectors.csv` | <1 MB | Stock universe |
+| `stock_data/news_sentiment_qwen.csv` | ~3 MB | Sentiment trend |
+| **Subtotal** | **~13 GB** | |
+
+Optional (only if you'll re-link the news corpus on the remote, otherwise skip):
+
+| Path | Size | Skip if you have `news_linked.parquet` |
+|---|---|---|
+| `stock_data/news_corpus_dedup.parquet` | ~1.2 GB | yes |
+| `stock_data/news_corpus_dedup_codes.parquet` | ~70 MB | yes |
+
+Plus the model weights downloaded on the remote (§4):
+- Qwen2.5-32B-Instruct-AWQ in HF cache (~19 GB)
+- bge-m3 in HF cache (~2.3 GB)
+
+**Total disk on data volume: ~35 GB. The 200 GB disk has plenty of headroom.**
+
+Concrete rsync command (run from your **local** repo root):
+
+```bash
+HOST=region-1.autodl.com    # ← your autodl host
+PORT=22000                  # ← your autodl ssh port
+
+rsync -avzP -e "ssh -p $PORT" \
+    stock_data/qa/ stock_data/sh/ stock_data/sz/ \
+    stock_data/fina_indicator/ stock_data/static_features/ \
+    stock_data/stock_list.csv stock_data/stock_sectors.csv \
+    stock_data/news_sentiment_qwen.csv \
+    root@$HOST:/root/autodl-tmp/tushare/stock_data/
+```
+
+The `-z` compresses over the wire (parquet + CSV compress well), `-P`
+shows progress and resumes if interrupted. Expect 10–30 min depending
+on bandwidth.
+
+After transfer, run §7's verifier to confirm everything landed.
+
 ## 1. Two env vars cover all download paths
 
 `export` is **per-session** by default — the variables vanish when you
@@ -113,7 +172,7 @@ hf download BAAI/bge-m3
 # huggingface-cli download BAAI/bge-m3
 
 # Build local bge-m3 snapshot (goes to $QA_MODELS_DIR)
-./venv_vllm/bin/python -m qa.local_loader
+python -m qa.local_loader
 ```
 
 After this, the venv + models are on disk, but `stock_data/` is still
@@ -132,26 +191,25 @@ the QA pipeline on your laptop), just transfer the files. From your
 local repo:
 
 ```bash
-# Replace <user>@<host>:<port> with your autodl ssh creds
-RSYNC_DEST="root@region-1.autodl.com:22000:/root/autodl-tmp/tushare"
+HOST=region-1.autodl.com    # your autodl host
+PORT=22000                  # your autodl ssh port
+DEST=root@$HOST:/root/autodl-tmp/tushare/stock_data/
+SSH="ssh -p $PORT"
 
-# Required minimum for QA inference (~10 GB)
-rsync -avzP --info=progress2 stock_data/qa/         $RSYNC_DEST/stock_data/qa/
-rsync -avzP --info=progress2 stock_data/sh/         $RSYNC_DEST/stock_data/sh/
-rsync -avzP --info=progress2 stock_data/sz/         $RSYNC_DEST/stock_data/sz/
-rsync -avzP --info=progress2 stock_data/fina_indicator/ \
-                                                    $RSYNC_DEST/stock_data/fina_indicator/
-rsync -avzP --info=progress2 stock_data/static_features/ \
-                                                    $RSYNC_DEST/stock_data/static_features/
-rsync -avzP --info=progress2 stock_data/stock_list.csv stock_data/stock_sectors.csv \
-                                stock_data/news_sentiment_qwen.csv \
-                                                    $RSYNC_DEST/stock_data/
+# Required minimum for QA inference (~13 GB)
+rsync -avzP -e "$SSH" stock_data/qa/                $DEST/qa/
+rsync -avzP -e "$SSH" stock_data/sh/                $DEST/sh/
+rsync -avzP -e "$SSH" stock_data/sz/                $DEST/sz/
+rsync -avzP -e "$SSH" stock_data/fina_indicator/    $DEST/fina_indicator/
+rsync -avzP -e "$SSH" stock_data/static_features/   $DEST/static_features/
+rsync -avzP -e "$SSH" stock_data/stock_list.csv \
+                       stock_data/stock_sectors.csv \
+                       stock_data/news_sentiment_qwen.csv  $DEST
 
 # Optional: only if you plan to RE-RUN the linker on the remote
 # (otherwise news_linked.parquet alone is enough for QA inference).
-rsync -avzP --info=progress2 stock_data/news_corpus_dedup.parquet \
-                                stock_data/news_corpus_dedup_codes.parquet \
-                                                    $RSYNC_DEST/stock_data/
+rsync -avzP -e "$SSH" stock_data/news_corpus_dedup.parquet \
+                       stock_data/news_corpus_dedup_codes.parquet  $DEST
 ```
 
 `-z` compresses over the wire — important for parquet/CSV which
@@ -167,29 +225,29 @@ has Tushare access from US.
 # Edit dl/config.py and paste your Tushare Pro token in TUSHARE_TOKEN.
 
 # 2. Pull stock daily bars (forward + backward fill, ~30 min)
-./venv_vllm/bin/python extend_stock_data.py --update --workers 8
+python extend_stock_data.py --update --workers 8
 
 # 3. Pull static features (~5 min)
-./venv_vllm/bin/python -m api.static_features --source stock_company
-./venv_vllm/bin/python -m api.static_features --source index_member_pit
+python -m api.static_features --source stock_company
+python -m api.static_features --source index_member_pit
 
 # 4. Pull fundamentals (~10 min, fina_indicator across all stocks)
-./venv_vllm/bin/python -m api.fina_extras   # whatever the entry point is
+python -m api.fina_extras   # whatever the entry point is
 
 # 5. Pull news corpus (~3-5 hr — the long pole)
-./venv_vllm/bin/python main.py              # runs features.news.run('download')
+python main.py              # runs features.news.run('download')
 
 # 6. Pull main_business + business_scope sidecar (~30 sec)
-./venv_vllm/bin/python -m qa.fetch_company_business
+python -m qa.fetch_company_business
 
 # 7. Build all QA-derived artifacts in order:
-./venv_vllm/bin/python -m qa.build_alias_dict       # ~5 sec
-./venv_vllm/bin/python -m qa.linker.predict          # ~1 min over 1.95 M articles
-./venv_vllm/bin/python -m qa.build_concept_tags      # ~30 sec
-./venv_vllm/bin/python -m qa.build_entity_index      # ~30 sec on GPU
-./venv_vllm/bin/python -m qa.linker.train_reranker   # ~5 min
-./venv_vllm/bin/python -m qa.linker.predict --use_dense  # ~80 min, optional
-./venv_vllm/bin/python -m qa.build_news_index        # ~110 min on RTX 4070;
+python -m qa.build_alias_dict       # ~5 sec
+python -m qa.linker.predict          # ~1 min over 1.95 M articles
+python -m qa.build_concept_tags      # ~30 sec
+python -m qa.build_entity_index      # ~30 sec on GPU
+python -m qa.linker.train_reranker   # ~5 min
+python -m qa.linker.predict --use_dense  # ~80 min, optional
+python -m qa.build_news_index        # ~110 min on RTX 4070;
                                                      # ~50 min on RTX 5090
 ```
 
@@ -229,7 +287,7 @@ optional enhancement.
 ## 7. Verify the data is in place
 
 ```bash
-./venv_vllm/bin/python -c "
+python -c "
 from pathlib import Path
 import pandas as pd, json
 
@@ -278,7 +336,7 @@ Expected output:
 ## 8. Sanity-check the env vars are honoured
 
 ```bash
-./venv_vllm/bin/python -c "
+python -c "
 import os
 print('HF_HOME       :', os.environ.get('HF_HOME'))
 print('QA_MODELS_DIR :', os.environ.get('QA_MODELS_DIR'))
@@ -299,7 +357,7 @@ practice. To skip the duplicate, point `QA_MODELS_DIR` at the HF
 hub snapshot directly:
 
 ```bash
-export QA_MODELS_DIR=$(./venv_vllm/bin/python -c "
+export QA_MODELS_DIR=$(python -c "
 import huggingface_hub as h
 print(h.snapshot_download('BAAI/bge-m3', local_files_only=True).rsplit('/bge-m3', 1)[0])
 ")
@@ -316,7 +374,7 @@ vLLM. Two-process stack:
 ```bash
 # ─── Terminal 1 (or screen window) — vLLM serves Qwen at :8000 ───
 screen -S vllm
-./venv_vllm/bin/vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ \
+vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ \
     --gpu-memory-utilization 0.85 \
     --max-model-len 8192 \
     --quantization awq_marlin \
@@ -325,7 +383,7 @@ screen -S vllm
 
 # ─── Terminal 2 — our FastAPI server at :8080 ───
 screen -S api
-./venv_vllm/bin/python -m qa.api.server \
+python -m qa.api.server \
     --vllm-url http://localhost:8000/v1 \
     --model Qwen/Qwen2.5-32B-Instruct-AWQ \
     --host 0.0.0.0 --port 8080
@@ -358,7 +416,7 @@ share KV cache via vLLM's PagedAttention — no GPU lock.
 ### Re-running the 50-question demo against vLLM
 
 ```bash
-./venv_vllm/bin/python -m qa.eval.run_phase2_demo \
+python -m qa.eval.run_phase2_demo \
     --api http://localhost:8080 \
     --out stock_data/qa/phase2_demo_report_vllm.json
 ```
